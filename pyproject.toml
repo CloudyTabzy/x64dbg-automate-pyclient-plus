@@ -7,9 +7,9 @@ readme = "README.md"
 keywords = ["x64dbg", "debugger", "instrumentation", "plugin", "dynamic-analysis"]
 
 [project.urls]
-Homepage = "https://dariushoule.github.io/x64dbg-automate-pyclient/"
-Repository = "https://github.com/dariushoule/x64dbg-automate-pyclient"
-Issues = "https://github.com/dariushoule/x64dbg-automate-pyclient/issues"
+Homepage = "https://github.com/CloudyTabzy/x64dbg-automate-pyclient-plus"
+Repository = "https://github.com/CloudyTabzy/x64dbg-automate-pyclient-plus"
+Issues = "https://github.com/CloudyTabzy/x64dbg-automate-pyclient-plus/issues"
 
 [tool.poetry.dependencies]
 python = "^3.10"
