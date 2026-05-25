@@ -1,4 +1,4 @@
-# x64dbg Automate Plus — AI-Native Runtime Analysis Platform
+# Axon MCP — AI-Native Runtime Analysis Platform for x64dbg
 
 > A fork-and-extension of [x64dbg-automate](https://github.com/dariushoule/x64dbg-automate) that transforms x64dbg into an **AI-controllable runtime analysis engine** via the Model Context Protocol (MCP).
 
@@ -6,7 +6,7 @@ Instead of typing debugger commands by hand, LLM agents drive the entire reverse
 
 ---
 
-## What's New (Plus Edition)
+## What's New (Axon MCP Edition)
 
 | Capability | Description |
 |-----------|-------------|
@@ -223,4 +223,4 @@ Upstream: [dariushoule/x64dbg-automate](https://github.com/dariushoule/x64dbg-au
 
 ## License
 
-This project extends the upstream x64dbg-automate ecosystem. All original upstream code retains its respective license. New contributions in the Plus edition follow the same open-source spirit.
+This project extends the upstream x64dbg-automate ecosystem. All original upstream code retains its respective license. New contributions in the Axon MCP edition follow the same open-source spirit.
