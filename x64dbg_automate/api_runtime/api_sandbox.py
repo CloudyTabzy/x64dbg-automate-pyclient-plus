@@ -62,7 +62,7 @@ def sandbox_create(
 
 @tool
 @unsafe
-def sandbox_destroy(sandbox_id: str) -> dict:
+def sandbox_destroy(sandbox_id: str | None = None) -> dict:
     """Terminate a sandbox's debugger process and forget it. The original target is unaffected."""
     mgr = get_manager()
     try:
@@ -86,7 +86,7 @@ def sandbox_list() -> dict:
 
 
 @tool
-def sandbox_info(sandbox_id: str) -> dict:
+def sandbox_info(sandbox_id: str | None = None) -> dict:
     """Get a sandbox's metadata and refreshed live debugger state."""
     mgr = get_manager()
     try:
@@ -98,7 +98,7 @@ def sandbox_info(sandbox_id: str) -> dict:
 
 
 @tool
-def sandbox_continue(sandbox_id: str) -> dict:
+def sandbox_continue(sandbox_id: str | None = None) -> dict:
     """Resume execution of the sandbox's debuggee (lets it run toward the next event)."""
     mgr = get_manager()
     try:
@@ -114,7 +114,7 @@ def sandbox_continue(sandbox_id: str) -> dict:
 
 
 @tool
-def sandbox_pause(sandbox_id: str) -> dict:
+def sandbox_pause(sandbox_id: str | None = None) -> dict:
     """Pause the sandbox's debuggee so its state can be inspected."""
     mgr = get_manager()
     try:
@@ -130,7 +130,7 @@ def sandbox_pause(sandbox_id: str) -> dict:
 
 
 @tool
-def sandbox_checkpoint(sandbox_id: str, name: str, regions: list[str] | None = None) -> dict:
+def sandbox_checkpoint(*, sandbox_id: str | None = None, name: str, regions: list[str] | None = None) -> dict:
     """Save a best-effort userland checkpoint: active-thread registers + chosen memory regions.
 
     This is NOT a kernel-level process fork — handles, new threads, and kernel object
@@ -159,7 +159,7 @@ def sandbox_checkpoint(sandbox_id: str, name: str, regions: list[str] | None = N
 
 @tool
 @unsafe
-def sandbox_restore(sandbox_id: str, name: str) -> dict:
+def sandbox_restore(*, sandbox_id: str | None = None, name: str) -> dict:
     """Restore a previously saved checkpoint (writes registers + captured memory back)."""
     mgr = get_manager()
     try:
@@ -182,7 +182,7 @@ def sandbox_restore(sandbox_id: str, name: str) -> dict:
 
 
 @tool
-def sandbox_dump(sandbox_id: str, output_dir: str = "", method: str = "procdump") -> dict:
+def sandbox_dump(*, sandbox_id: str | None = None, output_dir: str = "", method: str = "procdump") -> dict:
     """Take a read-only forensic memory dump of the sandbox's debuggee.
 
     Uses a process clone/minidump (the original is not paused beyond what the method

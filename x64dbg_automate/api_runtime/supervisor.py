@@ -113,6 +113,7 @@ class SandboxManager:
 
     def __init__(self) -> None:
         self._sandboxes: dict[str, ProcessSandbox] = {}
+        self._active_session_id: str | None = None
         self._lock = threading.RLock()
 
     # -- lifecycle ---------------------------------------------------------
@@ -168,6 +169,8 @@ class SandboxManager:
         """Terminate the sandbox's debugger process and forget it."""
         with self._lock:
             sandbox = self._sandboxes.pop(sandbox_id, None)
+            if self._active_session_id == sandbox_id:
+                self._active_session_id = None
         if sandbox is None:
             raise KeyError(f"No sandbox with id '{sandbox_id}'")
         ok = self._safe_terminate(sandbox.client)
@@ -175,18 +178,56 @@ class SandboxManager:
         sandbox.client = None
         return ok
 
-    def get_sandbox(self, sandbox_id: str) -> ProcessSandbox:
+    def get_sandbox(self, sandbox_id: str | None = None) -> ProcessSandbox:
         with self._lock:
-            sandbox = self._sandboxes.get(sandbox_id)
+            if sandbox_id is None:
+                sandbox_id = self._active_session_id
+            sandbox = self._sandboxes.get(sandbox_id) if sandbox_id else None
         if sandbox is None:
-            raise KeyError(f"No sandbox with id '{sandbox_id}'")
+            if sandbox_id:
+                raise KeyError(f"No sandbox with id '{sandbox_id}'")
+            raise KeyError(
+                "No active session. Start a session with start_session() or sandbox_create() first."
+            )
         return sandbox
 
-    def get_client(self, sandbox_id: str) -> "X64DbgClient":
+    def get_client(self, sandbox_id: str | None = None) -> "X64DbgClient":
         sandbox = self.get_sandbox(sandbox_id)
         if sandbox.client is None:
-            raise SandboxError(f"Sandbox '{sandbox_id}' has no active debugger client")
+            raise SandboxError(
+                f"Sandbox '{sandbox.sandbox_id}' has no active debugger client"
+            )
         return sandbox.client
+
+    def set_active_session(self, sandbox_id: str) -> None:
+        with self._lock:
+            if sandbox_id not in self._sandboxes:
+                raise KeyError(f"No sandbox with id '{sandbox_id}'")
+            self._active_session_id = sandbox_id
+
+    def get_active_session_id(self) -> str | None:
+        with self._lock:
+            return self._active_session_id
+
+    def register_legacy_session(
+        self, client: "X64DbgClient", debugger_pid: int, debugger_arch: str
+    ) -> ProcessSandbox:
+        """Wrap an existing legacy X64DbgClient as a sandbox for unified access."""
+        sandbox = ProcessSandbox(
+            sandbox_id=uuid.uuid4().hex[:8],
+            debugger_pid=debugger_pid,
+            debugger_arch=debugger_arch,
+            created_at=datetime.now(),
+            target_exe=None,
+            attach_pid=None,
+            debuggee_pid=None,
+            state="stopped",
+            client=client,
+        )
+        with self._lock:
+            self._sandboxes[sandbox.sandbox_id] = sandbox
+            self._active_session_id = sandbox.sandbox_id
+        return sandbox
 
     def list_sandboxes(self) -> list[ProcessSandbox]:
         with self._lock:

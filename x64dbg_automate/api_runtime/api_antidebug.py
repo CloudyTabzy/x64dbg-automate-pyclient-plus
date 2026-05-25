@@ -43,7 +43,7 @@ def _peb_status(client) -> dict:
 
 
 @tool
-def configure_scyllahide(sandbox_id: str) -> dict:
+def configure_scyllahide(sandbox_id: str | None = None) -> dict:
     """Write the SecuROM ScyllaHide profile into x64dbg settings for this sandbox.
 
     Takes full effect when the target is (re)started under the debugger.
@@ -64,7 +64,7 @@ def configure_scyllahide(sandbox_id: str) -> dict:
 
 
 @tool
-def attach_safe(sandbox_id: str, breakpoint_tls: bool = False) -> dict:
+def attach_safe(*, sandbox_id: str | None = None, breakpoint_tls: bool = False) -> dict:
     """Apply full anti-debug evasion to an already-created sandbox.
 
     Performs, in order:
@@ -132,7 +132,7 @@ def attach_safe(sandbox_id: str, breakpoint_tls: bool = False) -> dict:
 
 
 @tool
-def check_antidebug_status(sandbox_id: str) -> dict:
+def check_antidebug_status(sandbox_id: str | None = None) -> dict:
     """Report whether the debugger is currently detectable via the target's PEB.
 
     Checks BeingDebugged, NtGlobalFlag, and heap flags. Expected when hidden:
@@ -245,7 +245,7 @@ def _enum_debug_object_handles(pid: int) -> list[int]:
 
 
 @tool
-def detect_timing_attacks(sandbox_id: str, samples: int = 5) -> dict:
+def detect_timing_attacks(*, sandbox_id: str | None = None, samples: int = 5) -> dict:
     """Detect RDTSC-based timing anti-debug by measuring CPU tick consistency.
 
     A target that reads RDTSC, sleeps, then reads RDTSC again can detect a debugger
@@ -292,7 +292,7 @@ def detect_timing_attacks(sandbox_id: str, samples: int = 5) -> dict:
 
 
 @tool
-def check_debug_port(sandbox_id: str) -> dict:
+def check_debug_port(sandbox_id: str | None = None) -> dict:
     """Query the target's ProcessDebugPort via NtQueryInformationProcess.
 
     A non-zero value means a debugger is attached at the kernel level.
@@ -320,7 +320,7 @@ def check_debug_port(sandbox_id: str) -> dict:
 
 
 @tool
-def check_debug_object_handles(sandbox_id: str) -> dict:
+def check_debug_object_handles(sandbox_id: str | None = None) -> dict:
     """Enumerate the target's handles looking for DebugObject instances.
 
     When a debugger attaches, Windows creates a DebugObject handle in the target's

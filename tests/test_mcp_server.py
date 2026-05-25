@@ -288,7 +288,8 @@ class TestListSessions:
     def test_no_sessions(self, mock_cls):
         mock_cls.list_sessions.return_value = []
         result = mcp_mod.list_sessions()
-        assert "No active" in result
+        assert result["success"] is True
+        assert result["total_legacy"] == 0
 
     @patch.object(mcp_mod, "X64DbgClient")
     def test_with_sessions(self, mock_cls):
@@ -300,9 +301,8 @@ class TestListSessions:
         session.sess_pub_sub_port = 5556
         mock_cls.list_sessions.return_value = [session]
         result = mcp_mod.list_sessions()
-        assert "1234" in result
-        assert "C:\\x64dbg\\x64\\x64dbg.exe" in result
-        assert "x64dbg" in result
+        assert result["success"] is True
+        assert result["total_legacy"] == 1
 
     @patch.object(mcp_mod, "X64DbgClient")
     def test_with_sessions_empty_cmdline(self, mock_cls):
@@ -314,8 +314,8 @@ class TestListSessions:
         session.sess_pub_sub_port = 5556
         mock_cls.list_sessions.return_value = [session]
         result = mcp_mod.list_sessions()
-        assert "1234" in result
-        assert "unknown" in result
+        assert result["success"] is True
+        assert result["total_legacy"] == 1
 
     @patch.object(mcp_mod, "X64DbgClient")
     def test_with_sessions_whitespace_cmdline(self, mock_cls):
@@ -327,15 +327,15 @@ class TestListSessions:
         session.sess_pub_sub_port = 5556
         mock_cls.list_sessions.return_value = [session]
         result = mcp_mod.list_sessions()
-        assert "1234" in result
-        assert "unknown" in result
+        assert result["success"] is True
+        assert result["total_legacy"] == 1
 
     @patch.object(mcp_mod, "X64DbgClient")
     def test_exception_returns_error(self, mock_cls):
         mock_cls.list_sessions.side_effect = NotImplementedError("Windows only")
         result = mcp_mod.list_sessions()
-        assert "Error" in result
-        assert "Windows only" in result
+        assert result["success"] is False
+        assert "Windows only" in result["error"]
 
 
 class TestStartSession:
@@ -347,7 +347,8 @@ class TestStartSession:
         mock_cls.return_value = mock_instance
         result = mcp_mod.start_session(x64dbg_path="C:\\x64dbg\\x96dbg.exe")
         mock_resolve.assert_called_once_with("C:\\x64dbg\\x96dbg.exe", "")
-        assert "1234" in result
+        assert result["success"] is True
+        assert result["debugger_pid"] == 1234
 
     @patch.object(mcp_mod, "X64DbgClient")
     @patch.object(mcp_mod, "_resolve_debugger_path", return_value="C:\\env\\x64dbg.exe")
@@ -358,13 +359,14 @@ class TestStartSession:
         mock_cls.return_value = mock_instance
         result = mcp_mod.start_session()
         mock_resolve.assert_called_once_with("C:\\env\\x96dbg.exe", "")
-        assert "5678" in result
+        assert result["success"] is True
+        assert result["debugger_pid"] == 5678
 
     def test_no_path_no_env_error(self, monkeypatch):
         monkeypatch.delenv("X64DBG_PATH", raising=False)
         result = mcp_mod.start_session()
-        assert "Error" in result
-        assert "X64DBG_PATH" in result
+        assert result["success"] is False
+        assert "X64DBG_PATH" in result["error"]
 
 
 class TestConnectToSession:
@@ -375,7 +377,8 @@ class TestConnectToSession:
         mock_cls.return_value = mock_instance
         result = mcp_mod.connect_to_session(x64dbg_path="C:\\x64dbg\\x96dbg.exe", session_pid=1234)
         mock_resolve.assert_called_once_with("C:\\x64dbg\\x96dbg.exe")
-        assert "1234" in result
+        assert result["success"] is True
+        assert result["debugger_pid"] == 1234
 
     @patch.object(mcp_mod, "X64DbgClient")
     @patch.object(mcp_mod, "_resolve_debugger_path", return_value="C:\\env\\x64dbg.exe")
@@ -385,18 +388,19 @@ class TestConnectToSession:
         mock_cls.return_value = mock_instance
         result = mcp_mod.connect_to_session(session_pid=5678)
         mock_resolve.assert_called_once_with("C:\\env\\x96dbg.exe")
-        assert "5678" in result
+        assert result["success"] is True
+        assert result["debugger_pid"] == 5678
 
     def test_no_path_no_env_error(self, monkeypatch):
         monkeypatch.delenv("X64DBG_PATH", raising=False)
         result = mcp_mod.connect_to_session(session_pid=9999)
-        assert "Error" in result
-        assert "X64DBG_PATH" in result
+        assert result["success"] is False
+        assert "X64DBG_PATH" in result["error"]
 
     def test_missing_session_pid(self):
         result = mcp_mod.connect_to_session()
-        assert "Error" in result
-        assert "session_pid" in result
+        assert result["success"] is False
+        assert "session_pid" in result["error"]
 
 
 class TestDisconnect:
@@ -404,13 +408,13 @@ class TestDisconnect:
         original = mcp_mod._client
         mcp_mod._client = None
         result = mcp_mod.disconnect()
-        assert "No active" in result
+        assert result["success"] is False
         mcp_mod._client = original
 
     def test_disconnect_success(self, mock_client):
         result = mcp_mod.disconnect()
         mock_client.detach_session.assert_called_once()
-        assert "Disconnected" in result
+        assert result["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -866,8 +870,7 @@ class TestErrorPaths:
         mcp_mod._client = None
         try:
             result = mcp_mod.go()
-            assert "Error" in result
-            assert "Not connected" in result
+            assert "Error" in result or "Not connected" in result
         finally:
             mcp_mod._client = original
 

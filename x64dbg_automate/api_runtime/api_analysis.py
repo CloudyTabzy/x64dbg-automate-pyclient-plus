@@ -21,7 +21,7 @@ def _xref_name(t: int) -> str:
 
 
 @tool
-def get_threads(sandbox_id: str) -> dict:
+def get_threads(sandbox_id: str | None = None) -> dict:
     """List all threads in the debuggee with their state (CIP, suspend count, priority)."""
     mgr = get_manager()
     try:
@@ -41,7 +41,7 @@ def get_threads(sandbox_id: str) -> dict:
 
 
 @tool
-def get_xrefs(sandbox_id: str, address: str) -> dict:
+def get_xrefs(*, sandbox_id: str | None = None, address: str) -> dict:
     """Get cross-references (calls, jumps, data refs) to/from an address.
 
     Args:
@@ -70,7 +70,7 @@ def get_xrefs(sandbox_id: str, address: str) -> dict:
 
 
 @tool
-def get_function_boundaries(sandbox_id: str, address: str) -> dict:
+def get_function_boundaries(*, sandbox_id: str | None = None, address: str) -> dict:
     """Get the start/end boundaries and instruction count of the function at an address.
 
     Args:
@@ -105,7 +105,7 @@ def get_function_boundaries(sandbox_id: str, address: str) -> dict:
 
 
 @tool
-def analyze_function_cfg(sandbox_id: str, address: str) -> dict:
+def analyze_function_cfg(*, sandbox_id: str | None = None, address: str) -> dict:
     """Analyze a function and return its control flow graph (CFG).
 
     Returns basic blocks with branch targets, instruction counts, terminal
@@ -158,7 +158,7 @@ def analyze_function_cfg(sandbox_id: str, address: str) -> dict:
 
 
 @tool
-def get_string_at(sandbox_id: str, address: str) -> dict:
+def get_string_at(*, sandbox_id: str | None = None, address: str) -> dict:
     """Read an auto-detected string (ASCII/Unicode) at an address.
 
     Args:
@@ -184,7 +184,7 @@ def get_string_at(sandbox_id: str, address: str) -> dict:
 
 
 @tool
-def get_patches(sandbox_id: str) -> dict:
+def get_patches(sandbox_id: str | None = None) -> dict:
     """List all patched bytes in the debuggee (memory modifications made by the debugger/user)."""
     mgr = get_manager()
     try:
@@ -203,7 +203,7 @@ def get_patches(sandbox_id: str) -> dict:
 
 
 @tool
-def get_modules(sandbox_id: str) -> dict:
+def get_modules(sandbox_id: str | None = None) -> dict:
     """List all loaded modules (DLLs/exe) in the debuggee with base/size/entry/name/path."""
     mgr = get_manager()
     try:
@@ -223,7 +223,7 @@ def get_modules(sandbox_id: str) -> dict:
 
 
 @tool
-def get_seh_chain(sandbox_id: str) -> dict:
+def get_seh_chain(sandbox_id: str | None = None) -> dict:
     """Get the Structured Exception Handling (SEH) chain for the current thread.
 
     Useful for understanding exception handler chains and anti-debug tricks that
@@ -246,7 +246,7 @@ def get_seh_chain(sandbox_id: str) -> dict:
 
 
 @tool
-def get_handles(sandbox_id: str) -> dict:
+def get_handles(sandbox_id: str | None = None) -> dict:
     """Enumerate all handles in the debuggee process.
 
     Identifies open files, mutexes, events, threads, processes, registry keys,

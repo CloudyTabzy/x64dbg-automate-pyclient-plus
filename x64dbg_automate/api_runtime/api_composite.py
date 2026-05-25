@@ -31,8 +31,8 @@ def _symbol_name(client, addr: int) -> str | None:
 
 
 @tool
-def capture_function_context(
-    sandbox_id: str,
+def capture_function_context(*, 
+    sandbox_id: str | None = None,
     addr: str,
     capture_memory_regions: list[str] | None = None,
     capture_inputs: bool = True,
@@ -164,8 +164,8 @@ def _disasm(client, addr: int, count: int) -> list[str]:
 
 
 @tool
-def trace_until_memory_change(
-    sandbox_id: str,
+def trace_until_memory_change(*, 
+    sandbox_id: str | None = None,
     address: str,
     size: int,
     timeout_sec: int = 30,
@@ -235,7 +235,7 @@ def trace_until_memory_change(
 
 @tool
 def find_crypto_material(
-    sandbox_id: str,
+    sandbox_id: str | None = None,
     scan_mode: str = "all",
     regions: list[str] | None = None,
 ) -> dict:
@@ -294,7 +294,7 @@ def find_crypto_material(
 
 @tool
 def trace_execution(
-    sandbox_id: str,
+    sandbox_id: str | None = None,
     max_steps: int = 100,
     stop_condition: str = "",
     record_registers: bool = False,

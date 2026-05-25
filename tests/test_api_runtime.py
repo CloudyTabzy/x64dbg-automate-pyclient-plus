@@ -239,7 +239,7 @@ class TestSandboxTools:
         from x64dbg_automate.api_runtime.api_sandbox import sandbox_checkpoint
 
         _mock_sandbox(manager)
-        r = sandbox_checkpoint("aa11", "cp", regions=["not-a-region"])
+        r = sandbox_checkpoint(sandbox_id="aa11", name="cp", regions=["not-a-region"])
         assert r["success"] is False and r["error_type"] == ErrorType.BAD_ARGUMENT
 
 
@@ -272,7 +272,7 @@ class TestMemoryTools:
 
         sb = _mock_sandbox(manager)
         sb.client.read_memory.return_value = bytes(range(256))
-        r = read_struct("aa11", "rc4_state", "0x500000")
+        r = read_struct(sandbox_id="aa11", schema="rc4_state", address="0x500000")
         assert r["success"] and r["is_identity"] is True
 
     def test_read_struct_peb(self, manager):
@@ -285,7 +285,7 @@ class TestMemoryTools:
         struct.pack_into("<I", blob, 0xBC, 0x70)
         sb.client.read_memory.return_value = bytes(blob)
         sb.client.eval_sync.return_value = (0x7FF00000, True)
-        r = read_struct("aa11", "peb")
+        r = read_struct(sandbox_id="aa11", schema="peb")
         assert r["success"]
         assert r["fields"]["BeingDebugged"] is True
         assert r["fields"]["NtGlobalFlag"] == "0x70"
@@ -295,7 +295,7 @@ class TestMemoryTools:
         from x64dbg_automate.api_runtime.api_memory import read_struct
 
         _mock_sandbox(manager)
-        r = read_struct("aa11", "bogus", "0x1000")
+        r = read_struct(sandbox_id="aa11", schema="bogus", address="0x1000")
         assert r["success"] is False and r["error_type"] == ErrorType.BAD_ARGUMENT
 
     def test_memory_search_pattern(self, manager):
@@ -303,7 +303,7 @@ class TestMemoryTools:
 
         sb = _mock_sandbox(manager)
         sb.client.read_memory.return_value = b"\x90\x55\x8b\xec\x90"
-        r = memory_search_pattern("aa11", "0x401000", 5, "55 8B EC")
+        r = memory_search_pattern(sandbox_id="aa11", address="0x401000", size=5, pattern="55 8B EC")
         assert r["success"] and r["total"] == 1
         assert r["matches"] == ["0x401001"]
 
@@ -334,7 +334,7 @@ class TestCompositeTools:
         c.go.return_value = True
         c.wait_until_stopped.return_value = True
         c.get_reg.return_value = 0x401234
-        r = trace_until_memory_change("aa11", "0x448300", 4, timeout_sec=5)
+        r = trace_until_memory_change(sandbox_id="aa11", address="0x448300", size=4, timeout_sec=5)
         assert r["success"] and r["before"] == "00000000" and r["after"] == "11223344"
         assert r["changed_by_instruction"] == "0x401234"
 
@@ -358,7 +358,7 @@ class TestCompositeTools:
 
         c.get_reg.side_effect = _get_reg
         c.read_qword.return_value = 0x402000  # return address
-        r = capture_function_context("aa11", "0x401000")
+        r = capture_function_context(sandbox_id="aa11", addr="0x401000")
         assert r["success"]
         assert r["entry_hit"] is True
         assert r["return_hit"] is True
@@ -414,7 +414,7 @@ class TestDisassembleRange:
         ins = type("Ins", (), {"instruction": "mov rax, rbx", "instr_size": 3})()
         sb.client.disassemble_at.return_value = ins
         sb.client.read_memory.return_value = b"\x48\x89\xD8"
-        r = disassemble_range("aa11", "0x401000", count=2)
+        r = disassemble_range(sandbox_id="aa11", address="0x401000", count=2)
         assert r["success"]
         assert r["total"] == 2
         assert r["instructions"][0]["mnemonic"] == "mov rax, rbx"
@@ -423,7 +423,7 @@ class TestDisassembleRange:
         from x64dbg_automate.api_runtime.api_memory import disassemble_range
 
         _mock_sandbox(manager)
-        r = disassemble_range("aa11", "not_an_addr", count=2)
+        r = disassemble_range(sandbox_id="aa11", address="not_an_addr", count=2)
         assert r["success"] is False
 
 
@@ -471,7 +471,7 @@ class TestAdaptiveAntiDebug:
     def test_detect_timing_attacks(self):
         from x64dbg_automate.api_runtime.api_antidebug import detect_timing_attacks
 
-        r = detect_timing_attacks("dummy", samples=3)
+        r = detect_timing_attacks(sandbox_id="dummy", samples=3)
         assert r["success"]
         assert len(r["measured_deltas_ms"]) == 3
         assert "noisy_environment" in r
@@ -513,7 +513,7 @@ class TestAnalysisTools:
             XrefRecord(address=0x401000, xref_type=3),
             XrefRecord(address=0x402000, xref_type=2),
         ]
-        r = get_xrefs("aa11", "0x400000")
+        r = get_xrefs(sandbox_id="aa11", address="0x400000")
         assert r["success"] and r["total"] == 2
         assert r["xrefs"][0]["type"] == "CALL"
 
@@ -523,7 +523,7 @@ class TestAnalysisTools:
 
         sb = _mock_sandbox(manager)
         sb.client.get_function.return_value = FunctionBoundaries(start=0x401000, end=0x401100, instruction_count=42, manual=False)
-        r = get_function_boundaries("aa11", "0x401050")
+        r = get_function_boundaries(sandbox_id="aa11", address="0x401050")
         assert r["success"]
         assert r["start"] == "0x401000"
         assert r["instruction_count"] == 42
@@ -533,7 +533,7 @@ class TestAnalysisTools:
 
         sb = _mock_sandbox(manager)
         sb.client.get_function.return_value = None
-        r = get_function_boundaries("aa11", "0x401050")
+        r = get_function_boundaries(sandbox_id="aa11", address="0x401050")
         assert r["success"] is False
         assert r["error_type"] == ErrorType.NOT_FOUND
 
@@ -577,7 +577,7 @@ class TestAnalysisTools:
 
         sb = _mock_sandbox(manager)
         sb.client.get_string_at.return_value = "Hello World"
-        r = get_string_at("aa11", "0x404000")
+        r = get_string_at(sandbox_id="aa11", address="0x404000")
         assert r["success"]
         assert r["string"] == "Hello World"
 
@@ -586,7 +586,7 @@ class TestAnalysisTools:
 
         sb = _mock_sandbox(manager)
         sb.client.get_string_at.return_value = ""
-        r = get_string_at("aa11", "0x404000")
+        r = get_string_at(sandbox_id="aa11", address="0x404000")
         assert r["success"] is False
         assert r["error_type"] == ErrorType.NOT_FOUND
 

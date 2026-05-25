@@ -125,8 +125,8 @@ def workflow_capture_securom_state(
 
 
 @tool
-def workflow_trace_crypto_pipeline(
-    sandbox_id: str,
+def workflow_trace_crypto_pipeline(*, 
+    sandbox_id: str | None = None,
     stages: list[str],
     watch_regions: list[str] | None = None,
     timeout_sec: int = 30,

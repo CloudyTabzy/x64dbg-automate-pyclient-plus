@@ -46,13 +46,22 @@ from x64dbg_automate.workflows.securom_extract import (
 mcp = FastMCP(
     "x64dbg-automate",
     instructions=(
-        "MCP server for controlling the x64dbg debugger via x64dbg-automate. "
-        "Use list_sessions or start_session first, then connect before using other tools. "
-        "Addresses are hex strings (e.g. '0x7FF6A0001000'). Memory reads return hex dumps."
+        "Axon MCP — AI-native runtime analysis platform for x64dbg. "
+        "Unified session model: start_session creates a session, then use ANY tool. "
+        "Runtime tools (get_threads, analyze_function_cfg, trace_execution, etc.) work "
+        "with the active session automatically — no sandbox_id required. "
+        "Legacy tools and runtime tools share the same session registry. "
+        "Addresses are hex strings (e.g. '0x7FF6A0001000') or expressions (e.g. 'RIP', 'rsp+0x20')."
     ),
 )
 
 _client: X64DbgClient | None = None
+
+
+def _get_unified_manager():
+    """Return the unified SandboxManager (legacy + runtime sessions)."""
+    from x64dbg_automate.api_runtime.supervisor import get_manager
+    return get_manager()
 
 
 # ---------------------------------------------------------------------------
@@ -114,30 +123,45 @@ def _format_memory(data: bytes, base: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_sessions() -> str:
-    """List all active x64dbg debugger instances. Does not require an active connection."""
+def list_sessions() -> dict:
+    """List all active x64dbg debugger instances and unified sessions. Does not require an active connection."""
     try:
-        sessions = X64DbgClient.list_sessions()
-        if not sessions:
-            return "No active x64dbg sessions found."
-        lines = []
-        for s in sessions:
+        # Legacy lockfile sessions
+        raw_sessions = X64DbgClient.list_sessions()
+        legacy = []
+        for s in raw_sessions:
             exe_path = s.cmdline[0].strip() if s.cmdline and s.cmdline[0].strip() else "unknown"
-            lines.append(
-                f"PID: {s.pid}  |  Path: {exe_path}  |  Window: {s.window_title}  |  "
-                f"REQ port: {s.sess_req_rep_port}  |  SUB port: {s.sess_pub_sub_port}"
-            )
-        return "\n".join(lines)
+            legacy.append({
+                "pid": s.pid,
+                "path": exe_path,
+                "window_title": s.window_title,
+                "req_rep_port": s.sess_req_rep_port,
+                "pub_sub_port": s.sess_pub_sub_port,
+            })
+
+        # Unified sessions (legacy + sandbox)
+        mgr = _get_unified_manager()
+        unified = [s.to_info() for s in mgr.list_sandboxes()]
+
+        return {
+            "success": True,
+            "legacy_sessions": legacy,
+            "unified_sessions": unified,
+            "active_session_id": mgr.get_active_session_id(),
+            "total_legacy": len(legacy),
+            "total_unified": len(unified),
+        }
     except Exception as e:
-        return f"Error: {e}"
+        return {"success": False, "error": str(e), "error_type": "LIST_FAILED"}
 
 
 @mcp.tool()
-def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = "", current_dir: str = "") -> str:
+def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = "", current_dir: str = "") -> dict:
     """Launch a new x64dbg instance and optionally load an executable.
 
-    If x96dbg.exe (the launcher) is given, the correct x64dbg.exe or x32dbg.exe is
-    selected automatically based on the target executable's PE bitness.
+    Creates a unified session that both legacy and runtime tools can use.
+    Returns a session_id — pass it to runtime tools, or omit sandbox_id to use
+    the active session automatically.
 
     Args:
         x64dbg_path: Path to x64dbg installation (x96dbg.exe, x64dbg.exe, or x32dbg.exe). Falls back to X64DBG_PATH env var if not provided.
@@ -151,14 +175,25 @@ def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = ""
         resolved = _resolve_debugger_path(path, target_exe)
         _client = X64DbgClient(resolved)
         pid = _client.start_session(target_exe, cmdline, current_dir)
-        return f"Session started with {Path(resolved).name}. Debugger PID: {pid}"
+        arch = "x64" if "x64dbg" in Path(resolved).name.lower() else "x32"
+        mgr = _get_unified_manager()
+        sandbox = mgr.register_legacy_session(_client, pid, arch)
+        return {
+            "success": True,
+            "session_id": sandbox.sandbox_id,
+            "debugger_pid": pid,
+            "debugger_path": resolved,
+            "debugger_arch": arch,
+            "message": f"Session started. Debugger PID: {pid}",
+            "hint": "Use this session_id with runtime tools, or call other tools directly — they use the active session.",
+        }
     except Exception as e:
         _client = None
-        return f"Error: {e}"
+        return {"success": False, "error": str(e), "error_type": "STARTUP_FAILED", "hint": "Check X64DBG_PATH and that x64dbg is installed."}
 
 
 @mcp.tool()
-def connect_to_session(x64dbg_path: str = "", session_pid: int = 0) -> str:
+def connect_to_session(x64dbg_path: str = "", session_pid: int = 0) -> dict:
     """Connect to an already-running x64dbg instance.
 
     If x96dbg.exe is given, it is resolved to x64dbg.exe (default).
@@ -169,21 +204,24 @@ def connect_to_session(x64dbg_path: str = "", session_pid: int = 0) -> str:
         session_pid: PID of the x64dbg process to attach to
     """
     if not session_pid:
-        return "Error: session_pid is required."
+        return {"success": False, "error": "session_pid is required", "error_type": "BAD_ARGUMENT", "hint": "Use list_sessions to find the PID."}
     global _client
     try:
         path = _resolve_x64dbg_path_with_env(x64dbg_path)
         resolved = _resolve_debugger_path(path)
         _client = X64DbgClient(resolved)
         _client.attach_session(session_pid)
-        return f"Connected to session PID {session_pid}."
+        arch = "x64" if "x64dbg" in Path(resolved).name.lower() else "x32"
+        mgr = _get_unified_manager()
+        sandbox = mgr.register_legacy_session(_client, session_pid, arch)
+        return {"success": True, "session_id": sandbox.sandbox_id, "debugger_pid": session_pid, "message": f"Connected to session PID {session_pid}."}
     except Exception as e:
         _client = None
-        return f"Error: {e}"
+        return {"success": False, "error": str(e), "error_type": "CONNECTION_FAILED", "hint": "Verify the PID is correct and x64dbg is running with the plugin loaded."}
 
 
 @mcp.tool()
-def connect_remote(host: str, req_rep_port: int, pub_sub_port: int) -> str:
+def connect_remote(host: str, req_rep_port: int, pub_sub_port: int) -> dict:
     """Connect to a remote x64dbg instance running on another machine or VM.
 
     Bypasses local session discovery (lockfiles). The x64dbg plugin on the
@@ -198,39 +236,58 @@ def connect_remote(host: str, req_rep_port: int, pub_sub_port: int) -> str:
     global _client
     try:
         _client = X64DbgClient.connect_remote(host, req_rep_port, pub_sub_port)
-        return f"Connected to remote x64dbg at {host}:{req_rep_port}."
+        mgr = _get_unified_manager()
+        # Remote connections don't have a local PID; use a synthetic ID
+        sandbox = mgr.register_legacy_session(_client, 0, "x64")
+        return {"success": True, "session_id": sandbox.sandbox_id, "host": host, "req_rep_port": req_rep_port, "message": f"Connected to remote x64dbg at {host}:{req_rep_port}."}
     except Exception as e:
         _client = None
-        return f"Error: {e}"
+        return {"success": False, "error": str(e), "error_type": "CONNECTION_FAILED", "hint": "Verify the remote plugin is configured for remote mode and the port/firewall is open."}
 
 
 @mcp.tool()
-def disconnect() -> str:
+def disconnect() -> dict:
     """Disconnect from the current x64dbg session without terminating the debugger."""
     global _client
     if _client is None:
-        return "No active connection."
+        return {"success": False, "error": "No active connection", "error_type": "NOT_CONNECTED", "hint": "Call start_session or connect_to_session first."}
     try:
+        # Remove from unified manager
+        mgr = _get_unified_manager()
+        active = mgr.get_active_session_id()
+        if active:
+            try:
+                mgr.destroy_sandbox(active)
+            except Exception:
+                pass
         _client.detach_session()
         _client = None
-        return "Disconnected."
+        return {"success": True, "message": "Disconnected."}
     except Exception as e:
         _client = None
-        return f"Error: {e}"
+        return {"success": False, "error": str(e), "error_type": "DISCONNECT_FAILED"}
 
 
 @mcp.tool()
-def terminate_session() -> str:
+def terminate_session() -> dict:
     """Terminate the connected x64dbg debugger process."""
     global _client
     try:
         client = _require_client()
+        # Remove from unified manager
+        mgr = _get_unified_manager()
+        active = mgr.get_active_session_id()
+        if active:
+            try:
+                mgr.destroy_sandbox(active)
+            except Exception:
+                pass
         client.terminate_session()
         _client = None
-        return "Session terminated."
+        return {"success": True, "message": "Session terminated."}
     except Exception as e:
         _client = None
-        return f"Error: {e}"
+        return {"success": False, "error": str(e), "error_type": "TERMINATE_FAILED"}
 
 
 # ---------------------------------------------------------------------------

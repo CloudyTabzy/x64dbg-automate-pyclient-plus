@@ -58,7 +58,7 @@ def _read_fixed_struct(client, base: int, fields: list[tuple[str, int, str]], pt
 
 
 @tool
-def read_struct(sandbox_id: str, schema: str, address: str = "") -> dict:
+def read_struct(*, sandbox_id: str | None = None, schema: str, address: str = "") -> dict:
     """Read memory as a named structure with labeled fields.
 
     Built-in schemas: 'peb', 'teb' (address auto-resolved if omitted), and 'rc4_state'
@@ -113,7 +113,7 @@ def read_struct(sandbox_id: str, schema: str, address: str = "") -> dict:
 
 @tool
 def find_initialized_data(
-    sandbox_id: str,
+    sandbox_id: str | None = None,
     min_entropy: float = 4.0,
     max_regions: int = 50,
     sample_bytes: int = 65536,
@@ -181,7 +181,7 @@ def find_initialized_data(
 
 
 @tool
-def resolve_iat_slot(sandbox_id: str, address: str) -> dict:
+def resolve_iat_slot(*, sandbox_id: str | None = None, address: str) -> dict:
     """Resolve an import-address-table slot to the function it points at.
 
     Reads the pointer stored at the slot and resolves the target's symbol/module.
@@ -231,7 +231,7 @@ def resolve_iat_slot(sandbox_id: str, address: str) -> dict:
 
 
 @tool
-def memory_search_pattern(sandbox_id: str, address: str, size: int, pattern: str) -> dict:
+def memory_search_pattern(*, sandbox_id: str | None = None, address: str, size: int, pattern: str) -> dict:
     """Search a sandbox memory region for a hex byte pattern with ?? wildcards.
 
     Example pattern: '55 8B EC' or 'E8 ?? ?? ?? ?? 83 C4 04'.
@@ -266,7 +266,7 @@ def memory_search_pattern(sandbox_id: str, address: str, size: int, pattern: str
 
 
 @tool
-def memory_diff(sandbox_id: str, checkpoint_a: str, checkpoint_b: str, region: str = "") -> dict:
+def memory_diff(*, sandbox_id: str | None = None, checkpoint_a: str, checkpoint_b: str, region: str = "") -> dict:
     """Compare the captured memory of two checkpoints in a sandbox.
 
     Diffs the regions captured by both checkpoints (see sandbox_checkpoint). Optionally
@@ -330,8 +330,8 @@ def memory_diff(sandbox_id: str, checkpoint_a: str, checkpoint_b: str, region: s
 
 
 @tool
-def disassemble_range(
-    sandbox_id: str,
+def disassemble_range(*, 
+    sandbox_id: str | None = None,
     address: str,
     count: int = 16,
 ) -> dict:
@@ -377,7 +377,7 @@ def disassemble_range(
 
 
 @tool
-def get_call_stack(sandbox_id: str) -> dict:
+def get_call_stack(sandbox_id: str | None = None) -> dict:
     """Retrieve the current call stack (most recent frame first).
 
     Uses x64dbg's native stack walker so it handles FPO, unwind info, and
