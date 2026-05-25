@@ -14,11 +14,33 @@ except ImportError:
     sys.exit(1)
 
 from x64dbg_automate import X64DbgClient
+from x64dbg_automate.dbg_paths import (
+    pe_bitness as _pe_bitness,
+    resolve_debugger_path as _resolve_debugger_path,
+    resolve_x64dbg_path_with_env as _resolve_x64dbg_path_with_env,
+)
 from x64dbg_automate.events import EventType
 from x64dbg_automate.models import (
     BreakpointType,
     HardwareBreakpointType,
     MemoryBreakpointType,
+)
+
+from x64dbg_automate.external.entropy import shannon_entropy, sliding_entropy, is_likely_code, is_likely_encrypted
+from x64dbg_automate.external.string_finder import find_strings as _ext_find_strings, find_strings_utf16le, find_specific_strings
+from x64dbg_automate.external.pattern_scanner import scan_pattern
+from x64dbg_automate.external.memory_analysis import analyze_region as _analyze_region, validate_extracted_section
+from x64dbg_automate.external.pe_analyzer import (
+    get_sections, get_tls_callbacks, get_entry_point, get_image_base, get_bitness,
+    get_imports, get_exports, check_security,
+)
+from x64dbg_automate.external.process_dumper import (
+    dump_via_comsvcs, dump_via_procdump_clone, dump_via_minidumpwritedump,
+    wait_for_window, find_process_by_window_title,
+)
+from x64dbg_automate.external.process_control import nt_suspend_process, nt_resume_process
+from x64dbg_automate.workflows.securom_extract import (
+    workflow_extract_securom, ExtractionResult, TARGET_SECTIONS,
 )
 
 mcp = FastMCP(
@@ -82,77 +104,9 @@ def _format_memory(data: bytes, base: int) -> str:
     return "\n".join(lines)
 
 
-def _pe_bitness(exe_path: str) -> int:
-    """Read the PE Machine field to determine if an executable is 32-bit or 64-bit."""
-    with open(exe_path, "rb") as f:
-        mz = f.read(2)
-        if mz != b"MZ":
-            raise ValueError(f"Not a valid PE file: {exe_path}")
-        f.seek(0x3C)
-        pe_offset = struct.unpack("<I", f.read(4))[0]
-        f.seek(pe_offset)
-        sig = f.read(4)
-        if sig != b"PE\x00\x00":
-            raise ValueError(f"Invalid PE signature in: {exe_path}")
-        machine = struct.unpack("<H", f.read(2))[0]
-    if machine == 0x8664:
-        return 64
-    if machine == 0x14C:
-        return 32
-    raise ValueError(f"Unknown PE machine type 0x{machine:X} in: {exe_path}")
-
-
-def _resolve_x64dbg_path_with_env(x64dbg_path: str) -> str:
-    """Resolve x64dbg path from parameter, falling back to X64DBG_PATH env var.
-
-    Args:
-        x64dbg_path: Explicit path from tool parameter (may be empty).
-
-    Returns:
-        Resolved path string.
-
-    Raises:
-        FileNotFoundError: If neither parameter nor env var provides a path.
-    """
-    path = x64dbg_path.strip() if x64dbg_path else ""
-    if not path:
-        path = os.environ.get("X64DBG_PATH", "").strip()
-    if not path:
-        raise FileNotFoundError(
-            "x64dbg path not provided and X64DBG_PATH environment variable is not set."
-        )
-    return path
-
-
-def _resolve_debugger_path(x64dbg_path: str, target_exe: str = "") -> str:
-    """Resolve x96dbg.exe to the correct x64dbg.exe or x32dbg.exe based on target bitness.
-
-    If the path already points to x64dbg.exe or x32dbg.exe, it is returned as-is.
-    """
-    p = Path(x64dbg_path)
-    name_lower = p.name.lower()
-    if name_lower not in ("x96dbg.exe", "x96dbg"):
-        return x64dbg_path
-    # x96dbg launcher — resolve to the correct binary
-    if target_exe.strip():
-        bitness = _pe_bitness(target_exe.strip())
-    else:
-        bitness = 64  # default when no target specified
-    arch_dir = "x64" if bitness == 64 else "x32"
-    dbg_name = "x64dbg.exe" if bitness == 64 else "x32dbg.exe"
-    candidates = [
-        p.parent / arch_dir / dbg_name,        # release/x64/x64dbg.exe (standard layout)
-        p.parent / dbg_name,                    # release/x64dbg.exe (flat layout)
-        p.parent / "release" / dbg_name,        # alongside release/ folder
-        p.parent / "release" / arch_dir / dbg_name,
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    raise FileNotFoundError(
-        f"Cannot find {dbg_name} relative to {x64dbg_path}. "
-        f"Pass the path to {dbg_name} directly instead of x96dbg.exe."
-    )
+# Debugger-path helpers (_pe_bitness, _resolve_debugger_path,
+# _resolve_x64dbg_path_with_env) now live in x64dbg_automate.dbg_paths and are
+# imported as aliases above so the SandboxManager can share them.
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1107,861 @@ def refresh_gui() -> str:
         return "GUI refreshed." if result else "Failed to refresh GUI."
     except Exception as e:
         return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Memory Analysis — offline (no x64dbg required)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def analyze_entropy(address: str, size: int = 4096, window_size: int = 0) -> str:
+    """Calculate Shannon entropy of a debuggee memory region.
+
+    High entropy (>7.0) = encrypted/compressed.
+    Medium (4.5–6.5) = likely x86 code.
+    Low (<4.0) = likely data or zeros.
+
+    If window_size > 0, returns sliding window results.
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        data = client.read_memory(addr, size)
+
+        if window_size > 0:
+            results = sliding_entropy(data, window_size)
+            lines = [f"Sliding entropy (window={window_size}):"]
+            for offset, ent in results:
+                marker = "ENCRYPTED" if ent > 7.0 else ("CODE" if 4.5 <= ent <= 6.5 else "DATA")
+                lines.append(f"  {_format_address(addr + offset)}: {ent:.4f} [{marker}]")
+            return "\n".join(lines)
+
+        ent = shannon_entropy(data)
+        verdict = (
+            "ENCRYPTED/COMPRESSED" if ent > 7.0
+            else "LIKELY CODE" if 4.5 <= ent <= 6.5
+            else "LIKELY DATA"
+        )
+        return f"Region {_format_address(addr)}–{_format_address(addr + size)}: entropy={ent:.4f} — {verdict}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def find_strings(address: str, size: int = 65536, min_length: int = 4, encoding: str = "both") -> str:
+    """Extract printable strings from a debuggee memory region."""
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        size = min(size, 1048576)
+        data = client.read_memory(addr, size)
+
+        results = []
+        if encoding in ("ascii", "both"):
+            results.extend(_ext_find_strings(data, min_length))
+        if encoding in ("utf16le", "both"):
+            results.extend(find_strings_utf16le(data, min_length))
+
+        if not results:
+            return "No strings found."
+
+        lines = [f"Strings in {_format_address(addr)} ({len(results)} found):"]
+        for offset, s in results[:100]:
+            lines.append(f"  {_format_address(addr + offset)}: {s}")
+        if len(results) > 100:
+            lines.append(f"  ... and {len(results) - 100} more")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def scan_hex_pattern(address: str, size: int, pattern: str) -> str:
+    """Scan a debuggee memory region for a hex pattern with ?? wildcards.
+
+    Example: '55 8B EC' (x86 function prologue)
+    Example: 'E8 ?? ?? ?? ?? 83 C4 04' (call + add esp, 4)
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        data = client.read_memory(addr, size)
+        matches = scan_pattern(data, pattern)
+
+        if not matches:
+            return f"No matches for pattern '{pattern}' in {_format_address(addr)}–{_format_address(addr + size)}"
+
+        lines = [f"Pattern '{pattern}' — {len(matches)} matches:"]
+        for off in matches[:50]:
+            lines.append(f"  {_format_address(addr + off)}")
+        if len(matches) > 50:
+            lines.append(f"  ... and {len(matches) - 50} more")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def find_x86_prologues(address: str, size: int = 65536) -> str:
+    """Find x86 function prologues in a debuggee memory region.
+
+    Detects 'push ebp; mov ebp, esp' patterns.
+    High density indicates decrypted machine code.
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        data = client.read_memory(addr, size)
+
+        prologues = scan_pattern(data, "55 8B EC") + scan_pattern(data, "55 89 E5")
+        all_prologues = sorted(set(prologues))
+
+        if not all_prologues:
+            return f"No x86 function prologues found in region."
+
+        pages = max(1, len(data) / 4096)
+        density = len(all_prologues) / pages
+        verdict = "DECRYPTED CODE (high confidence)" if density > 1.0 else ("POSSIBLE CODE" if density > 0.1 else "SPARSE")
+
+        lines = [
+            f"Found {len(all_prologues)} function prologues",
+            f"Density: {density:.1f} per 4KB page",
+            f"Interpretation: {verdict}",
+        ]
+        for off in all_prologues[:20]:
+            lines.append(f"  {_format_address(addr + off)}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def analyze_region_full(address: str, size: int = 65536) -> str:
+    """Run comprehensive analysis on a debuggee memory region.
+
+    Returns: entropy, string count, known SecuROM/Torque engine strings,
+    function prologue density, and a code/data/encrypted verdict.
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        data = client.read_memory(addr, size)
+        result = _analyze_region(data, addr)
+
+        lines = [
+            f"=== Region {_format_address(addr)} ({result['size']} bytes) ===",
+            f"Entropy: {result['entropy']:.4f}",
+            f"Likely code: {'YES' if result['is_likely_code'] else 'NO'}",
+            f"ASCII strings: {result['string_count']}",
+            f"Function prologues: {result['prologue_count']}",
+            "",
+            "Known SecuROM strings found:",
+        ]
+        for offset, s in result["known_strings"]:
+            lines.append(f"  '{s}' @ {_format_address(offset)}")
+        if not result["known_strings"]:
+            lines.append("  (none)")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def compare_memory(address_a: str, address_b: str, size: int = 4096) -> str:
+    """Compare two debuggee memory regions byte-by-byte."""
+    try:
+        client = _require_client()
+        a = _parse_address_or_expression(address_a)
+        b = _parse_address_or_expression(address_b)
+        data_a = client.read_memory(a, size)
+        data_b = client.read_memory(b, size)
+
+        if data_a == data_b:
+            return f"Regions are identical ({_format_address(a)} and {_format_address(b)}, {size} bytes)"
+
+        diffs = [(i, data_a[i], data_b[i]) for i in range(size) if data_a[i] != data_b[i]]
+        lines = [f"Differences ({len(diffs)} bytes differ):"]
+        for offset, va, vb in diffs[:50]:
+            lines.append(f"  {_format_address(a + offset)}: {va:02X} vs {vb:02X}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# External Process — no debugger required
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def launch_process_no_debug(exe_path: str, args: str = "", cwd: str = "", wait: bool = False) -> str:
+    """Launch a process WITHOUT debugger attachment. Returns the PID.
+
+    Use this to run SecuROM-protected targets normally,
+    then dump them after decryption completes.
+    """
+    import subprocess
+    try:
+        cmd = [exe_path]
+        if args.strip():
+            cmd.extend(args.split())
+        proc = subprocess.Popen(cmd, cwd=cwd or None, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if wait:
+            proc.wait()
+            return f"Process completed with exit code {proc.returncode}"
+        return f"Process launched. PID={proc.pid}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def dump_process_no_debugger(pid: int, output_dir: str = "", method: str = "procdump") -> str:
+    """Dump process memory WITHOUT debugger attachment.
+
+    Methods:
+      - procdump: ProcDump -r (clone via PssCaptureSnapshot, never pauses)
+      - comsvcs: Built-in comsvcs.dll MiniDump (always available)
+      - minidump: Python ctypes call to MiniDumpWriteDump
+    """
+    try:
+        if not output_dir:
+            output_dir = os.path.join(Path.cwd(), "dumps")
+        os.makedirs(output_dir, exist_ok=True)
+        dump_path = os.path.join(output_dir, f"dump_{pid}.dmp")
+
+        if method == "procdump":
+            ok = dump_via_procdump_clone(pid, dump_path)
+        elif method == "comsvcs":
+            ok = dump_via_comsvcs(pid, dump_path)
+        elif method == "minidump":
+            ok = dump_via_minidumpwritedump(pid, dump_path)
+        else:
+            return f"ERROR: Unknown method '{method}'. Use: procdump, comsvcs, minidump."
+
+        if ok and os.path.exists(dump_path):
+            size = os.path.getsize(dump_path)
+            return f"Dump: {dump_path} ({size:,} bytes)"
+        return "Dump failed. Run as Administrator?"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def wait_for_window_title(pid: int, title_substring: str, timeout_sec: int = 120) -> str:
+    """Wait until a process window with a specific title appears.
+
+    For SecuROM: wait for 'Serial' dialog = Stext decrypted in memory.
+    """
+    if wait_for_window(pid, title_substring, timeout_sec):
+        return f"Window containing '{title_substring}' found for PID {pid}."
+    return f"TIMEOUT: Window '{title_substring}' not found within {timeout_sec}s."
+
+
+@mcp.tool()
+def list_running_processes(filter_name: str = "") -> str:
+    """List running processes, optionally filtered by name."""
+    import psutil
+    try:
+        procs = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                info = proc.info
+                name = info["name"] or "???"
+                if filter_name and filter_name.lower() not in name.lower():
+                    continue
+                procs.append((info["pid"], name))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if not procs:
+            return "No matching processes." if filter_name else "No processes found."
+        return "\n".join(f"{pid:>8}  {name}" for pid, name in sorted(procs))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def terminate_process(pid: int) -> str:
+    """Terminate a process by PID."""
+    import psutil
+    try:
+        proc = psutil.Process(pid)
+        proc.terminate()
+        proc.wait(timeout=5)
+        return f"Process {pid} terminated."
+    except psutil.NoSuchProcess:
+        return f"Process {pid} not found."
+    except psutil.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return f"Process {pid} killed (terminate timed out)."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def suspend_process(pid: int) -> str:
+    """Suspend all threads in a process WITHOUT debugger attachment."""
+    if nt_suspend_process(pid):
+        return f"Process {pid} suspended."
+    return f"Failed to suspend process {pid}. Run as Administrator?"
+
+
+# ---------------------------------------------------------------------------
+# PE Analysis — read-only, no x64dbg required
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def analyze_pe(pe_path: str) -> str:
+    """Parse PE headers, sections, entry point, TLS callbacks (read-only).
+
+    NO patching — SecuROM CRC32 check blocks modified executables.
+    """
+    try:
+        sections = get_sections(pe_path)
+        tls = get_tls_callbacks(pe_path)
+        ep = get_entry_point(pe_path)
+        base = get_image_base(pe_path)
+        bits = get_bitness(pe_path)
+
+        lines = [
+            f"=== {os.path.basename(pe_path)} ===",
+            f"Bitness: {bits}-bit",
+            f"Image Base: {_format_address(base)}",
+            f"Entry Point: {_format_address(base + ep)} (RVA 0x{ep:X})",
+            f"TLS Callbacks: {len(tls)}",
+        ]
+        for i, cb in enumerate(tls):
+            lines.append(f"  [{i}] RVA 0x{cb:X}")
+
+        lines.append(f"\nSections ({len(sections)}):")
+        fmt = "{:<14} {:<14} {:<10} {:<10}"
+        lines.append(fmt.format("Name", "VA", "VSize", "RawSize"))
+        for sec in sections:
+            lines.append(fmt.format(sec["name"], _format_address(sec["virtual_address"]), hex(sec["virtual_size"]), hex(sec["size_of_raw_data"])))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_pe_imports(pe_path: str, dll_filter: str = "") -> str:
+    """List imported functions from a PE file."""
+    try:
+        imports = get_imports(pe_path, dll_filter)
+        by_dll: dict[str, list[str]] = {}
+        for imp in imports:
+            dll = imp["dll"]
+            by_dll.setdefault(dll, []).append(imp["function_name"])
+
+        lines = [f"=== Imports ({os.path.basename(pe_path)}) ==="]
+        for dll, funcs in sorted(by_dll.items()):
+            lines.append(f"\n{dll} ({len(funcs)} functions):")
+            for f in funcs[:20]:
+                lines.append(f"  {f}")
+            if len(funcs) > 20:
+                lines.append(f"  ... and {len(funcs) - 20} more")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def check_pe_security(pe_path: str) -> str:
+    """Check PE security mitigations: NX, ASLR, CFG, Integrity Check."""
+    try:
+        result = check_security(pe_path)
+        lines = [f"=== Security: {os.path.basename(pe_path)} ==="]
+        for k, v in result.items():
+            lines.append(f"  {k}: {'YES' if v else 'NO'}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def locate_securom_sections(pe_path: str) -> str:
+    """Locate SecuROM-specific sections: Stext, Sdata, .securom."""
+    try:
+        sections = get_sections(pe_path)
+        target = {"stext", "sdata", ".securom", "srdata"}
+        lines = ["=== SecuROM Sections ==="]
+        found = False
+        for sec in sections:
+            name_lower = sec["name"].lower().strip("\x00").rstrip("\x00")
+            if name_lower in target or any(t in name_lower for t in target):
+                found = True
+                lines.append(f"  {sec['name']}: VA={_format_address(sec['virtual_address'])}  Size=0x{sec['virtual_size']:X} ({sec['virtual_size']:,} bytes)")
+        if not found:
+            lines.append("  No SecuROM sections found.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_pe_tls_callbacks(pe_path: str) -> str:
+    """List TLS callback addresses from a PE file."""
+    try:
+        callbacks = get_tls_callbacks(pe_path)
+        if not callbacks:
+            return f"No TLS callbacks in {os.path.basename(pe_path)}."
+        lines = [f"TLS Callbacks in {os.path.basename(pe_path)}:"]
+        for i, cb in enumerate(callbacks):
+            lines.append(f"  [{i}] RVA 0x{cb:X}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Section Extraction — dump file analysis
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def extract_section_from_dump(dump_path: str, section_va: str, size: int, output_path: str) -> str:
+    """Extract raw bytes at a VA from a process minidump file.
+
+    Uses memprocfs if available, falls back to pefile-based raw search.
+    Use this to extract Stext/Sdata/.securom from a process dump.
+    """
+    try:
+        va = _parse_address_or_expression(section_va)
+
+        extracted = None
+        try:
+            import memprocfs
+            vmm = memprocfs.Vmm(["-device", dump_path])
+            for proc in vmm.process_list():
+                try:
+                    data = proc.memory.read(va, size)
+                    if data and len(data) == size:
+                        extracted = bytes(data)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        if extracted is None:
+            try:
+                import pefile as pef
+                with open(dump_path, "rb") as f:
+                    raw = f.read()
+                offset = 0
+                while offset < len(raw) - 2 and extracted is None:
+                    if raw[offset:offset + 2] == b"MZ":
+                        try:
+                            pe = pef.PE(data=raw[offset:])
+                            image_base = pe.OPTIONAL_HEADER.ImageBase
+                            for section in pe.sections:
+                                sec_va = image_base + section.VirtualAddress
+                                sec_end = sec_va + section.Misc_VirtualSize
+                                if sec_va <= va < sec_end:
+                                    section_offset = va - sec_va
+                                    section_data = section.get_data()
+                                    if section_offset + size <= len(section_data):
+                                        extracted = section_data[section_offset:section_offset + size]
+                                        break
+                        except Exception:
+                            pass
+                    offset += 1
+            except ImportError:
+                pass
+
+        if extracted is None:
+            return f"Could not extract bytes at VA {_format_address(va)} from dump."
+
+        with open(output_path, "wb") as f:
+            f.write(extracted)
+        return f"Extracted {len(extracted):,} bytes to {output_path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def validate_extracted_binary(binary_path: str, expected_va: int = 0) -> str:
+    """Validate an extracted section: entropy, prologues, known strings.
+
+    Scores 0–100. >=70 = VALID, >=40 = SUSPECT, <40 = INVALID.
+    """
+    try:
+        with open(binary_path, "rb") as f:
+            data = f.read()
+        result = validate_extracted_section(data, os.path.basename(binary_path))
+        lines = [
+            f"=== Validation: {os.path.basename(binary_path)} ===",
+            f"Size: {result['size']:,} bytes",
+            f"Entropy: {result['entropy']:.4f}",
+            f"Prologues: {result['prologue_count']}",
+            f"Score: {result['score']}/100 — {result['verdict']}",
+        ]
+        for check in result["checks"]:
+            lines.append(f"  {check}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def extract_securom_sections(dump_path: str, output_dir: str = "") -> str:
+    """Extract all known SecuROM sections from a dump file.
+
+    Extracts Stext (0x67A000), Sdata (0x1122000), .securom (0x146D000).
+    """
+    try:
+        if not output_dir:
+            output_dir = os.path.join(Path.cwd(), "extracted")
+        os.makedirs(output_dir, exist_ok=True)
+
+        results = []
+        for name, (va, size) in TARGET_SECTIONS.items():
+            output = os.path.join(output_dir, f"{name.lower()}.bin")
+            extracted = None
+
+            try:
+                import memprocfs
+                vmm = memprocfs.Vmm(["-device", dump_path])
+                for proc in vmm.process_list():
+                    try:
+                        data = proc.memory.read(va, size)
+                        if data and len(data) == size:
+                            extracted = bytes(data)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            if extracted is None:
+                results.append(f"  {name}: FAILED to extract")
+                continue
+
+            with open(output, "wb") as f:
+                f.write(extracted)
+
+            ent = shannon_entropy(extracted)
+            prologues = len(scan_pattern(extracted, "55 8B EC")) + len(scan_pattern(extracted, "55 89 E5"))
+            results.append(f"  {name}: {output} ({len(extracted):,}b, entropy={ent:.2f}, {prologues} prologues)")
+
+        return "\n".join(results)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Master Workflow — SecuROM extraction
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def workflow_extract_securom(
+    target_exe: str,
+    timeout_sec: int = 120,
+    dump_method: str = "procdump",
+    output_dir: str = "",
+    validate: bool = True,
+) -> str:
+    """Extract decrypted Stext/Sdata/.securom from BoneCrafterModKit.exe.
+
+    Steps: launch -> wait for serial dialog -> dump process -> extract sections -> validate.
+
+    NO debugger, NO PE patching. Works against SecuROM v7-v8 integrity checks.
+
+    Args:
+        target_exe: Full path to BoneCrafterModKit.exe
+        timeout_sec: Max wait for serial dialog (default 120)
+        dump_method: 'procdump' (recommended), 'comsvcs', or 'minidump'
+        output_dir: Output directory (default: ./extracted/)
+        validate: Run entropy + string analysis after extraction
+    """
+    try:
+        if not output_dir:
+            output_dir = os.path.join(Path.cwd(), "extracted")
+
+        result = workflow_extract_securom(
+            target_exe=target_exe,
+            timeout_sec=timeout_sec,
+            dump_method=dump_method,
+            output_dir=output_dir,
+            validate=validate,
+            terminate_after=True,
+        )
+
+        lines = [f"=== Extraction {'SUCCESS' if result.success else 'FAILED'} ==="]
+        lines.append(f"PID: {result.pid}  Method: {result.dump_method}")
+        lines.append(f"Dump: {result.dump_path}")
+        lines.append(f"Elapsed: {result.elapsed_sec:.1f}s")
+
+        for section, path in result.sections_extracted.items():
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            analysis = result.analysis.get(section, {})
+            lines.append(f"\n  {section}: {path} ({size:,} bytes)")
+            if analysis:
+                lines.append(f"    Score: {analysis['score']}/100 — {analysis['verdict']}")
+                for check in analysis.get("checks", []):
+                    lines.append(f"      {check}")
+
+        if result.errors:
+            lines.append("\nErrors:")
+            for err in result.errors:
+                lines.append(f"  X {err}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def workflow_batch_cold_dump(
+    target_exe: str,
+    iterations: int = 5,
+    dump_method: str = "procdump",
+    output_dir: str = "",
+) -> str:
+    """Run extraction multiple times, compare dumps for consistency."""
+    try:
+        if not output_dir:
+            output_dir = os.path.join(Path.cwd(), "extracted")
+
+        results_data = []
+        for i in range(iterations):
+            iteration_dir = os.path.join(output_dir, f"run_{i + 1:02d}")
+            result = workflow_extract_securom(
+                target_exe=target_exe,
+                dump_method=dump_method,
+                output_dir=iteration_dir,
+                sections=["Stext"],
+                validate=True,
+                terminate_after=True,
+            )
+            results_data.append(result)
+
+        lines = [f"=== Batch Results ({iterations} runs) ==="]
+        for i, r in enumerate(results_data):
+            status = "OK" if r.success else "FAIL"
+            analysis = r.analysis.get("Stext", {})
+            lines.append(f"  [{i + 1}] {status}  score={analysis.get('score', 0)}/100  entropy={analysis.get('entropy', '?')}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — New debugger commands
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_debugee_tls_callbacks() -> str:
+    """Get TLS callback RVAs from the debuggee's PE file on disk."""
+    try:
+        client = _require_client()
+        callbacks = client.get_tls_callbacks()
+        if not callbacks:
+            return "No TLS callbacks found in debuggee."
+        lines = [f"TLS Callbacks ({len(callbacks)}):"]
+        for i, cb in enumerate(callbacks):
+            lines.append(f"  [{i}] RVA 0x{cb:X}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def debuggee_virtual_protect_ex(address: str, size: int, new_protection: int = 0x20) -> str:
+    """Change memory protection on a debuggee region.
+    
+    Uses VirtualProtectEx. Common values:
+    0x20 = PAGE_EXECUTE_READ, 0x04 = PAGE_READWRITE, 0x40 = PAGE_EXECUTE_READWRITE
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        result = client.virtual_protect_ex(addr, size, new_protection)
+        return f"Page protection changed at {_format_address(addr)}." if result else "VirtualProtectEx failed."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def debuggee_suspend_all_threads() -> str:
+    """Suspend all threads in the debuggee via ToolHelp snapshot."""
+    try:
+        client = _require_client()
+        ok = client.suspend_all_threads()
+        return "All threads suspended." if ok else "Suspend failed."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def debuggee_get_peb() -> str:
+    """Read the debuggee's PEB: BeingDebugged, NtGlobalFlag, HeapFlags."""
+    try:
+        client = _require_client()
+        peb = client.get_peb()
+        lines = [
+            f"BeingDebugged: {peb.being_debugged}",
+            f"NtGlobalFlag: 0x{peb.nt_global_flag:08X}",
+            f"HeapFlags: 0x{peb.heap_flags:08X}",
+            f"HeapForceFlags: 0x{peb.heap_force_flags:08X}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def debuggee_get_process_info() -> str:
+    """Get debuggee process metadata: PID, entry point, image base, size, path."""
+    try:
+        client = _require_client()
+        info = client.get_process_info()
+        lines = [
+            f"PID: {info.pid}",
+            f"Main Thread: {info.main_thread_id}",
+            f"Entry Point: {_format_address(info.image_base + info.entry_point)}",
+            f"Image Base: {_format_address(info.image_base)}",
+            f"Image Size: {info.image_size:,} bytes",
+            f"64-bit: {info.is_64bit}",
+            f"Path: {info.exe_path}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — x64dbg SecuROM fallback tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def debug_securom_tls_callbacks(target_exe: str) -> str:
+    """Launch target in x64dbg with ScyllaHide, enumerate TLS callbacks."""
+    try:
+        client = _require_client()
+        client.load_executable(target_exe)
+        client.wait_until_debugging(timeout=30)
+        callbacks = client.get_tls_callbacks()
+        peb = client.get_peb()
+        info = client.get_process_info()
+
+        lines = [
+            f"=== TLS Analysis: {target_exe} ===",
+            f"Entry Point: {_format_address(info.image_base + info.entry_point)}",
+            f"Image Base: {_format_address(info.image_base)}",
+            f"PEB.BeingDebugged: {peb.being_debugged}",
+            f"PEB.NtGlobalFlag: 0x{peb.nt_global_flag:08X}",
+            f"TLS Callbacks ({len(callbacks)}):",
+        ]
+        for i, cb in enumerate(callbacks):
+            lines.append(f"  [{i}] RVA 0x{cb:X} (VA {_format_address(info.image_base + cb)})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def bypass_securom_execute_protect(section_name: str = "Stext") -> str:
+    """Change Stext/Sdata/.securom from PAGE_EXECUTE to PAGE_EXECUTE_READ."""
+    section_map = {
+        "Stext": (0x00A7A000, 0x00A18DF0),
+        "Sdata": (0x01522000, 0x0034381C),
+        ".securom": (0x0186D000, 0x00172A4C),
+    }
+    if section_name not in section_map:
+        return f"Unknown section '{section_name}'. Known: {list(section_map.keys())}"
+    va, size = section_map[section_name]
+    PAGE_EXECUTE_READ = 0x20
+    try:
+        client = _require_client()
+        ok = client.virtual_protect_ex(va, size, PAGE_EXECUTE_READ)
+        if ok:
+            return f"Changed {section_name} ({_format_address(va)}, {size:,}b) to PAGE_EXECUTE_READ"
+        return f"VirtualProtectEx failed for {section_name}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# DEPRECATED legacy tools — superseded by api_runtime equivalents
+# These are kept for backward compatibility but agents should prefer:
+#   configure_scyllahide  →  configure_scyllahide (runtime API)
+#   check_peb_after_hide  →  check_antidebug_status (runtime API)
+#   freeze_debugee_for_dump  →  sandbox_dump (runtime API)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def freeze_debugee_for_dump() -> str:
+    """[DEPRECATED] Use sandbox_dump instead. Suspend all debugee threads, dump via comsvcs, then resume."""
+    try:
+        client = _require_client()
+        pid = client.get_process_info().pid
+        if not client.suspend_all_threads():
+            return "[DEPRECATED → use sandbox_dump] Failed to suspend threads."
+        from x64dbg_automate.external.process_dumper import dump_via_comsvcs
+        output = os.path.join(Path.cwd(), "dumps", f"frozen_dump_{pid}.dmp")
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        ok = dump_via_comsvcs(pid, output)
+        return f"[DEPRECATED → use sandbox_dump] Dump: {output} ({'OK' if ok else 'FAILED'})"
+    except Exception as e:
+        return f"[DEPRECATED → use sandbox_dump] Error: {e}"
+
+
+@mcp.tool()
+def configure_scyllahide_for_securom() -> str:
+    """[DEPRECATED] Use configure_scyllahide(sandbox_id) instead. Configure ScyllaHide settings for SecuROM v8 anti-debug."""
+    try:
+        client = _require_client()
+        settings = [
+            ("ScyllaHide", "PEBBeingDebugged", 0),
+            ("ScyllaHide", "PEBHeapFlags", 0),
+            ("ScyllaHide", "NtQueryInformationProcess", 1),
+            ("ScyllaHide", "NtSetInformationThread", 1),
+            ("ScyllaHide", "NtQuerySystemInformation", 1),
+            ("ScyllaHide", "GetTickCount", 1),
+            ("ScyllaHide", "NtClose", 1),
+        ]
+        for section, key, val in settings:
+            client.set_setting_int(section, key, val)
+        return "[DEPRECATED → use configure_scyllahide(sandbox_id)] ScyllaHide configured for SecuROM (7 settings)"
+    except Exception as e:
+        return f"[DEPRECATED → use configure_scyllahide(sandbox_id)] Error: {e}"
+
+
+@mcp.tool()
+def check_peb_after_hide() -> str:
+    """[DEPRECATED] Use check_antidebug_status(sandbox_id) instead. Verify PEB patches are active after ScyllaHide configuration."""
+    try:
+        client = _require_client()
+        peb = client.get_peb()
+        lines = [
+            "[DEPRECATED → use check_antidebug_status(sandbox_id)]",
+            f"BeingDebugged: {peb.being_debugged} (expect False)",
+            f"NtGlobalFlag: 0x{peb.nt_global_flag:08X} (expect 0x00)",
+            f"HeapFlags: 0x{peb.heap_flags:08X} (expect 0x02)",
+            f"HeapForceFlags: 0x{peb.heap_force_flags:08X} (expect 0x00)",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[DEPRECATED → use check_antidebug_status(sandbox_id)] Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — AI-native runtime API (api_runtime package)
+# ---------------------------------------------------------------------------
+# Registers the structured sandbox / anti-debug / composite / semantic-memory /
+# workflow tools onto the same FastMCP instance. Additive — existing tools are
+# unchanged. Failure here must not prevent the legacy tools from loading.
+try:
+    from x64dbg_automate.api_runtime import register_runtime_tools
+
+    _RUNTIME_TOOLS_REGISTERED = register_runtime_tools(mcp)
+except Exception as _runtime_reg_err:  # pragma: no cover - defensive
+    print(
+        f"Warning: failed to register runtime API tools: {_runtime_reg_err}",
+        file=sys.stderr,
+    )
+    _RUNTIME_TOOLS_REGISTERED = 0
 
 
 # ---------------------------------------------------------------------------

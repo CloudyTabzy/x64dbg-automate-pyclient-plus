@@ -395,3 +395,77 @@ class Symbol(BaseModel):
 class ReferenceViewRef(BaseModel):
     address: int
     text: str
+
+
+class PEBSnapshot(BaseModel):
+    being_debugged: bool
+    nt_global_flag: int
+    heap_flags: int
+    heap_force_flags: int
+
+
+class ProcessInfo(BaseModel):
+    pid: int
+    main_thread_id: int
+    entry_point: int
+    image_base: int
+    image_size: int
+    exe_path: str
+    is_64bit: bool
+
+
+class CallStackEntry(BaseModel):
+    address: int
+    from_addr: int
+    to_addr: int
+    comment: str
+
+
+class ThreadInfo(BaseModel):
+    thread_id: int
+    start_address: int
+    local_base: int
+    cip: int
+    suspend_count: int
+    priority: int
+    wait_reason: int
+    last_error: int
+    name: str
+
+
+class XrefRecord(BaseModel):
+    address: int
+    xref_type: int
+
+
+class FunctionBoundaries(BaseModel):
+    start: int
+    end: int
+    instruction_count: int
+    manual: bool
+
+
+class PatchInfo(BaseModel):
+    address: int
+    old_byte: int
+    new_byte: int
+
+
+class ModuleInfo(BaseModel):
+    base: int
+    size: int
+    entry: int
+    section_count: int
+    name: str
+    path: str
+
+
+class SehRecord(BaseModel):
+    address: int
+    handler: int
+
+
+class HandleInfo(BaseModel):
+    handle: int
+    type_number: int
+    granted_access: int

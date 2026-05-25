@@ -32,10 +32,18 @@ ENV/
 *.swp
 *.swo
 
+# Test / type check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Misc
 .DS_Store
 *.log
 
 # docs build output
 site/
+
+# AI assistant local settings
 .claude/settings.local.json
+.kimi/

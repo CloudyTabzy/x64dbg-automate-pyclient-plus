@@ -2,9 +2,10 @@ from enum import StrEnum
 import time
 
 from x64dbg_automate.client_base import XAutoClientBase
-from x64dbg_automate.models import Breakpoint, BreakpointType, Context64, Context32, DisasmArgType, \
-    DisasmInstrType, Flags, FpuReg, Instruction, InstructionArg, MemPage, MxcsrFields, RegDump32, RegDump64, \
-    SegmentReg, Symbol, SymbolType, X87ControlWordFields, X87Fpu, X87StatusWordFields
+from x64dbg_automate.models import Breakpoint, BreakpointType, CallStackEntry, Context64, Context32, DisasmArgType, \
+    DisasmInstrType, Flags, FpuReg, FunctionBoundaries, HandleInfo, Instruction, InstructionArg, MemPage, ModuleInfo, \
+    MxcsrFields, PatchInfo, PEBSnapshot, ProcessInfo, RegDump32, RegDump64, SehRecord, SegmentReg, Symbol, SymbolType, \
+    ThreadInfo, X87ControlWordFields, X87Fpu, X87StatusWordFields, XrefRecord
 
 
 class XAutoCommand(StrEnum):
@@ -34,6 +35,21 @@ class XAutoCommand(StrEnum):
     XAUTO_REQ_GET_LABEL = "XAUTO_REQ_GET_LABEL"
     XAUTO_REQ_GET_COMMENT = "XAUTO_REQ_GET_COMMENT"
     XAUTO_REQ_GET_SYMBOL = "XAUTO_REQ_GET_SYMBOL"
+    XAUTO_REQ_DBG_GET_TLS_CALLBACKS = "XAUTO_REQ_DBG_GET_TLS_CALLBACKS"
+    XAUTO_REQ_DBG_VIRTUAL_PROTECT_EX = "XAUTO_REQ_DBG_VIRTUAL_PROTECT_EX"
+    XAUTO_REQ_DBG_SUSPEND_ALL_THREADS = "XAUTO_REQ_DBG_SUSPEND_ALL_THREADS"
+    XAUTO_REQ_DBG_GET_PEB = "XAUTO_REQ_DBG_GET_PEB"
+    XAUTO_REQ_DBG_GET_PROCESS_INFO = "XAUTO_REQ_DBG_GET_PROCESS_INFO"
+    XAUTO_REQ_DBG_GET_CALLSTACK = "XAUTO_REQ_DBG_GET_CALLSTACK"
+    XAUTO_REQ_DBG_GET_THREADS = "XAUTO_REQ_DBG_GET_THREADS"
+    XAUTO_REQ_DBG_GET_XREFS = "XAUTO_REQ_DBG_GET_XREFS"
+    XAUTO_REQ_DBG_GET_FUNCTION = "XAUTO_REQ_DBG_GET_FUNCTION"
+    XAUTO_REQ_DBG_ANALYZE_FUNCTION = "XAUTO_REQ_DBG_ANALYZE_FUNCTION"
+    XAUTO_REQ_DBG_GET_STRING = "XAUTO_REQ_DBG_GET_STRING"
+    XAUTO_REQ_DBG_GET_PATCHES = "XAUTO_REQ_DBG_GET_PATCHES"
+    XAUTO_REQ_DBG_GET_MODULES = "XAUTO_REQ_DBG_GET_MODULES"
+    XAUTO_REQ_DBG_GET_SEH_CHAIN = "XAUTO_REQ_DBG_GET_SEH_CHAIN"
+    XAUTO_REQ_DBG_GET_HANDLES = "XAUTO_REQ_DBG_GET_HANDLES"
 
 
 class XAutoCommandsMixin(XAutoClientBase):
@@ -522,3 +538,165 @@ class XAutoCommandsMixin(XAutoClientBase):
             True if the debugger is ready, False otherwise
         """
         return self.wait_until_debugging(timeout) and self.wait_until_stopped(timeout)
+
+    def get_tls_callbacks(self) -> list[int]:
+        return self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_TLS_CALLBACKS)
+
+    def virtual_protect_ex(self, addr: int, size: int, new_prot: int) -> bool:
+        return self._send_request(XAutoCommand.XAUTO_REQ_DBG_VIRTUAL_PROTECT_EX, addr, size, new_prot)
+
+    def suspend_all_threads(self) -> bool:
+        suspended, failed = self._send_request(XAutoCommand.XAUTO_REQ_DBG_SUSPEND_ALL_THREADS)
+        return suspended > 0 and failed == 0
+
+    def get_peb(self) -> PEBSnapshot:
+        being_debugged, nt_global_flag, heap_flags, heap_force_flags = \
+            self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_PEB)
+        return PEBSnapshot(
+            being_debugged=bool(being_debugged),
+            nt_global_flag=nt_global_flag,
+            heap_flags=heap_flags,
+            heap_force_flags=heap_force_flags,
+        )
+
+    def get_process_info(self) -> ProcessInfo:
+        pid, tid, ep, base, size, exe_path, is64 = \
+            self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_PROCESS_INFO)
+        return ProcessInfo(
+            pid=pid,
+            main_thread_id=tid,
+            entry_point=ep,
+            image_base=base,
+            image_size=size,
+            exe_path=exe_path,
+            is_64bit=is64,
+        )
+
+    def get_call_stack(self) -> list[CallStackEntry]:
+        """Retrieve the current call stack from x64dbg's debugger.
+
+        Returns:
+            A list of CallStackEntry objects (most recent frame first).
+        """
+        from x64dbg_automate.models import CallStackEntry
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_CALLSTACK)
+        return [CallStackEntry(address=e[0], from_addr=e[1], to_addr=e[2], comment=e[3]) for e in resp]
+
+    def get_threads(self) -> list[ThreadInfo]:
+        """Retrieve the list of threads in the debuggee.
+
+        Returns:
+            A list of ThreadInfo objects.
+        """
+        from x64dbg_automate.models import ThreadInfo
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_THREADS)
+        return [ThreadInfo(
+            thread_id=e[0], start_address=e[1], local_base=e[2], cip=e[3],
+            suspend_count=e[4], priority=e[5], wait_reason=e[6],
+            last_error=e[7], name=e[8],
+        ) for e in resp]
+
+    def get_xrefs(self, addr: int) -> list[XrefRecord]:
+        """Retrieve cross-references to/from an address.
+
+        Args:
+            addr: The address to query xrefs for.
+
+        Returns:
+            A list of XrefRecord objects.
+        """
+        from x64dbg_automate.models import XrefRecord
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_XREFS, addr)
+        return [XrefRecord(address=e[0], xref_type=e[1]) for e in resp]
+
+    def get_function(self, addr: int) -> FunctionBoundaries | None:
+        """Get function boundaries for an address.
+
+        Args:
+            addr: Address within the function.
+
+        Returns:
+            FunctionBoundaries or None if not found.
+        """
+        from x64dbg_automate.models import FunctionBoundaries
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_FUNCTION, addr)
+        if not resp:
+            return None
+        return FunctionBoundaries(start=resp[0], end=resp[1], instruction_count=resp[2], manual=resp[3])
+
+    def analyze_function(self, entry: int) -> dict | None:
+        """Analyze a function and return its control flow graph.
+
+        Args:
+            entry: Function entry point address.
+
+        Returns:
+            Dict with 'entry_point' and 'nodes', or None on failure.
+        """
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_ANALYZE_FUNCTION, entry)
+        if not resp:
+            return None
+        entry_point, raw_nodes = resp
+        nodes = []
+        for n in raw_nodes:
+            nodes.append({
+                "start": n[0], "end": n[1], "brtrue": n[2], "brfalse": n[3],
+                "instruction_count": n[4], "terminal": n[5], "split": n[6],
+                "indirect_call": n[7], "exits": n[8],
+                "instructions": [{"address": ins[0], "bytes": bytes(ins[1])} for ins in n[9]],
+            })
+        return {"entry_point": entry_point, "nodes": nodes}
+
+    def get_string_at(self, addr: int) -> str:
+        """Get an auto-detected string at an address.
+
+        Args:
+            addr: The address to check.
+
+        Returns:
+            The string or empty string if none found.
+        """
+        return self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_STRING, addr)
+
+    def get_patches(self) -> list[PatchInfo]:
+        """Get all patched bytes in the debuggee.
+
+        Returns:
+            A list of PatchInfo objects.
+        """
+        from x64dbg_automate.models import PatchInfo
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_PATCHES)
+        return [PatchInfo(address=e[0], old_byte=e[1], new_byte=e[2]) for e in resp]
+
+    def get_modules(self) -> list[ModuleInfo]:
+        """Get all loaded modules in the debuggee.
+
+        Returns:
+            A list of ModuleInfo objects.
+        """
+        from x64dbg_automate.models import ModuleInfo
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_MODULES)
+        return [ModuleInfo(
+            base=e[0], size=e[1], entry=e[2], section_count=e[3],
+            name=e[4], path=e[5],
+        ) for e in resp]
+
+    def get_seh_chain(self) -> list[SehRecord]:
+        """Get the SEH (Structured Exception Handling) chain.
+
+        Returns:
+            A list of SehRecord objects.
+        """
+        from x64dbg_automate.models import SehRecord
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_SEH_CHAIN)
+        return [SehRecord(address=e[0], handler=e[1]) for e in resp]
+
+    def get_handles(self) -> list[HandleInfo]:
+        """Get all handles in the debuggee process.
+
+        Returns:
+            A list of HandleInfo objects.
+        """
+        from x64dbg_automate.models import HandleInfo
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_HANDLES)
+        return [HandleInfo(handle=e[0], type_number=e[1], granted_access=e[2]) for e in resp]

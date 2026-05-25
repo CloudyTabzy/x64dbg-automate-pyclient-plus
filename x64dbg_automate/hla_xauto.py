@@ -839,3 +839,16 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
             text = ref.text.replace('"', '\\"')
             if not self.cmd_sync(f'refadd 0x{ref.address:x}, "{text}"'):
                 return False
+        return True
+
+    def dump_section_to_file(self, section_va: int, section_size: int, output_path: str) -> bool:
+        self.virtual_protect_ex(section_va, section_size, 0x20)
+        data = self.read_memory(section_va, section_size)
+        with open(output_path, "wb") as f:
+            f.write(data)
+        return os.path.exists(output_path)
+
+    def analyze_region_entropy(self, va: int, size: int) -> dict:
+        from x64dbg_automate.external.memory_analysis import analyze_region as _ar
+        data = self.read_memory(va, size)
+        return _ar(data, va)

@@ -1,0 +1,379 @@
+"""Sandbox lifecycle management for the AI-native runtime API.
+
+A **sandbox** here is a *disposable debugged session*: one ``X64DbgClient`` bound to
+one launched-or-attached target under x64dbg/x32dbg. The on-disk binary is never
+patched, so each debugged instance is freely killable — that is the isolation
+guarantee. This deliberately does **not** try to clone a running process into a
+separately-runnable copy (a ``PssCaptureSnapshot`` VA-clone is a frozen read-only
+snapshot, not an executable process). Three safety primitives instead:
+
+1. ``create_sandbox`` / ``destroy_sandbox`` — disposable debugged instances.
+2. ``checkpoint`` / ``restore_checkpoint`` — best-effort userland state snapshots
+   (active-thread registers + caller-chosen memory regions). Not a kernel-level
+   fork: handles, new threads, and kernel object state are NOT restored.
+3. Read-only forensic dumps (ProcDump/PssCaptureSnapshot) live in the existing
+   ``external.process_dumper`` and are surfaced by the sandbox tool layer.
+
+The manager keys multiple sandboxes by ``sandbox_id``, mirroring Synapse's
+``IDASessionManager``.
+"""
+
+from __future__ import annotations
+
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import TYPE_CHECKING
+
+from x64dbg_automate.dbg_paths import (
+    pe_bitness,
+    resolve_debugger_path,
+    resolve_x64dbg_path_with_env,
+)
+
+if TYPE_CHECKING:
+    from x64dbg_automate import X64DbgClient
+
+# Curated general-purpose register sets captured/restored by checkpoints.
+_GP_REGS_64 = [
+    "rax", "rbx", "rcx", "rdx", "rbp", "rsp", "rsi", "rdi",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags",
+]
+_GP_REGS_32 = ["eax", "ebx", "ecx", "edx", "ebp", "esp", "esi", "edi", "eip", "eflags"]
+
+
+@dataclass
+class Checkpoint:
+    """A best-effort userland snapshot of a debugged target's state."""
+
+    name: str
+    created_at: datetime
+    arch: str                                   # "x64" or "x32"
+    registers: dict[str, int] = field(default_factory=dict)
+    memory: dict[int, bytes] = field(default_factory=dict)   # addr -> captured bytes
+    thread_count: int = 0
+    debuggee_pid: int | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    def to_info(self) -> dict:
+        """JSON-safe summary (no raw bytes)."""
+        return {
+            "name": self.name,
+            "created_at": self.created_at.isoformat(timespec="seconds"),
+            "arch": self.arch,
+            "register_count": len(self.registers),
+            "region_count": len(self.memory),
+            "total_bytes": sum(len(b) for b in self.memory.values()),
+            "thread_count": self.thread_count,
+            "warnings": self.warnings,
+        }
+
+
+@dataclass
+class ProcessSandbox:
+    """A disposable debugged session managed by :class:`SandboxManager`."""
+
+    sandbox_id: str
+    debugger_pid: int                           # PID of the x64dbg/x32dbg process
+    debugger_arch: str                          # "x64" or "x32"
+    created_at: datetime
+    target_exe: str | None = None
+    attach_pid: int | None = None               # source PID when created via attach
+    debuggee_pid: int | None = None             # the actual target PID
+    state: str = "created"                       # created|running|stopped|detached|destroyed|crashed
+    anti_debug_applied: bool = False
+    last_error: str | None = None
+    checkpoints: dict[str, Checkpoint] = field(default_factory=dict)
+    client: "X64DbgClient | None" = None
+
+    def to_info(self) -> dict:
+        """JSON-safe metadata for tool responses (never includes the client)."""
+        return {
+            "sandbox_id": self.sandbox_id,
+            "debugger_pid": self.debugger_pid,
+            "debuggee_pid": self.debuggee_pid,
+            "debugger_arch": self.debugger_arch,
+            "target_exe": self.target_exe,
+            "attach_pid": self.attach_pid,
+            "state": self.state,
+            "anti_debug_applied": self.anti_debug_applied,
+            "created_at": self.created_at.isoformat(timespec="seconds"),
+            "checkpoints": [cp.to_info() for cp in self.checkpoints.values()],
+            "last_error": self.last_error,
+        }
+
+
+class SandboxError(Exception):
+    """Raised for sandbox lifecycle failures (creation, lookup, teardown)."""
+
+
+class SandboxManager:
+    """Tracks and operates on multiple disposable debugged sessions."""
+
+    def __init__(self) -> None:
+        self._sandboxes: dict[str, ProcessSandbox] = {}
+        self._lock = threading.RLock()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def create_sandbox(
+        self,
+        target_exe: str | None = None,
+        attach_pid: int | None = None,
+        cmdline: str = "",
+        current_dir: str = "",
+        x64dbg_path: str = "",
+    ) -> ProcessSandbox:
+        """Launch (or attach) a target under a fresh debugger and register it.
+
+        Exactly one of ``target_exe`` or ``attach_pid`` must be provided.
+        """
+        if bool(target_exe) == bool(attach_pid):
+            raise ValueError("Provide exactly one of target_exe or attach_pid")
+
+        from x64dbg_automate import X64DbgClient  # local import avoids import cycle
+
+        base_path = resolve_x64dbg_path_with_env(x64dbg_path)
+        bitness_exe = target_exe or self._exe_path_for_pid(attach_pid) or ""
+        resolved = resolve_debugger_path(base_path, bitness_exe)
+
+        client = X64DbgClient(resolved)
+        try:
+            if target_exe:
+                debugger_pid = client.start_session(target_exe, cmdline, current_dir)
+            else:
+                debugger_pid = client.start_session_attach(int(attach_pid))  # type: ignore[arg-type]
+        except Exception as exc:
+            self._safe_terminate(client)
+            raise SandboxError(f"Failed to create sandbox: {exc}") from exc
+
+        arch = self._detect_arch(client, bitness_exe)
+        sandbox = ProcessSandbox(
+            sandbox_id=uuid.uuid4().hex[:8],
+            debugger_pid=debugger_pid,
+            debugger_arch=arch,
+            created_at=datetime.now(),
+            target_exe=target_exe,
+            attach_pid=attach_pid,
+            debuggee_pid=self._safe_debuggee_pid(client),
+            state="stopped" if self._safe_is_debugging(client) else "created",
+            client=client,
+        )
+        with self._lock:
+            self._sandboxes[sandbox.sandbox_id] = sandbox
+        return sandbox
+
+    def destroy_sandbox(self, sandbox_id: str) -> bool:
+        """Terminate the sandbox's debugger process and forget it."""
+        with self._lock:
+            sandbox = self._sandboxes.pop(sandbox_id, None)
+        if sandbox is None:
+            raise KeyError(f"No sandbox with id '{sandbox_id}'")
+        ok = self._safe_terminate(sandbox.client)
+        sandbox.state = "destroyed"
+        sandbox.client = None
+        return ok
+
+    def get_sandbox(self, sandbox_id: str) -> ProcessSandbox:
+        with self._lock:
+            sandbox = self._sandboxes.get(sandbox_id)
+        if sandbox is None:
+            raise KeyError(f"No sandbox with id '{sandbox_id}'")
+        return sandbox
+
+    def get_client(self, sandbox_id: str) -> "X64DbgClient":
+        sandbox = self.get_sandbox(sandbox_id)
+        if sandbox.client is None:
+            raise SandboxError(f"Sandbox '{sandbox_id}' has no active debugger client")
+        return sandbox.client
+
+    def list_sandboxes(self) -> list[ProcessSandbox]:
+        with self._lock:
+            return list(self._sandboxes.values())
+
+    def refresh_state(self, sandbox: ProcessSandbox) -> str:
+        """Re-query the live debugger state, updating ``sandbox.state``."""
+        client = sandbox.client
+        if client is None:
+            sandbox.state = "destroyed"
+            return sandbox.state
+        try:
+            if not client.is_debugging():
+                sandbox.state = "detached"
+            elif client.is_running():
+                sandbox.state = "running"
+            else:
+                sandbox.state = "stopped"
+        except Exception as exc:  # RPC dead → debugger likely gone
+            sandbox.state = "crashed"
+            sandbox.last_error = str(exc)
+        return sandbox.state
+
+    # -- checkpoint / restore ---------------------------------------------
+
+    def _count_threads(self, pid: int | None) -> int:
+        if not pid:
+            return 0
+        try:
+            import psutil
+            return psutil.Process(pid).num_threads()
+        except Exception:
+            return 0
+
+    def checkpoint(
+        self,
+        sandbox_id: str,
+        name: str,
+        regions: list[tuple[int, int]] | None = None,
+    ) -> Checkpoint:
+        """Capture a best-effort userland snapshot (registers + chosen regions)."""
+        sandbox = self.get_sandbox(sandbox_id)
+        client = self.get_client(sandbox_id)
+        self._ensure_stopped(client)
+
+        registers: dict[str, int] = {}
+        for reg in self._reg_names(sandbox):
+            try:
+                registers[reg] = client.get_reg(reg)
+            except Exception:
+                pass  # subregister unavailable for this arch — skip
+
+        memory: dict[int, bytes] = {}
+        for addr, size in (regions or []):
+            memory[addr] = client.read_memory(addr, size)
+
+        thread_count = self._count_threads(sandbox.debuggee_pid)
+
+        cp = Checkpoint(
+            name=name,
+            created_at=datetime.now(),
+            arch=sandbox.debugger_arch,
+            registers=registers,
+            memory=memory,
+            thread_count=thread_count,
+            debuggee_pid=sandbox.debuggee_pid,
+            warnings=[
+                "Checkpoint captures only active-thread registers + chosen memory.",
+                "Kernel handles, new threads, and mapped file state are NOT restored.",
+            ],
+        )
+        sandbox.checkpoints[name] = cp
+        return cp
+
+    def restore_checkpoint(self, sandbox_id: str, name: str) -> tuple[int, int, list[str]]:
+        """Restore a checkpoint. Returns (registers_restored, regions_restored, warnings)."""
+        sandbox = self.get_sandbox(sandbox_id)
+        client = self.get_client(sandbox_id)
+        cp = sandbox.checkpoints.get(name)
+        if cp is None:
+            raise KeyError(f"No checkpoint '{name}' in sandbox '{sandbox_id}'")
+        self._ensure_stopped(client)
+
+        warnings: list[str] = list(cp.warnings)
+        current_threads = self._count_threads(sandbox.debuggee_pid)
+        if current_threads != cp.thread_count:
+            warnings.append(
+                f"Thread count changed: {cp.thread_count} at checkpoint → {current_threads} now. "
+                "New threads will continue running with stale register state."
+            )
+
+        regions_restored = 0
+        for addr, data in cp.memory.items():
+            try:
+                if client.write_memory(addr, data):
+                    regions_restored += 1
+            except Exception:
+                pass
+
+        regs_restored = 0
+        for reg, val in cp.registers.items():
+            try:
+                if client.set_reg(reg, val):
+                    regs_restored += 1
+            except Exception:
+                pass
+
+        return regs_restored, regions_restored, warnings
+
+    # -- helpers -----------------------------------------------------------
+
+    def _reg_names(self, sandbox: ProcessSandbox) -> list[str]:
+        return _GP_REGS_64 if sandbox.debugger_arch == "x64" else _GP_REGS_32
+
+    @staticmethod
+    def _ensure_stopped(client: "X64DbgClient") -> None:
+        try:
+            if client.is_running():
+                client.pause()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _detect_arch(client: "X64DbgClient", bitness_exe: str) -> str:
+        try:
+            bits = client.debugee_bitness()
+            if bits in (32, 64):
+                return "x64" if bits == 64 else "x32"
+        except Exception:
+            pass
+        if bitness_exe:
+            try:
+                return "x64" if pe_bitness(bitness_exe) == 64 else "x32"
+            except Exception:
+                pass
+        return "x64"
+
+    @staticmethod
+    def _exe_path_for_pid(pid: int | None) -> str:
+        if not pid:
+            return ""
+        try:
+            import psutil
+
+            return psutil.Process(int(pid)).exe() or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _safe_debuggee_pid(client: "X64DbgClient") -> int | None:
+        try:
+            return client.debugee_pid()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_is_debugging(client: "X64DbgClient") -> bool:
+        try:
+            return bool(client.is_debugging())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _safe_terminate(client: "X64DbgClient | None") -> bool:
+        if client is None:
+            return True
+        try:
+            client.terminate_session()
+            return True
+        except Exception:
+            try:
+                client.detach_session()
+            except Exception:
+                pass
+            return False
+
+
+# Module-level singleton (mirrors the existing mcp_server global-client pattern).
+_manager: SandboxManager | None = None
+_manager_lock = threading.Lock()
+
+
+def get_manager() -> SandboxManager:
+    """Return the process-wide SandboxManager, creating it on first use."""
+    global _manager
+    if _manager is None:
+        with _manager_lock:
+            if _manager is None:
+                _manager = SandboxManager()
+    return _manager
