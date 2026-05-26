@@ -50,6 +50,10 @@ class XAutoCommand(StrEnum):
     XAUTO_REQ_DBG_GET_MODULES = "XAUTO_REQ_DBG_GET_MODULES"
     XAUTO_REQ_DBG_GET_SEH_CHAIN = "XAUTO_REQ_DBG_GET_SEH_CHAIN"
     XAUTO_REQ_DBG_GET_HANDLES = "XAUTO_REQ_DBG_GET_HANDLES"
+    XAUTO_REQ_COVERAGE_START = "XAUTO_REQ_COVERAGE_START"
+    XAUTO_REQ_COVERAGE_STOP = "XAUTO_REQ_COVERAGE_STOP"
+    XAUTO_REQ_COVERAGE_GET = "XAUTO_REQ_COVERAGE_GET"
+    XAUTO_REQ_COVERAGE_CLEAR = "XAUTO_REQ_COVERAGE_CLEAR"
 
 
 class XAutoCommandsMixin(XAutoClientBase):
@@ -700,3 +704,46 @@ class XAutoCommandsMixin(XAutoClientBase):
         from x64dbg_automate.models import HandleInfo
         resp = self._send_request(XAutoCommand.XAUTO_REQ_DBG_GET_HANDLES)
         return [HandleInfo(handle=e[0], type_number=e[1], granted_access=e[2]) for e in resp]
+
+    def coverage_start(self) -> tuple[bool, int]:
+        """Start recording code coverage via TRACEEXECUTE callback.
+
+        Coverage is only collected while x64dbg's trace (TraceIntoConditional etc.)
+        is running.  Call this before issuing a trace command.
+
+        Returns:
+            (active, existing_count) — always (True, N) on success.
+        """
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_COVERAGE_START)
+        return (bool(resp[0]), int(resp[1]))
+
+    def coverage_stop(self) -> tuple[bool, int]:
+        """Stop recording code coverage.
+
+        Returns:
+            (active, final_count) — always (False, N) on success.
+        """
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_COVERAGE_STOP)
+        return (bool(resp[0]), int(resp[1]))
+
+    def coverage_get(self, start: int = 0, end: int = 0) -> list[int]:
+        """Return all addresses recorded in the coverage set.
+
+        Args:
+            start: Optional lower bound (inclusive).  0 = no filter.
+            end:   Optional upper bound (exclusive).  0 = no filter.
+
+        Returns:
+            Sorted list of instruction addresses visited during tracing.
+        """
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_COVERAGE_GET, start, end)
+        return list(resp[0])
+
+    def coverage_clear(self) -> bool:
+        """Clear all coverage data accumulated so far.
+
+        Returns:
+            True on success.
+        """
+        resp = self._send_request(XAutoCommand.XAUTO_REQ_COVERAGE_CLEAR)
+        return bool(resp)

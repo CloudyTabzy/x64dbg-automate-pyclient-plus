@@ -938,3 +938,163 @@ class TestSymbolTools:
         r = get_type_info(sandbox_id="aa11", address="0x401000", type_name="BOGUS")
         assert r["success"] is False
         assert r["error_type"] == ErrorType.NOT_FOUND
+
+
+# ---------------------------------------------------------------------------
+# Coverage tools
+# ---------------------------------------------------------------------------
+
+class TestCoverageTools:
+    def test_coverage_start(self, manager):
+        from x64dbg_automate.api_runtime.api_coverage import coverage_start
+
+        sb = _mock_sandbox(manager, sid="cc11")
+        sb.client.is_running.return_value = False
+        sb.client.coverage_start.return_value = (True, 0)
+        r = coverage_start(sandbox_id="cc11")
+        assert r["success"]
+        assert r["active"] is True
+        assert r["existing_count"] == 0
+        sb.client.coverage_start.assert_called_once()
+
+    def test_coverage_stop(self, manager):
+        from x64dbg_automate.api_runtime.api_coverage import coverage_stop
+
+        sb = _mock_sandbox(manager, sid="cc11")
+        sb.client.is_running.return_value = False
+        sb.client.coverage_stop.return_value = (False, 42)
+        r = coverage_stop(sandbox_id="cc11")
+        assert r["success"]
+        assert r["active"] is False
+        assert r["total_count"] == 42
+
+    def test_coverage_query_flat(self, manager):
+        from x64dbg_automate.api_runtime.api_coverage import coverage_query
+
+        sb = _mock_sandbox(manager, sid="cc11")
+        addrs = [0x401000, 0x401010, 0x401020]
+        sb.client.coverage_get.return_value = addrs
+        r = coverage_query(sandbox_id="cc11")
+        assert r["success"]
+        assert r["total"] == 3
+        assert "0x401000" in r["addresses"]
+
+    def test_coverage_query_with_filter(self, manager):
+        from x64dbg_automate.api_runtime.api_coverage import coverage_query
+        from unittest.mock import patch as mpatch
+
+        sb = _mock_sandbox(manager, sid="cc11")
+        sb.client.coverage_get.return_value = [0x401000]
+        with mpatch("x64dbg_automate.api_runtime.runtime_helpers.resolve_addr") as mock_ra:
+            mock_ra.side_effect = lambda c, expr: int(expr, 16)
+            r = coverage_query(
+                sandbox_id="cc11",
+                start_address="0x401000",
+                end_address="0x402000",
+            )
+        assert r["success"]
+        sb.client.coverage_get.assert_called_with(0x401000, 0x402000)
+
+    def test_coverage_clear(self, manager):
+        from x64dbg_automate.api_runtime.api_coverage import coverage_clear
+
+        sb = _mock_sandbox(manager, sid="cc11")
+        sb.client.coverage_clear.return_value = True
+        r = coverage_clear(sandbox_id="cc11")
+        assert r["success"]
+        assert r["cleared"] is True
+
+    def test_coverage_no_client(self, manager):
+        from x64dbg_automate.api_runtime.api_coverage import coverage_start
+
+        sb = ProcessSandbox(
+            sandbox_id="noconn",
+            debugger_pid=0,
+            debugger_arch="x64",
+            created_at=__import__("datetime").datetime.now(),
+            client=None,
+        )
+        manager._sandboxes["noconn"] = sb
+        r = coverage_start(sandbox_id="noconn")
+        assert r["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# Exception handler tools
+# ---------------------------------------------------------------------------
+
+class TestExceptionTools:
+    def test_set_handler_break(self, manager):
+        from x64dbg_automate.api_runtime.api_exceptions import exception_set_handler
+
+        sb = _mock_sandbox(manager, sid="ex11")
+        sb.client.is_running.return_value = False
+        r = exception_set_handler(
+            sandbox_id="ex11",
+            exception_code="0xC0000094",
+            action="break",
+        )
+        assert r["success"]
+        assert r["exception_code"] == "0xC0000094"
+        assert r["action"] == "break"
+        sb.client.cmd_sync.assert_called_once()
+        call_arg = sb.client.cmd_sync.call_args[0][0]
+        assert "SetExceptionBPX" in call_arg
+        assert "C0000094" in call_arg.upper()
+
+    def test_set_handler_pass(self, manager):
+        from x64dbg_automate.api_runtime.api_exceptions import exception_set_handler
+
+        sb = _mock_sandbox(manager, sid="ex11")
+        sb.client.is_running.return_value = False
+        r = exception_set_handler(
+            sandbox_id="ex11",
+            exception_code="0xC0000094",
+            action="pass",
+        )
+        assert r["success"]
+        call_arg = sb.client.cmd_sync.call_args[0][0]
+        assert "DeleteExceptionBPX" in call_arg
+
+    def test_set_handler_invalid_action(self, manager):
+        from x64dbg_automate.api_runtime.api_exceptions import exception_set_handler
+
+        _mock_sandbox(manager, sid="ex11")
+        r = exception_set_handler(
+            sandbox_id="ex11",
+            exception_code="0xC0000094",
+            action="nuke",
+        )
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_set_handler_bad_code(self, manager):
+        from x64dbg_automate.api_runtime.api_exceptions import exception_set_handler
+
+        _mock_sandbox(manager, sid="ex11")
+        r = exception_set_handler(
+            sandbox_id="ex11",
+            exception_code="notanumber",
+            action="break",
+        )
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_exception_list_known(self):
+        from x64dbg_automate.api_runtime.api_exceptions import exception_list_known
+
+        r = exception_list_known()
+        assert r["success"]
+        assert r["total"] > 0
+        codes = [e["code"] for e in r["exceptions"]]
+        assert "0xC0000094" in codes
+
+    def test_configure_securom(self, manager):
+        from x64dbg_automate.api_runtime.api_exceptions import exception_configure_securom
+
+        sb = _mock_sandbox(manager, sid="ex11")
+        sb.client.is_running.return_value = False
+        r = exception_configure_securom(sandbox_id="ex11")
+        assert r["success"]
+        assert r["all_succeeded"]
+        assert len(r["applied"]) == 3
