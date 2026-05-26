@@ -702,6 +702,174 @@ def get_call_stack(sandbox_id: str | None = None) -> dict:
 
 
 @tool
+def graph_memory_layout(
+    sandbox_id: str | None = None,
+    sample_entropy: bool = True,
+    entropy_sample_bytes: int = 4096,
+) -> dict:
+    """Produce a structured memory layout map with anomaly highlighting.
+
+    Groups adjacent committed regions by type/module, labels protection flags,
+    and flags anomalies: RWX (read-write-execute), PAGE_GUARD, high-entropy
+    regions, and executable non-module pages.
+
+    Args:
+        sandbox_id: Sandbox to inspect.
+        sample_entropy: Whether to sample region entropy (adds RPC overhead).
+        entropy_sample_bytes: Bytes to sample per region for entropy (default 4 KiB).
+    """
+    _MEM_COMMIT = 0x1000
+    _MEM_PRIVATE = 0x20000
+    _MEM_MAPPED = 0x40000
+    _MEM_IMAGE = 0x1000000
+
+    _PROT_NAMES = {
+        0x01: "noaccess",
+        0x02: "readonly",
+        0x04: "readwrite",
+        0x08: "writecopy",
+        0x10: "execute",
+        0x20: "execute_read",
+        0x40: "execute_readwrite",
+        0x80: "execute_writecopy",
+    }
+
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    try:
+        pages = client.memmap()
+    except Exception as exc:
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    committed = [p for p in pages if p.state == _MEM_COMMIT]
+    if not committed:
+        return ok(sandbox_id=sandbox_id, regions=[], total=0, anomalies=[])
+
+    regions: list[dict] = []
+    for page in committed:
+        # Type label
+        if page.type == _MEM_IMAGE:
+            rtype = "image"
+        elif page.type == _MEM_MAPPED:
+            rtype = "mapped"
+        elif page.type == _MEM_PRIVATE:
+            rtype = "private"
+        else:
+            rtype = "unknown"
+
+        # Protection decode
+        low_prot = page.protect & 0xFF
+        prot_str = _PROT_NAMES.get(low_prot, f"0x{low_prot:X}")
+        is_guard = bool(page.protect & 0x100)
+        is_rwx = low_prot == 0x40
+        is_executable = low_prot in (0x10, 0x20, 0x40, 0x80)
+
+        # Anomalies
+        anomalies: list[str] = []
+        if is_rwx:
+            anomalies.append("RWX")
+        if is_guard:
+            anomalies.append("PAGE_GUARD")
+        if is_executable and not page.info and rtype != "image":
+            anomalies.append("EXEC_NON_MODULE")
+
+        # Entropy (optional, sampled to avoid RPC thrashing)
+        entropy: float | None = None
+        if sample_entropy:
+            sample = min(entropy_sample_bytes, page.region_size)
+            try:
+                data = client.read_memory(page.base_address, sample)
+                if data and data.count(data[0]) != len(data):
+                    entropy = round(shannon_entropy(data), 4)
+                    if entropy >= 7.0:
+                        anomalies.append("HIGH_ENTROPY")
+            except Exception:
+                pass
+
+        regions.append({
+            "start": f"0x{page.base_address:X}",
+            "end": f"0x{page.base_address + page.region_size:X}",
+            "size": page.region_size,
+            "type": rtype,
+            "name": page.info or "",
+            "protection": f"0x{page.protect:X}",
+            "protection_str": prot_str,
+            "entropy": entropy,
+            "anomalies": anomalies,
+        })
+
+    # Group adjacent regions with same type and name
+    grouped: list[dict] = []
+    if regions:
+        cur = {
+            "start": regions[0]["start"],
+            "end": regions[0]["end"],
+            "size": regions[0]["size"],
+            "type": regions[0]["type"],
+            "name": regions[0]["name"],
+            "protection": regions[0]["protection"],
+            "protection_str": regions[0]["protection_str"],
+            "anomalies": list(regions[0]["anomalies"]),
+            "sub_regions": 1,
+            "entropy": regions[0].get("entropy"),
+        }
+        for r in regions[1:]:
+            # Check adjacency: current end == next start
+            cur_end = int(cur["end"], 16)
+            r_start = int(r["start"], 16)
+            if (cur_end == r_start and cur["type"] == r["type"]
+                    and cur["name"] == r["name"]
+                    and cur["protection_str"] == r["protection_str"]):
+                cur["end"] = r["end"]
+                cur["size"] += r["size"]
+                cur["sub_regions"] += 1
+                for a in r["anomalies"]:
+                    if a not in cur["anomalies"]:
+                        cur["anomalies"].append(a)
+                if r.get("entropy") is not None:
+                    cur["entropy"] = max(cur.get("entropy") or 0, r["entropy"])
+            else:
+                grouped.append(cur)
+                cur = {
+                    "start": r["start"],
+                    "end": r["end"],
+                    "size": r["size"],
+                    "type": r["type"],
+                    "name": r["name"],
+                    "protection": r["protection"],
+                    "protection_str": r["protection_str"],
+                    "anomalies": list(r["anomalies"]),
+                    "sub_regions": 1,
+                    "entropy": r.get("entropy"),
+                }
+        grouped.append(cur)
+
+    # Anomaly summary
+    summary = {
+        "rwx_count": sum(1 for g in grouped if "RWX" in g["anomalies"]),
+        "guard_count": sum(1 for g in grouped if "PAGE_GUARD" in g["anomalies"]),
+        "exec_non_module_count": sum(
+            1 for g in grouped if "EXEC_NON_MODULE" in g["anomalies"]
+        ),
+        "high_entropy_count": sum(1 for g in grouped if "HIGH_ENTROPY" in g["anomalies"]),
+        "total_grouped": len(grouped),
+        "total_raw": len(regions),
+    }
+
+    return ok(
+        sandbox_id=sandbox_id,
+        regions=grouped,
+        summary=summary,
+    )
+
+
+@tool
 def sandbox_cross_diff(
     sandbox_a_id: str,
     sandbox_b_id: str,

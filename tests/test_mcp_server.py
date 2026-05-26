@@ -1171,3 +1171,62 @@ class TestResumeProcess:
         result = mcp_mod.resume_process(99999)
         assert isinstance(result, dict)
         assert "success" in result
+
+
+
+class TestWorkflowShadowingFix:
+    """Ensure workflow_extract_binary MCP wrapper does not shadow the imported impl."""
+
+    def test_wrapper_calls_impl_not_itself(self):
+        """The MCP wrapper must call _workflow_extract_binary_impl, not recurse."""
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.pid = 1234
+        mock_result.dump_path = "/tmp/dump.dmp"
+        mock_result.dump_method = "procdump"
+        mock_result.sections_extracted = {"Stext": "/tmp/stext.bin"}
+        mock_result.analysis = {"Stext": {"score": 0.95, "verdict": "valid", "checks": []}}
+        mock_result.errors = []
+        mock_result.elapsed_sec = 5.0
+
+        with patch.object(mcp_mod, "_workflow_extract_binary_impl", return_value=mock_result) as mock_impl:
+            result = mcp_mod.workflow_extract_binary(
+                target_exe="C:/fake/target.exe",
+                timeout_sec=30,
+                dump_method="procdump",
+                output_dir="C:/out",
+                validate=True,
+                window_title="Ready",
+            )
+            assert result["success"] is True
+            assert result["pid"] == 1234
+            mock_impl.assert_called_once()
+            # Verify kwargs passed through include terminate_after and window_title
+            call_kwargs = mock_impl.call_args.kwargs
+            assert call_kwargs["terminate_after"] is True
+            assert call_kwargs["window_title"] == "Ready"
+
+    def test_batch_calls_impl_with_sections(self):
+        """workflow_batch_cold_dump must pass sections= to the impl, not the wrapper."""
+        mock_result = MagicMock()
+        mock_result.success = True
+        mock_result.pid = 1234
+        mock_result.dump_path = "/tmp/dump.dmp"
+        mock_result.dump_method = "procdump"
+        mock_result.analysis = {"Stext": {"score": 0.9}}
+        mock_result.errors = []
+
+        with patch.object(mcp_mod, "_workflow_extract_binary_impl", return_value=mock_result) as mock_impl:
+            result = mcp_mod.workflow_batch_cold_dump(
+                target_exe="C:/fake/target.exe",
+                iterations=2,
+                dump_method="procdump",
+                output_dir="C:/out",
+            )
+            assert result["success"] is True
+            assert result["iterations"] == 2
+            assert mock_impl.call_count == 2
+            # Verify sections kwarg is passed (the wrapper doesn't accept this)
+            for call in mock_impl.call_args_list:
+                assert call.kwargs["sections"] == ["Stext"]
+                assert call.kwargs["terminate_after"] is True

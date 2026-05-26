@@ -3260,3 +3260,175 @@ class TestFleetTools:
         )
         assert r["success"] is False
         assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+
+
+class TestToolUsageStats:
+    def test_empty_telemetry(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import tool_usage_stats
+        from x64dbg_automate.api_runtime.registry import reset_telemetry
+
+        reset_telemetry()
+        r = tool_usage_stats()
+        assert r["success"]
+        assert r["total_calls"] == 0
+        assert "No telemetry" in r["note"]
+
+    def test_records_after_tool_call(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import tool_usage_stats
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_list
+        from x64dbg_automate.api_runtime.registry import reset_telemetry
+
+        reset_telemetry()
+        _mock_sandbox(manager, sid="sb01")
+        sandbox_list()
+
+        r = tool_usage_stats()
+        assert r["success"]
+        assert r["total_calls"] >= 1
+        names = {t["name"] for t in r["tools"]}
+        assert "sandbox_list" in names
+
+    def test_reset_clears_counters(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import tool_usage_stats
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_list
+        from x64dbg_automate.api_runtime.registry import reset_telemetry
+
+        reset_telemetry()
+        _mock_sandbox(manager, sid="sb01")
+        sandbox_list()
+
+        r = tool_usage_stats(reset=True)
+        assert r["success"]
+        assert r.get("reset") is True
+        assert r["total_calls"] >= 1
+        # After reset, the previous sandbox_list call should be gone.
+        # (tool_usage_stats itself may be recorded from the reset call wrapper.)
+        r2 = tool_usage_stats()
+        names = {t["name"] for t in r2["tools"]}
+        assert "sandbox_list" not in names
+
+    def test_error_counting(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import tool_usage_stats
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_info
+        from x64dbg_automate.api_runtime.registry import reset_telemetry
+
+        reset_telemetry()
+        # Call with nonexistent sandbox → error
+        sandbox_info(sandbox_id="ghost")
+
+        r = tool_usage_stats()
+        assert r["success"]
+        entry = next((t for t in r["tools"] if t["name"] == "sandbox_info"), None)
+        assert entry is not None
+        assert entry["calls"] >= 1
+        assert entry["errors"] >= 1
+        assert entry["success_rate"] < 100.0
+
+
+
+class TestGraphMemoryLayout:
+    def _make_page(self, base, size, state=0x1000, protect=0x20, type_=0x1000000, info=""):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            base_address=base, region_size=size, state=state,
+            protect=protect, type=type_, info=info,
+        )
+
+    def test_empty_memmap(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import graph_memory_layout
+
+        sb = _mock_sandbox(manager)
+        sb.client.memmap.return_value = []
+        r = graph_memory_layout(sandbox_id="aa11")
+        assert r["success"]
+        assert r["total"] == 0
+        assert r["regions"] == []
+
+    def test_basic_grouping(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import graph_memory_layout
+
+        sb = _mock_sandbox(manager)
+        sb.client.memmap.return_value = [
+            self._make_page(0x140000000, 0x1000, protect=0x20, info="target.exe"),
+            self._make_page(0x140001000, 0x1000, protect=0x20, info="target.exe"),
+            self._make_page(0x140002000, 0x1000, protect=0x04, info="target.exe"),
+        ]
+        sb.client.read_memory.return_value = b"\x90" * 16
+
+        r = graph_memory_layout(sandbox_id="aa11", sample_entropy=False)
+        assert r["success"]
+        # First two are adjacent with same protection → merged
+        # Third has different protection → separate
+        assert len(r["regions"]) == 2
+        assert r["regions"][0]["size"] == 0x2000
+        assert r["regions"][0]["sub_regions"] == 2
+        assert r["regions"][1]["protection_str"] == "readwrite"
+
+    def test_rwx_anomaly(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import graph_memory_layout
+
+        sb = _mock_sandbox(manager)
+        sb.client.memmap.return_value = [
+            self._make_page(0x10000, 0x1000, protect=0x40, type_=0x20000, info=""),
+        ]
+        sb.client.read_memory.return_value = b"\x90" * 16
+
+        r = graph_memory_layout(sandbox_id="aa11", sample_entropy=False)
+        assert r["success"]
+        assert "RWX" in r["regions"][0]["anomalies"]
+        assert r["summary"]["rwx_count"] == 1
+
+    def test_exec_non_module_anomaly(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import graph_memory_layout
+
+        sb = _mock_sandbox(manager)
+        sb.client.memmap.return_value = [
+            self._make_page(0x10000, 0x1000, protect=0x20, type_=0x20000, info=""),
+        ]
+        sb.client.read_memory.return_value = b"\x90" * 16
+
+        r = graph_memory_layout(sandbox_id="aa11", sample_entropy=False)
+        assert r["success"]
+        assert "EXEC_NON_MODULE" in r["regions"][0]["anomalies"]
+        assert r["summary"]["exec_non_module_count"] == 1
+
+    def test_page_guard_anomaly(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import graph_memory_layout
+
+        sb = _mock_sandbox(manager)
+        sb.client.memmap.return_value = [
+            self._make_page(0x10000, 0x1000, protect=0x104, type_=0x20000, info=""),
+        ]
+        sb.client.read_memory.return_value = b"\x00" * 16
+
+        r = graph_memory_layout(sandbox_id="aa11", sample_entropy=False)
+        assert r["success"]
+        assert "PAGE_GUARD" in r["regions"][0]["anomalies"]
+        assert r["summary"]["guard_count"] == 1
+
+    def test_high_entropy_detection(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import graph_memory_layout
+
+        sb = _mock_sandbox(manager)
+        sb.client.memmap.return_value = [
+            self._make_page(0x10000, 0x1000, protect=0x04, type_=0x20000, info=""),
+        ]
+        # High-entropy data (random-ish)
+        import random
+        random.seed(42)
+        sb.client.read_memory.return_value = bytes(random.randint(0, 255) for _ in range(256))
+
+        r = graph_memory_layout(sandbox_id="aa11", sample_entropy=True)
+        assert r["success"]
+        assert r["regions"][0]["entropy"] is not None
+        assert r["regions"][0]["entropy"] >= 7.0
+        assert "HIGH_ENTROPY" in r["regions"][0]["anomalies"]
+        assert r["summary"]["high_entropy_count"] == 1
+
+    def test_missing_sandbox(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import graph_memory_layout
+
+        r = graph_memory_layout(sandbox_id="ghost")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND

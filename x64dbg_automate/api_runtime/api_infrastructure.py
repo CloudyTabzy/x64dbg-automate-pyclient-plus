@@ -8,10 +8,9 @@ forcing them to guess why an operation stalled.
 
 from __future__ import annotations
 
-from x64dbg_automate.api_runtime.registry import tool
+from x64dbg_automate.api_runtime.registry import get_telemetry, reset_telemetry, tool
 from x64dbg_automate.api_runtime.responses import ErrorType, err, ok
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
-from x64dbg_automate.api_runtime.runtime_helpers import resolve_addr
 
 
 @tool
@@ -218,3 +217,65 @@ def get_execution_log(*, sandbox_id: str | None = None, n: int = 20) -> dict:
     ]
 
     return ok(transitions=transitions, count=len(transitions))
+
+
+
+@tool
+def tool_usage_stats(reset: bool = False) -> dict:
+    """Return per-tool usage statistics: call counts, error rates, average latency.
+
+    Helps agents and operators understand which tools are heavily used, which
+    fail often, and where latency hotspots exist. Pass ``reset=True`` to clear
+    all counters after reading.
+
+    Args:
+        reset: If True, zero all counters after returning the snapshot.
+
+    Returns:
+        Dict with ``tools`` list (name, calls, errors, avg_ms, success_rate)
+        and aggregate totals.
+    """
+    raw = get_telemetry()
+    if not raw:
+        return ok(
+            tools=[], total_calls=0, total_errors=0, avg_latency_ms=0.0,
+            note="No telemetry recorded yet.",
+        )
+
+    tools: list[dict] = []
+    total_calls = 0
+    total_errors = 0
+    total_ms = 0.0
+
+    for name, data in sorted(raw.items()):
+        calls = data.get("calls", 0)
+        errors = data.get("errors", 0)
+        ms = data.get("total_ms", 0.0)
+        avg_ms = round(ms / calls, 3) if calls else 0.0
+        success_rate = round((calls - errors) / calls * 100, 1) if calls else 0.0
+        tools.append({
+            "name": name,
+            "calls": calls,
+            "errors": errors,
+            "avg_ms": avg_ms,
+            "success_rate": success_rate,
+        })
+        total_calls += calls
+        total_errors += errors
+        total_ms += ms
+
+    overall_avg = round(total_ms / total_calls, 3) if total_calls else 0.0
+
+    result = ok(
+        tools=tools,
+        total_calls=total_calls,
+        total_errors=total_errors,
+        avg_latency_ms=overall_avg,
+        tool_count=len(tools),
+    )
+
+    if reset:
+        reset_telemetry()
+        result["reset"] = True
+
+    return result

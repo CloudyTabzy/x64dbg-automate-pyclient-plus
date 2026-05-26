@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import functools
 import os
+import threading
+import time
 from typing import Callable
 
 from mcp.types import ToolAnnotations
@@ -22,12 +24,58 @@ from x64dbg_automate.api_runtime.responses import ErrorType, err
 _REGISTERED: list[Callable] = []
 _UNSAFE_NAMES: set[str] = set()
 
+# ---------------------------------------------------------------------------
+# Telemetry — per-tool call counts, errors, and timing
+# ---------------------------------------------------------------------------
+_telemetry_lock = threading.Lock()
+_telemetry: dict[str, dict] = {}  # tool_name -> {"calls": int, "errors": int, "total_ms": float}
+
+
+def _record_call(name: str, elapsed_ms: float, success: bool) -> None:
+    with _telemetry_lock:
+        entry = _telemetry.setdefault(name, {"calls": 0, "errors": 0, "total_ms": 0.0})
+        entry["calls"] += 1
+        entry["total_ms"] += elapsed_ms
+        if not success:
+            entry["errors"] += 1
+
+
+def get_telemetry() -> dict[str, dict]:
+    """Return a snapshot of per-tool usage statistics."""
+    with _telemetry_lock:
+        return {k: dict(v) for k, v in _telemetry.items()}
+
+
+def reset_telemetry() -> None:
+    """Clear all telemetry counters."""
+    with _telemetry_lock:
+        _telemetry.clear()
+
+
+def _telemetry_wrap(func: Callable) -> Callable:
+    """Wrap a tool function to capture call count, errors, and timing."""
+    @functools.wraps(func)
+    def _wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            result = func(*args, **kwargs)
+            success = bool(result.get("success")) if isinstance(result, dict) else True
+        except Exception:
+            success = False
+            raise
+        finally:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            _record_call(func.__name__, elapsed_ms, success)
+        return result
+    return _wrapper
+
 
 def tool(func: Callable) -> Callable:
-    """Register ``func`` as a runtime MCP tool. Returns it unchanged (still callable)."""
-    if func not in _REGISTERED:
-        _REGISTERED.append(func)
-    return func
+    """Register ``func`` as a runtime MCP tool. Wraps it with telemetry."""
+    wrapped = _telemetry_wrap(func)
+    if wrapped not in _REGISTERED:
+        _REGISTERED.append(wrapped)
+    return wrapped  # module-level name now refers to wrapped version
 
 
 def unsafe(func: Callable) -> Callable:
@@ -88,7 +136,10 @@ def register_all(mcp) -> int:
     for func in _REGISTERED:
         target = func
         if read_only and func.__name__ in _UNSAFE_NAMES:
-            target = _make_read_only_stub(func)
+            # Use __wrapped__ (preserved by functools.wraps) to get the original
+            # function for the stub, then re-wrap with telemetry.
+            orig = getattr(func, "__wrapped__", func)
+            target = _telemetry_wrap(_make_read_only_stub(orig))
         mcp.tool(annotations=_tool_annotations(func))(target)
         count += 1
     return count

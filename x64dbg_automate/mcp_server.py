@@ -40,7 +40,9 @@ from x64dbg_automate.external.process_dumper import (
 )
 from x64dbg_automate.external.process_control import nt_suspend_process, nt_resume_process
 from x64dbg_automate.workflows.protected_extract import (
-    workflow_extract_binary, ExtractionResult, TARGET_SECTIONS,
+    workflow_extract_binary as _workflow_extract_binary_impl,
+    ExtractionResult,
+    TARGET_SECTIONS,
 )
 from x64dbg_automate.api_runtime.responses import (
     ErrorType, err, ok, err_from_exc, _ERROR_HINTS,
@@ -2189,7 +2191,7 @@ def workflow_extract_binary(
         if not output_dir:
             output_dir = os.path.join(Path.cwd(), "extracted")
 
-        result = workflow_extract_binary(
+        result = _workflow_extract_binary_impl(
             target_exe=target_exe,
             timeout_sec=timeout_sec,
             dump_method=dump_method,
@@ -2238,7 +2240,7 @@ def workflow_batch_cold_dump(
         runs = []
         for i in range(iterations):
             iteration_dir = os.path.join(output_dir, f"run_{i + 1:02d}")
-            result = workflow_extract_binary(
+            result = _workflow_extract_binary_impl(
                 target_exe=target_exe,
                 dump_method=dump_method,
                 output_dir=iteration_dir,
