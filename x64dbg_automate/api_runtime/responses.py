@@ -103,6 +103,35 @@ def classify_exception(exc: BaseException) -> str:
     return ErrorType.UNKNOWN
 
 
+_ERROR_HINTS: dict[str, str] = {
+    ErrorType.NOT_CONNECTED:       "Call start_session or connect_to_session first.",
+    ErrorType.TIMEOUT:             "Increase wait_timeout or reduce the size of the operation.",
+    ErrorType.INVALID_STATE:       "Check get_debugger_status — the process may not be in the expected run/paused state.",
+    ErrorType.BAD_ARGUMENT:        "Check address/expression format: use '0x401000', a register name like 'RIP', or a symbol like 'kernel32:CreateFileA'.",
+    ErrorType.PERMISSION_DENIED:   "Run as administrator. Some operations require elevated privileges.",
+    ErrorType.RPC_ERROR:           "x64dbg plugin returned failure. Check get_debugger_status or reconnect.",
+    ErrorType.NOT_FOUND:           "Verify the address or symbol exists. Use get_memory_map or get_modules to find valid ranges.",
+    ErrorType.ANTI_DEBUG_TRIGGERED:"Use sandbox_create() on a clean clone before attaching.",
+    ErrorType.SNAPSHOT_FAILED:     "Ensure the process is accessible and not protected by anti-dump.",
+    ErrorType.READ_ONLY:           "Server is in read-only mode (X64DBG_MCP_READ_ONLY=1). Unsafe operations are blocked.",
+    ErrorType.UNSUPPORTED:         "This operation is not supported in the current debugger mode.",
+    ErrorType.UNKNOWN:             "Use get_debugger_status to check the current debugger state.",
+}
+
+
+def err_from_exc(exc: BaseException, **context: Any) -> dict:
+    """Build a structured error from an exception with auto-classified type and hint.
+
+    Re-raises programming errors (AttributeError, NameError, NotImplementedError)
+    so they surface as bugs rather than being silently swallowed.
+    """
+    if is_bug(exc):
+        raise exc
+    etype = classify_exception(exc)
+    hint = _ERROR_HINTS.get(etype, _ERROR_HINTS[ErrorType.UNKNOWN])
+    return err(str(exc), etype, hint=hint, **context)
+
+
 def is_bug(exc: BaseException) -> bool:
     """Return True if this exception signals a programming error that should propagate.
 

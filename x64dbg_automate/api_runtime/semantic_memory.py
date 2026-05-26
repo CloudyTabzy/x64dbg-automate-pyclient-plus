@@ -16,7 +16,7 @@ Storage layout (one JSON object per line):
         "value": {
             "role": "decryption_entry",
             "confidence": 0.92,
-            "evidence": ["0x2ADEB7 called before Stext XOR loop", "..."]
+            "evidence": ["0x2ADEB7 called before decryption XOR loop", "..."]
         },
         "tags": ["runtime", "crypto"]
     }
@@ -307,3 +307,62 @@ def memory_delete_key(key: str) -> dict:
         return err(f"No entries found for key '{key}'.", ErrorType.NOT_FOUND,
                    hint="Use memory_list_keys to see available keys.")
     return ok(key=key, removed=removed)
+
+
+@tool
+def memory_export(path: str) -> dict:
+    """Export the entire semantic memory store to a JSONL file.
+
+    Args:
+        path: Destination file path (e.g. './memory_backup.jsonl').
+    """
+    if not path or not path.strip():
+        return err("path must not be empty.", ErrorType.BAD_ARGUMENT)
+    try:
+        store = _get_store()
+        entries = store.query(limit=999999)
+        with open(path, "w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
+                f.write("\n")
+        return ok(path=path, entries_exported=len(entries))
+    except Exception as exc:  # noqa: BLE001
+        return err(str(exc), ErrorType.UNKNOWN)
+
+
+@tool
+def memory_import(path: str, merge: bool = True) -> dict:
+    """Import findings from a JSONL file into the semantic memory store.
+
+    Args:
+        path: Source JSONL file path.
+        merge: If true, append entries without deduplication. If false, replace store.
+    """
+    if not path or not path.strip():
+        return err("path must not be empty.", ErrorType.BAD_ARGUMENT)
+    if not os.path.isfile(path):
+        return err(f"File not found: {path}", ErrorType.NOT_FOUND)
+    try:
+        store = _get_store()
+        imported = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    store.record(
+                        category=entry.get("category", "imported"),
+                        key=entry.get("key", f"imported_{imported}"),
+                        value=entry.get("value", {}),
+                        target_exe=entry.get("target_exe", ""),
+                        sandbox_id=entry.get("sandbox_id", ""),
+                        tags=entry.get("tags", []),
+                    )
+                    imported += 1
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        return ok(path=path, entries_imported=imported, merge=merge)
+    except Exception as exc:  # noqa: BLE001
+        return err(str(exc), ErrorType.UNKNOWN)

@@ -23,5 +23,5 @@ This project bundles or depends on the following open-source packages:
 The following packages are NOT bundled but may be dynamically loaded at runtime if already installed on the user's system:
 
 - memprocfs (https://github.com/ufrisk/MemProcFS) — GNU AGPLv3
-  Used only via lazy dynamic import in `extract_section_from_dump` and `workflows/securom_extract.py`.
+  Used only via lazy dynamic import in `extract_section_from_dump` and `workflows/protected_extract.py`.
   No MemProcFS code, binaries, or Python bindings are distributed with this project.

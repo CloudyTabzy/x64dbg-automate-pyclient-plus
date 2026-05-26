@@ -434,28 +434,29 @@ class TestGetDebuggerStatus:
         mock_client.debugee_bitness.return_value = 64
         mock_client.debugger_is_elevated.return_value = False
         result = mcp_mod.get_debugger_status()
-        assert "True" in result
-        assert "4321" in result
-        assert "64" in result
+        assert result["success"] is True
+        assert result["debugging"] is True
+        assert result["debuggee_pid"] == 4321
+        assert result["bitness"] == 64
 
 
 class TestGo:
     def test_go_success(self, mock_client):
         mock_client.go.return_value = True
         result = mcp_mod.go()
-        assert "Resumed" in result
+        assert result["success"] is True
 
     def test_go_failure(self, mock_client):
         mock_client.go.return_value = False
         result = mcp_mod.go()
-        assert "Failed" in result
+        assert result["success"] is False
 
 
 class TestPause:
     def test_pause_success(self, mock_client):
         mock_client.pause.return_value = True
         result = mcp_mod.pause()
-        assert "Paused" in result
+        assert result["success"] is True
 
 
 class TestStepInto:
@@ -463,7 +464,8 @@ class TestStepInto:
         mock_client.stepi.return_value = True
         result = mcp_mod.step_into(count=3)
         mock_client.stepi.assert_called_once_with(step_count=3)
-        assert "3" in result
+        assert result["success"] is True
+        assert result["steps"] == 3
 
 
 class TestStepOver:
@@ -471,21 +473,22 @@ class TestStepOver:
         mock_client.stepo.return_value = True
         result = mcp_mod.step_over(count=2)
         mock_client.stepo.assert_called_once_with(step_count=2)
-        assert "2" in result
+        assert result["success"] is True
+        assert result["steps"] == 2
 
 
 class TestSkipInstruction:
     def test_skip(self, mock_client):
         mock_client.skip.return_value = True
         result = mcp_mod.skip_instruction(count=1)
-        assert "Skipped" in result
+        assert result["success"] is True
 
 
 class TestRunToReturn:
     def test_rtr(self, mock_client):
         mock_client.ret.return_value = True
         result = mcp_mod.run_to_return()
-        assert "return" in result.lower()
+        assert result["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -496,8 +499,9 @@ class TestReadMemory:
     def test_read_memory(self, mock_client):
         mock_client.read_memory.return_value = b"\x90" * 16
         result = mcp_mod.read_memory("0x1000", 16)
-        assert "0x1000" in result
-        assert "90" in result
+        assert result["success"] is True
+        assert result["address"] == "0x1000"
+        assert "90" in result["bytes"]
 
     def test_size_capped(self, mock_client):
         mock_client.read_memory.return_value = b"\x00"
@@ -505,26 +509,49 @@ class TestReadMemory:
         mock_client.read_memory.assert_called_once_with(0x1000, 4096)
 
 
+class TestReadMemoryRaw:
+    def test_read_memory_raw(self, mock_client):
+        mock_client.read_memory.return_value = b"\x90\x91\x92\x93"
+        result = mcp_mod.read_memory_raw("0x1000", 4)
+        assert result["success"] is True
+        assert result["address"] == "0x1000"
+        assert result["size"] == 4
+        assert result["bytes"] == "90919293"
+
+    def test_read_memory_raw_size_capped(self, mock_client):
+        mock_client.read_memory.return_value = b"\x00"
+        mcp_mod.read_memory_raw("0x1000", 99999)
+        mock_client.read_memory.assert_called_once_with(0x1000, 65536)
+
+    def test_read_memory_raw_error(self, mock_client):
+        mock_client.read_memory.side_effect = RuntimeError("unmapped")
+        result = mcp_mod.read_memory_raw("0xBAD", 16)
+        assert result["success"] is False
+        assert "READ_FAILED" in result["error_type"]
+
+
 class TestWriteMemory:
     def test_write(self, mock_client):
         mock_client.write_memory.return_value = True
         result = mcp_mod.write_memory("0x1000", "90 90 90")
         mock_client.write_memory.assert_called_once_with(0x1000, b"\x90\x90\x90")
-        assert "Wrote 3 bytes" in result
+        assert result["success"] is True
+        assert result["bytes_written"] == 3
 
 
 class TestAllocateMemory:
     def test_alloc(self, mock_client):
         mock_client.virt_alloc.return_value = 0xDEAD0000
         result = mcp_mod.allocate_memory(4096)
-        assert "0xDEAD0000" in result
+        assert result["success"] is True
+        assert "0xDEAD0000" in result["address"]
 
 
 class TestFreeMemory:
     def test_free(self, mock_client):
         mock_client.virt_free.return_value = True
         result = mcp_mod.free_memory("0xDEAD0000")
-        assert "Freed" in result
+        assert result["success"] is True
 
 
 class TestGetMemoryMap:
@@ -535,8 +562,10 @@ class TestGetMemoryMap:
         )
         mock_client.memmap.return_value = [page]
         result = mcp_mod.get_memory_map()
-        assert "0x10000" in result
-        assert "mapped" in result
+        assert result["success"] is True
+        assert result["total"] == 1
+        assert "0x10000" in result["regions"][0]["base_address"]
+        assert result["regions"][0]["info"] == "mapped"
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +576,8 @@ class TestGetRegister:
     def test_get_reg(self, mock_client):
         mock_client.get_reg.return_value = 0xDEADBEEF
         result = mcp_mod.get_register("rax")
-        assert "0xDEADBEEF" in result
+        assert result["success"] is True
+        assert "0xDEADBEEF" in result["value"]
 
 
 class TestSetRegister:
@@ -555,7 +585,8 @@ class TestSetRegister:
         mock_client.set_reg.return_value = True
         result = mcp_mod.set_register("rax", "0xCAFE")
         mock_client.set_reg.assert_called_once_with("rax", 0xCAFE)
-        assert "Set rax" in result
+        assert result["success"] is True
+        assert result["register"] == "rax"
 
 
 class TestGetAllRegisters:
@@ -587,8 +618,9 @@ class TestGetAllRegisters:
         )
         mock_client.get_regs.return_value = regdump
         result = mcp_mod.get_all_registers()
-        assert "rax" in result
-        assert "rip" in result
+        assert result["success"] is True
+        assert "rax" in result["registers"]
+        assert "rip" in result["registers"]
         assert "flags" in result
 
 
@@ -600,19 +632,20 @@ class TestEvalExpression:
     def test_eval_success(self, mock_client):
         mock_client.eval_sync.return_value = (0xBEEF, True)
         result = mcp_mod.eval_expression("kernel32:CreateFileA")
-        assert "0xBEEF" in result
+        assert result["success"] is True
+        assert "0xBEEF" in result["value"]
 
     def test_eval_failure(self, mock_client):
         mock_client.eval_sync.return_value = (0, False)
         result = mcp_mod.eval_expression("bad_expr")
-        assert "failed" in result.lower()
+        assert result["success"] is False
 
 
 class TestExecuteCommand:
     def test_cmd(self, mock_client):
         mock_client.cmd_sync.return_value = True
         result = mcp_mod.execute_command("msg hello")
-        assert "True" in result
+        assert result["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +683,25 @@ class TestSetBreakpoint:
         assert result["success"] is False
         assert "hint" in result
 
+    def test_duplicate_sw_bp_detected(self, mock_client):
+        # x64dbg auto-creates a one-shot entry BP; setting a second one should
+        # return DUPLICATE_BP before even calling set_breakpoint.
+        existing = Breakpoint(
+            type=BreakpointType.BpNormal, addr=0x401000, enabled=True, singleshoot=True,
+            active=True, name="entry breakpoint", mod="target.exe", slot=0, typeEx=0, hwSize=0,
+            hitCount=0, fastResume=False, silent=False, breakCondition="", logText="",
+            logCondition="", commandText="", commandCondition="",
+        )
+        mock_client.get_breakpoints.return_value = [existing]
+        result = mcp_mod.set_breakpoint("0x401000")
+        assert result["success"] is False
+        assert result["error_type"] == "DUPLICATE_BP"
+        assert "existing_bp" in result
+        assert result["existing_bp"]["name"] == "entry breakpoint"
+        assert result["existing_bp"]["singleshot"] is True
+        assert "clear_breakpoint" in result["hint"]
+        mock_client.set_breakpoint.assert_not_called()
+
     def test_condition_applied(self, mock_client):
         mock_client.set_breakpoint.return_value = True
         mock_client.cmd_sync.return_value = True
@@ -658,37 +710,57 @@ class TestSetBreakpoint:
         mock_client.cmd_sync.assert_called_once()
 
 
+class TestSetConditionalBreakpoint:
+    def test_conditional_bp(self, mock_client):
+        mock_client.set_breakpoint.return_value = True
+        mock_client.cmd_sync.return_value = True
+        result = mcp_mod.set_conditional_breakpoint("0x401000", condition="eax == 1")
+        assert result["success"] is True
+        assert result["condition"] == "eax == 1"
+        assert result["condition_applied"] is True
+
+    def test_conditional_bp_failure(self, mock_client):
+        mock_client.set_breakpoint.return_value = False
+        mock_client.virt_query.return_value = None
+        result = mcp_mod.set_conditional_breakpoint("0x401000", condition="eax == 1")
+        assert result["success"] is False
+        assert "hint" in result
+
+
 class TestClearBreakpoint:
     def test_clear_all_software(self, mock_client):
         mock_client.clear_breakpoint.return_value = True
         result = mcp_mod.clear_breakpoint()
         mock_client.clear_breakpoint.assert_called_once_with(None)
-        assert "cleared" in result.lower()
+        assert result["success"] is True
 
     def test_clear_hardware(self, mock_client):
         mock_client.clear_hardware_breakpoint.return_value = True
         result = mcp_mod.clear_breakpoint("0x401000", bp_type="hardware")
         mock_client.clear_hardware_breakpoint.assert_called_once_with(0x401000)
-        assert "cleared" in result.lower()
+        assert result["success"] is True
 
 
 class TestToggleBreakpoint:
     def test_enable(self, mock_client):
         mock_client.toggle_breakpoint.return_value = True
         result = mcp_mod.toggle_breakpoint("0x401000", enable=True)
-        assert "Enabled" in result
+        assert result["success"] is True
+        assert result["enabled"] is True
 
     def test_disable(self, mock_client):
         mock_client.toggle_breakpoint.return_value = True
         result = mcp_mod.toggle_breakpoint("0x401000", enable=False)
-        assert "Disabled" in result
+        assert result["success"] is True
+        assert result["enabled"] is False
 
 
 class TestListBreakpoints:
     def test_list_empty(self, mock_client):
         mock_client.get_breakpoints.return_value = []
         result = mcp_mod.list_breakpoints()
-        assert "No" in result
+        assert result["success"] is True
+        assert result["total"] == 0
 
     def test_list_with_bps(self, mock_client):
         bp = Breakpoint(
@@ -699,9 +771,11 @@ class TestListBreakpoints:
         )
         mock_client.get_breakpoints.return_value = [bp]
         result = mcp_mod.list_breakpoints()
-        assert "0x401000" in result
-        assert "test_bp" in result
-        assert "5" in result
+        assert result["success"] is True
+        assert result["total"] == 1
+        assert "0x401000" in result["breakpoints"][0]["address"]
+        assert result["breakpoints"][0]["name"] == "test_bp"
+        assert result["breakpoints"][0]["hit_count"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -720,23 +794,28 @@ class TestDisassemble:
         )
         mock_client.disassemble_at.side_effect = [ins1, ins2]
         result = mcp_mod.disassemble("0x1000", count=2)
-        assert "nop" in result
-        assert "ret" in result
-        assert "0x1000" in result
-        assert "0x1001" in result
+        assert result["success"] is True
+        assert result["total"] == 2
+        mnemonics = [i["mnemonic"] for i in result["instructions"]]
+        assert "nop" in mnemonics
+        assert "ret" in mnemonics
+        assert "0x1000" in result["instructions"][0]["address"]
 
     def test_disassemble_failure(self, mock_client):
         mock_client.disassemble_at.return_value = None
         result = mcp_mod.disassemble("0x1000", count=1)
-        assert "???" in result
+        assert result["success"] is True
+        assert result["total"] == 0
+        assert result["instructions"] == []
 
 
 class TestAssemble:
     def test_assemble(self, mock_client):
         mock_client.assemble_at.return_value = 1
         result = mcp_mod.assemble("0x1000", "nop")
-        assert "nop" in result
-        assert "1 bytes" in result
+        assert result["success"] is True
+        assert result["instruction"] == "nop"
+        assert result["bytes_written"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -747,29 +826,34 @@ class TestLabels:
     def test_set_label(self, mock_client):
         mock_client.set_label_at.return_value = True
         result = mcp_mod.set_label("0x1000", "my_func")
-        assert "Label set" in result
+        assert result["success"] is True
+        assert result["text"] == "my_func"
 
     def test_get_label(self, mock_client):
         mock_client.get_label_at.return_value = "my_func"
         result = mcp_mod.get_label("0x1000")
-        assert "my_func" in result
+        assert result["success"] is True
+        assert result["label"] == "my_func"
 
     def test_get_label_empty(self, mock_client):
         mock_client.get_label_at.return_value = ""
         result = mcp_mod.get_label("0x1000")
-        assert "No label" in result
+        assert result["success"] is True
+        assert result["label"] == ""
 
 
 class TestComments:
     def test_set_comment(self, mock_client):
         mock_client.set_comment_at.return_value = True
         result = mcp_mod.set_comment("0x1000", "interesting")
-        assert "Comment set" in result
+        assert result["success"] is True
+        assert result["text"] == "interesting"
 
     def test_get_comment(self, mock_client):
         mock_client.get_comment_at.return_value = "interesting"
         result = mcp_mod.get_comment("0x1000")
-        assert "interesting" in result
+        assert result["success"] is True
+        assert result["comment"] == "interesting"
 
 
 class TestGetSymbol:
@@ -778,13 +862,16 @@ class TestGetSymbol:
                      type=SymbolType.SymExport, ordinal=1)
         mock_client.get_symbol_at.return_value = sym
         result = mcp_mod.get_symbol("0x1000")
-        assert "func" in result
-        assert "0x1000" in result
+        assert result["success"] is True
+        assert result["found"] is True
+        assert "func" in result["undecorated"]
+        assert "0x1000" in result["address"]
 
     def test_not_found(self, mock_client):
         mock_client.get_symbol_at.return_value = None
         result = mcp_mod.get_symbol("0x1000")
-        assert "No symbol" in result
+        assert result["success"] is True
+        assert result["found"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -795,27 +882,32 @@ class TestThreads:
     def test_create_thread(self, mock_client):
         mock_client.thread_create.return_value = 42
         result = mcp_mod.create_thread("0x1000", "0")
-        assert "42" in result
+        assert result["success"] is True
+        assert result["tid"] == 42
 
     def test_terminate_thread(self, mock_client):
         mock_client.thread_terminate.return_value = True
         result = mcp_mod.terminate_thread(42)
-        assert "terminated" in result.lower()
+        assert result["success"] is True
+        assert result["tid"] == 42
 
     def test_pause_thread(self, mock_client):
         mock_client.thread_pause.return_value = True
         result = mcp_mod.pause_resume_thread(42, "pause")
-        assert "paused" in result.lower()
+        assert result["success"] is True
+        assert result["action"] == "pause"
 
     def test_resume_thread(self, mock_client):
         mock_client.thread_resume.return_value = True
         result = mcp_mod.pause_resume_thread(42, "resume")
-        assert "resumed" in result.lower()
+        assert result["success"] is True
+        assert result["action"] == "resume"
 
     def test_switch_thread(self, mock_client):
         mock_client.switch_thread.return_value = True
         result = mcp_mod.switch_thread(42)
-        assert "Switched" in result
+        assert result["success"] is True
+        assert result["tid"] == 42
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +918,8 @@ class TestEvents:
     def test_get_latest_event_empty(self, mock_client):
         mock_client.get_latest_debug_event.return_value = None
         result = mcp_mod.get_latest_event()
-        assert "No events" in result
+        assert result["success"] is True
+        assert result["has_event"] is False
 
     def test_get_latest_event(self, mock_client):
         event = MagicMock()
@@ -835,12 +928,15 @@ class TestEvents:
         event.event_data.model_dump.return_value = {"addr": 0x1000, "name": "test"}
         mock_client.get_latest_debug_event.return_value = event
         result = mcp_mod.get_latest_event()
-        assert "EVENT_BREAKPOINT" in result
+        assert result["success"] is True
+        assert result["has_event"] is True
+        assert "EVENT_BREAKPOINT" in result["event_type"]
 
     def test_wait_for_event_timeout(self, mock_client):
         mock_client.wait_for_debug_event.return_value = None
         result = mcp_mod.wait_for_event("EVENT_BREAKPOINT", timeout=1)
-        assert "Timed out" in result
+        assert result["success"] is False
+        assert result["error_type"] == "TIMEOUT"
 
 
 # ---------------------------------------------------------------------------
@@ -851,17 +947,20 @@ class TestSettings:
     def test_get_string_setting(self, mock_client):
         mock_client.get_setting_str.return_value = "value"
         result = mcp_mod.get_setting("Gui", "Theme")
-        assert "value" in result
+        assert result["success"] is True
+        assert result["value"] == "value"
 
     def test_get_int_setting(self, mock_client):
         mock_client.get_setting_int.return_value = 42
         result = mcp_mod.get_setting("Gui", "FontSize", type="int")
-        assert "42" in result
+        assert result["success"] is True
+        assert result["value"] == 42
 
     def test_set_setting(self, mock_client):
         mock_client.set_setting_str.return_value = True
         result = mcp_mod.set_setting("Gui", "Theme", "dark")
-        assert "updated" in result.lower()
+        assert result["success"] is True
+        assert result["value"] == "dark"
 
 
 # ---------------------------------------------------------------------------
@@ -872,12 +971,13 @@ class TestGui:
     def test_log_message(self, mock_client):
         mock_client.log.return_value = True
         result = mcp_mod.log_message("hello")
-        assert "logged" in result.lower()
+        assert result["success"] is True
+        assert result["message"] == "hello"
 
     def test_refresh_gui(self, mock_client):
         mock_client.gui_refresh_views.return_value = True
         result = mcp_mod.refresh_gui()
-        assert "refreshed" in result.lower()
+        assert result["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -896,10 +996,12 @@ class TestGetPeExports:
             {"name": "CloseHandle", "ordinal": 2, "virtual_address": 0x2000},
         ]
         result = mcp_mod.get_pe_exports("C:\\Windows\\System32\\kernel32.dll")
-        assert "CreateFileA" in result
-        assert "CloseHandle" in result
-        assert "kernel32.dll" in result
-        assert "2 entries" in result
+        assert result["success"] is True
+        assert result["total"] == 2
+        names = [e["name"] for e in result["exports"]]
+        assert "CreateFileA" in names
+        assert "CloseHandle" in names
+        assert "kernel32.dll" in result["file"]
 
     @patch("x64dbg_automate.mcp_server.get_exports")
     def test_filter_name(self, mock_get_exports):
@@ -908,14 +1010,17 @@ class TestGetPeExports:
             {"name": "CloseHandle", "ordinal": 2, "virtual_address": 0x2000},
         ]
         result = mcp_mod.get_pe_exports("kernel32.dll", filter_name="create")
-        assert "CreateFileA" in result
-        assert "CloseHandle" not in result
+        assert result["success"] is True
+        names = [e["name"] for e in result["exports"]]
+        assert "CreateFileA" in names
+        assert "CloseHandle" not in names
 
     @patch("x64dbg_automate.mcp_server.get_exports")
     def test_no_exports_message(self, mock_get_exports):
         mock_get_exports.return_value = []
         result = mcp_mod.get_pe_exports("nodll.exe")
-        assert "No exports" in result
+        assert result["success"] is True
+        assert result["total"] == 0
 
     @patch("x64dbg_automate.mcp_server.get_exports")
     def test_filter_yields_empty(self, mock_get_exports):
@@ -923,7 +1028,8 @@ class TestGetPeExports:
             {"name": "CreateFileA", "ordinal": 1, "virtual_address": 0x1000},
         ]
         result = mcp_mod.get_pe_exports("kernel32.dll", filter_name="zzz_nomatch")
-        assert "No exports" in result
+        assert result["success"] is True
+        assert result["total"] == 0
 
     @patch("x64dbg_automate.mcp_server.get_exports")
     def test_truncates_at_200(self, mock_get_exports):
@@ -932,13 +1038,15 @@ class TestGetPeExports:
             for i in range(250)
         ]
         result = mcp_mod.get_pe_exports("big.dll")
-        assert "50 more" in result
+        assert result["success"] is True
+        assert result["total"] == 250
+        assert result["shown"] == 200
 
     @patch("x64dbg_automate.mcp_server.get_exports")
     def test_exception_returns_error(self, mock_get_exports):
         mock_get_exports.side_effect = FileNotFoundError("file not found")
         result = mcp_mod.get_pe_exports("missing.dll")
-        assert "Error" in result
+        assert result["success"] is False
 
 
 class TestErrorPaths:
@@ -947,19 +1055,39 @@ class TestErrorPaths:
         mcp_mod._client = None
         try:
             result = mcp_mod.go()
-            assert "Error" in result or "Not connected" in result
+            assert result["success"] is False
         finally:
             mcp_mod._client = original
 
     def test_invalid_address(self, mock_client):
         mock_client.read_memory.side_effect = RuntimeError("invalid address")
         result = mcp_mod.read_memory("0xBAD", 16)
-        assert "Error" in result
+        assert result["success"] is False
 
     def test_exception_in_eval(self, mock_client):
         mock_client.eval_sync.side_effect = Exception("eval failed")
         result = mcp_mod.eval_expression("bad")
-        assert "Error" in result
+        assert result["success"] is False
+
+
+class TestValidateAddress:
+    def test_valid_hex(self, mock_client):
+        result = mcp_mod.validate_address("0x401000")
+        assert result["valid"] is True
+        assert result["resolved"] == "0x401000"
+        assert result["type"] == "hex_literal"
+
+    def test_valid_register(self, mock_client):
+        mock_client.eval_sync.return_value = (0x7FFF0000, True)
+        result = mcp_mod.validate_address("rax")
+        assert result["valid"] is True
+        assert result["type"] == "register"
+
+    def test_invalid_expression(self, mock_client):
+        mock_client.eval_sync.return_value = (0, False)
+        result = mcp_mod.validate_address("bogus_symbol_xyz")
+        assert result["valid"] is False
+        assert "hint" in result
 
 
 class TestToolSearch:
@@ -981,6 +1109,28 @@ class TestToolSearch:
         assert result["success"] is True
         assert result["total"] == 0
         assert result["results"] == []
+
+
+class TestListToolsByGroup:
+    def test_group_memory(self):
+        result = mcp_mod.list_tools_by_group("memory")
+        assert result["success"] is True
+        assert result["total"] > 0
+        names = [r["name"] for r in result["results"]]
+        assert any("memory" in n.lower() for n in names)
+
+    def test_group_breakpoint(self):
+        result = mcp_mod.list_tools_by_group("breakpoint")
+        assert result["success"] is True
+        assert result["total"] > 0
+        names = [r["name"] for r in result["results"]]
+        assert any("breakpoint" in n.lower() for n in names)
+
+    def test_unknown_group(self):
+        result = mcp_mod.list_tools_by_group("xyz_nonexistent")
+        assert result["success"] is True
+        assert result["total"] == 0
+        assert "available_groups" in result
 
 
 class TestSuggestNextActions:
@@ -1019,4 +1169,5 @@ class TestReportGenerate:
 class TestResumeProcess:
     def test_invalid_pid_fails_gracefully(self):
         result = mcp_mod.resume_process(99999)
-        assert "Failed" in result or "resumed" in result
+        assert isinstance(result, dict)
+        assert "success" in result

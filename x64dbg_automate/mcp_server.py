@@ -42,6 +42,9 @@ from x64dbg_automate.external.process_control import nt_suspend_process, nt_resu
 from x64dbg_automate.workflows.protected_extract import (
     workflow_extract_binary, ExtractionResult, TARGET_SECTIONS,
 )
+from x64dbg_automate.api_runtime.responses import (
+    ErrorType, err, ok, err_from_exc, _ERROR_HINTS,
+)
 
 mcp = FastMCP(
     "x64dbg-automate",
@@ -100,6 +103,21 @@ def _parse_address_or_expression(s: str) -> int:
 def _format_address(addr: int) -> str:
     """Format an integer address as a hex string."""
     return f"0x{addr:X}"
+
+
+def _get_all_breakpoints(client) -> list:
+    """Aggregate breakpoints across all useful types (software, hardware, memory).
+
+    ``client.get_breakpoints()`` requires a ``BreakpointType`` argument.
+    This helper iterates over the common types and concatenates the results.
+    """
+    all_bps: list = []
+    for bt in (BreakpointType.BpNormal, BreakpointType.BpHardware, BreakpointType.BpMemory):
+        try:
+            all_bps.extend(client.get_breakpoints(bt))
+        except Exception:
+            pass
+    return all_bps
 
 
 def _format_memory(data: bytes, base: int) -> str:
@@ -309,7 +327,7 @@ def terminate_session() -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_debugger_status() -> str:
+def get_debugger_status() -> dict:
     """Get consolidated debugger status: debugging state, running state, PID, bitness, elevated."""
     try:
         client = _require_client()
@@ -318,20 +336,13 @@ def get_debugger_status() -> str:
         pid = client.debugee_pid() if debugging else None
         bitness = client.debugee_bitness() if debugging else None
         elevated = client.debugger_is_elevated()
-        parts = [
-            f"Debugging: {debugging}",
-            f"Running: {running}",
-            f"Debuggee PID: {pid}",
-            f"Bitness: {bitness}",
-            f"Elevated: {elevated}",
-        ]
-        return "\n".join(parts)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(debugging=debugging, running=running, debuggee_pid=pid, bitness=bitness, elevated=elevated)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def go(pass_exceptions: bool = False, swallow_exceptions: bool = False) -> str:
+def go(pass_exceptions: bool = False, swallow_exceptions: bool = False) -> dict:
     """Resume debuggee execution.
 
     Args:
@@ -341,24 +352,28 @@ def go(pass_exceptions: bool = False, swallow_exceptions: bool = False) -> str:
     try:
         client = _require_client()
         result = client.go(pass_exceptions=pass_exceptions, swallow_exceptions=swallow_exceptions)
-        return "Resumed." if result else "Failed to resume."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Failed to resume.", ErrorType.INVALID_STATE, hint=_ERROR_HINTS[ErrorType.INVALID_STATE])
+        return ok()
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def pause() -> str:
+def pause() -> dict:
     """Pause the debuggee."""
     try:
         client = _require_client()
         result = client.pause()
-        return "Paused." if result else "Failed to pause."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Failed to pause.", ErrorType.INVALID_STATE, hint=_ERROR_HINTS[ErrorType.INVALID_STATE])
+        return ok()
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def step_into(count: int = 1) -> str:
+def step_into(count: int = 1) -> dict:
     """Step into one or more instructions.
 
     Args:
@@ -367,13 +382,15 @@ def step_into(count: int = 1) -> str:
     try:
         client = _require_client()
         result = client.stepi(step_count=count)
-        return f"Stepped into {count} instruction(s)." if result else "Step into failed."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Step into failed.", ErrorType.INVALID_STATE, hint=_ERROR_HINTS[ErrorType.INVALID_STATE])
+        return ok(steps=count)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def step_over(count: int = 1) -> str:
+def step_over(count: int = 1) -> dict:
     """Step over one or more instructions.
 
     Args:
@@ -382,13 +399,15 @@ def step_over(count: int = 1) -> str:
     try:
         client = _require_client()
         result = client.stepo(step_count=count)
-        return f"Stepped over {count} instruction(s)." if result else "Step over failed."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Step over failed.", ErrorType.INVALID_STATE, hint=_ERROR_HINTS[ErrorType.INVALID_STATE])
+        return ok(steps=count)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def skip_instruction(count: int = 1) -> str:
+def skip_instruction(count: int = 1) -> dict:
     """Skip instructions without executing them.
 
     Args:
@@ -397,13 +416,15 @@ def skip_instruction(count: int = 1) -> str:
     try:
         client = _require_client()
         result = client.skip(skip_count=count)
-        return f"Skipped {count} instruction(s)." if result else "Skip failed."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Skip failed.", ErrorType.INVALID_STATE, hint=_ERROR_HINTS[ErrorType.INVALID_STATE])
+        return ok(steps=count)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def run_to_return(frames: int = 1) -> str:
+def run_to_return(frames: int = 1) -> dict:
     """Run until a return instruction is encountered.
 
     Args:
@@ -412,9 +433,11 @@ def run_to_return(frames: int = 1) -> str:
     try:
         client = _require_client()
         result = client.ret(frames=frames)
-        return "Ran to return." if result else "Run to return failed."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Run to return failed.", ErrorType.INVALID_STATE, hint=_ERROR_HINTS[ErrorType.INVALID_STATE])
+        return ok(frames=frames)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
@@ -429,7 +452,7 @@ def trace_into(
     pass_exceptions: bool = False,
     swallow_exceptions: bool = False,
     wait_timeout: int = 60,
-) -> str:
+) -> dict:
     """Trace into (single-step into calls) until a condition is met.
 
     Steps one instruction at a time, following into calls, until break_condition
@@ -461,9 +484,12 @@ def trace_into(
             swallow_exceptions=swallow_exceptions,
             wait_timeout=wait_timeout,
         )
-        return "Trace into completed." if result else "Trace into failed."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Trace into failed or max_steps reached.", ErrorType.INVALID_STATE,
+                       hint=_ERROR_HINTS[ErrorType.INVALID_STATE])
+        return ok(break_condition=break_condition)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
@@ -478,7 +504,7 @@ def trace_over(
     pass_exceptions: bool = False,
     swallow_exceptions: bool = False,
     wait_timeout: int = 60,
-) -> str:
+) -> dict:
     """Trace over (single-step over calls) until a condition is met.
 
     Steps one instruction at a time, stepping over calls, until break_condition
@@ -510,9 +536,12 @@ def trace_over(
             swallow_exceptions=swallow_exceptions,
             wait_timeout=wait_timeout,
         )
-        return "Trace over completed." if result else "Trace over failed."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Trace over failed or max_steps reached.", ErrorType.INVALID_STATE,
+                       hint=_ERROR_HINTS[ErrorType.INVALID_STATE])
+        return ok(break_condition=break_condition)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -520,8 +549,10 @@ def trace_over(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def read_memory(address: str, size: int = 256) -> str:
-    """Read memory from the debuggee. Returns hex dump with ASCII sidebar.
+def read_memory(address: str, size: int = 256) -> dict:
+    """Read memory from the debuggee.
+
+    Returns hex-encoded bytes and a formatted hex dump with ASCII sidebar.
 
     Args:
         address: Address — hex ('0x7FF6A0001000'), register ('RSP'), symbol, or expression ('rsp+0x20')
@@ -532,13 +563,43 @@ def read_memory(address: str, size: int = 256) -> str:
         addr = _parse_address_or_expression(address)
         size = min(size, 4096)
         data = client.read_memory(addr, size)
-        return _format_memory(data, addr)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            address=_format_address(addr),
+            size=len(data),
+            bytes=data.hex(),
+            hex_dump=_format_memory(data, addr),
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def write_memory(address: str, hex_data: str) -> str:
+def read_memory_raw(address: str, size: int = 256) -> dict:
+    """Read raw bytes from debuggee memory. Returns hex-encoded string, no ASCII sidebar.
+
+    Unlike read_memory, this returns structured JSON and supports sizes up to 64KB.
+
+    Args:
+        address: Address — hex ('0x7FF6A0001000'), register ('RSP'), symbol, or expression
+        size: Number of bytes to read (max 65536)
+    """
+    try:
+        client = _require_client()
+        addr = _parse_address_or_expression(address)
+        size = min(size, 65536)
+        data = client.read_memory(addr, size)
+        return {
+            "success": True,
+            "address": _format_address(addr),
+            "size": len(data),
+            "bytes": data.hex(),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "error_type": "READ_FAILED"}
+
+
+@mcp.tool()
+def write_memory(address: str, hex_data: str) -> dict:
     """Write bytes to debuggee memory.
 
     Args:
@@ -551,13 +612,16 @@ def write_memory(address: str, hex_data: str) -> str:
         cleaned = hex_data.replace(" ", "").replace("\n", "")
         data = bytes.fromhex(cleaned)
         result = client.write_memory(addr, data)
-        return f"Wrote {len(data)} bytes to {_format_address(addr)}." if result else "Write failed."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Write failed.", ErrorType.RPC_ERROR, hint=_ERROR_HINTS[ErrorType.RPC_ERROR],
+                       address=_format_address(addr))
+        return ok(address=_format_address(addr), bytes_written=len(data))
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def allocate_memory(size: int = 4096, address: str = "0") -> str:
+def allocate_memory(size: int = 4096, address: str = "0") -> dict:
     """Allocate memory in the debuggee's address space (VirtualAlloc).
 
     Args:
@@ -568,13 +632,13 @@ def allocate_memory(size: int = 4096, address: str = "0") -> str:
         client = _require_client()
         addr = _parse_address_or_expression(address)
         result = client.virt_alloc(n=size, addr=addr)
-        return f"Allocated {size} bytes at {_format_address(result)}."
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(address=_format_address(result), size=size)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def free_memory(address: str) -> str:
+def free_memory(address: str) -> dict:
     """Free memory in the debuggee's address space (VirtualFree).
 
     Args:
@@ -584,28 +648,30 @@ def free_memory(address: str) -> str:
         client = _require_client()
         addr = _parse_address_or_expression(address)
         client.virt_free(addr)
-        return f"Freed memory at {_format_address(addr)}."
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(address=_format_address(addr))
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def get_memory_map() -> str:
+def get_memory_map() -> dict:
     """List all memory regions in the debuggee's address space."""
     try:
         client = _require_client()
         pages = client.memmap()
-        if not pages:
-            return "No memory regions found."
-        lines = []
-        for p in pages:
-            lines.append(
-                f"{_format_address(p.base_address)}  Size: {_format_address(p.region_size)}  "
-                f"Protect: 0x{p.protect:X}  State: 0x{p.state:X}  Info: {p.info}"
-            )
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        regions = [
+            {
+                "base_address": _format_address(p.base_address),
+                "region_size": p.region_size,
+                "protect": f"0x{p.protect:X}",
+                "state": f"0x{p.state:X}",
+                "info": p.info,
+            }
+            for p in pages
+        ]
+        return ok(regions=regions, total=len(regions))
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +679,7 @@ def get_memory_map() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_register(register: str) -> str:
+def get_register(register: str) -> dict:
     """Read a single register value.
 
     Args:
@@ -622,13 +688,13 @@ def get_register(register: str) -> str:
     try:
         client = _require_client()
         val = client.get_reg(register)
-        return f"{register} = {_format_address(val)}"
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(register=register, value=_format_address(val), value_int=val)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def set_register(register: str, value: str) -> str:
+def set_register(register: str, value: str) -> dict:
     """Write a value to a register.
 
     Args:
@@ -639,29 +705,30 @@ def set_register(register: str, value: str) -> str:
         client = _require_client()
         val = _parse_address_or_expression(value)
         result = client.set_reg(register, val)
-        return f"Set {register} = {_format_address(val)}." if result else "Failed to set register."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Failed to set register.", ErrorType.RPC_ERROR,
+                       hint=_ERROR_HINTS[ErrorType.RPC_ERROR], register=register)
+        return ok(register=register, value=_format_address(val))
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def get_all_registers() -> str:
+def get_all_registers() -> dict:
     """Dump all general-purpose registers and flags."""
     try:
         client = _require_client()
         regs = client.get_regs()
         ctx = regs.context
-        lines = []
-        for field_name in type(ctx).model_fields:
-            val = getattr(ctx, field_name)
-            if isinstance(val, int):
-                lines.append(f"{field_name:8s} = {_format_address(val)}")
-        flags = regs.flags
-        flag_strs = [f"{k}={int(v)}" for k, v in flags.model_dump().items()]
-        lines.append(f"flags    = {' '.join(flag_strs)}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        registers = {
+            field_name: _format_address(getattr(ctx, field_name))
+            for field_name in type(ctx).model_fields
+            if isinstance(getattr(ctx, field_name), int)
+        }
+        flags = {k: int(v) for k, v in regs.flags.model_dump().items()}
+        return ok(registers=registers, flags=flags)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +736,55 @@ def get_all_registers() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def eval_expression(expression: str) -> str:
+def validate_address(expression: str) -> dict:
+    """Validate and resolve an address expression.
+
+    Tells the agent whether an address, symbol, register, or arithmetic expression
+    can be resolved BEFORE using it in a tool call. Prevents silent failures from
+    invalid expressions evaluating to 0.
+
+    Args:
+        expression: Expression to validate — hex ('0x401000'), register ('RAX'),
+                    symbol ('kernel32:CreateFileA'), or arithmetic ('rsp+0x20')
+    """
+    try:
+        resolved = _parse_address_or_expression(expression)
+        addr_type = "hex_literal"
+        expr_upper = expression.strip().upper()
+        if expr_upper in (
+            "RAX", "RBX", "RCX", "RDX", "RSP", "RBP", "RSI", "RDI", "RIP",
+            "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15",
+            "EAX", "EBX", "ECX", "EDX", "ESP", "EBP", "ESI", "EDI", "EIP",
+        ):
+            addr_type = "register"
+        elif ":" in expression:
+            addr_type = "symbol"
+        elif any(c in expression for c in "+-*/"):
+            addr_type = "arithmetic"
+        return ok(
+            valid=True,
+            resolved=f"0x{resolved:X}",
+            expression=expression,
+            type=addr_type,
+        )
+    except ValueError as exc:
+        return err(
+            str(exc), ErrorType.BAD_ARGUMENT,
+            expression=expression,
+            valid=False,
+            hint="Check the expression spelling. For symbols, use 'module:SymbolName' format.",
+        )
+    except Exception as exc:
+        return err(
+            str(exc), ErrorType.UNKNOWN,
+            expression=expression,
+            valid=False,
+            hint="Unexpected error resolving expression.",
+        )
+
+
+@mcp.tool()
+def eval_expression(expression: str) -> dict:
     """Evaluate an x64dbg expression. Supports symbols, registers, arithmetic.
 
     Args:
@@ -679,14 +794,15 @@ def eval_expression(expression: str) -> str:
         client = _require_client()
         val, success = client.eval_sync(expression)
         if not success:
-            return f"Evaluation failed for: {expression}"
-        return f"{expression} = {_format_address(val)}"
-    except Exception as e:
-        return f"Error: {e}"
+            return err(f"Evaluation failed for: {expression}", ErrorType.BAD_ARGUMENT,
+                       hint=_ERROR_HINTS[ErrorType.BAD_ARGUMENT], expression=expression)
+        return ok(expression=expression, value=_format_address(val), value_int=val)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def execute_command(command: str) -> str:
+def execute_command(command: str) -> dict:
     """Execute a raw x64dbg command.
 
     See https://help.x64dbg.com/en/latest/commands/ for available commands.
@@ -697,9 +813,9 @@ def execute_command(command: str) -> str:
     try:
         client = _require_client()
         result = client.cmd_sync(command)
-        return f"Command executed. Success: {result}"
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(command=command, result=result)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -742,6 +858,31 @@ def set_breakpoint(
             mm = MemoryBreakpointType(memory_mode)
             result = client.set_memory_breakpoint(addr, bp_type=mm, singleshoot=singleshot)
         else:
+            # Pre-flight: detect duplicate SW BP before calling set — x64dbg silently
+            # rejects duplicates, and the downstream virt_query diagnostic is unreliable
+            # at system BP (returns None for all addresses), producing a misleading hint.
+            if isinstance(addr, int):
+                duplicate = _find_existing_sw_bp(client, addr)
+                if duplicate is not None:
+                    return {
+                        "success": False,
+                        "error": f"A software breakpoint already exists at {address_or_symbol}.",
+                        "error_type": "DUPLICATE_BP",
+                        "address": address_or_symbol,
+                        "existing_bp": {
+                            "name": duplicate.name,
+                            "enabled": duplicate.enabled,
+                            "singleshot": duplicate.singleshoot,
+                            "hit_count": duplicate.hitCount,
+                        },
+                        "hint": (
+                            "x64dbg rejects duplicate software breakpoints. "
+                            "Call clear_breakpoint(address) to remove the existing one first, "
+                            "then set_breakpoint again. "
+                            "Tip: x64dbg auto-creates a one-shot BP at the entry point when loading "
+                            "a binary — this is the most common cause of this error at the entry address."
+                        ),
+                    }
             result = client.set_breakpoint(addr, name=name, singleshoot=singleshot)
 
         if not result:
@@ -773,14 +914,57 @@ def set_breakpoint(
         return {"success": False, "error": str(e), "error_type": "UNKNOWN"}
 
 
+def _find_existing_sw_bp(client, addr: int):
+    """Return the existing software BP at addr, or None if there isn't one."""
+    try:
+        bps = client.get_breakpoints(BreakpointType.BpNormal) or []
+        return next((bp for bp in bps if bp.addr == addr), None)
+    except Exception:
+        return None
+
+
 def _diagnose_bp_failure(client, addr) -> str:
     """Query memory at addr and return a human-readable explanation of why a BP failed."""
     if not isinstance(addr, int):
         return "Could not resolve address — check the symbol or expression."
+    # --- Duplicate BP check (most common cause at entry point) ------------------
+    # This is reached when the pre-flight in set_breakpoint was skipped (e.g. the
+    # conditional-BP path) or when the addr was not an int at pre-flight time.
+    duplicate = _find_existing_sw_bp(client, addr)
+    if duplicate is not None:
+        extra = " (auto-created by x64dbg at entry)" if duplicate.singleshoot and duplicate.hitCount == 0 else ""
+        return (
+            f"A software breakpoint{extra} already exists at 0x{addr:X} "
+            f"(name='{duplicate.name}', enabled={duplicate.enabled}, singleshot={duplicate.singleshoot}). "
+            "x64dbg rejects duplicates. Call clear_breakpoint(address) first, then set_breakpoint again."
+        )
+    # --- System-breakpoint guard ------------------------------------------------
+    # At the initial system breakpoint (ntdll.dll LdrInitializeThunk) the loader
+    # has not finished mapping the main image.  x64dbg's bp engine silently fails
+    # here even though the address is valid.  Detect this and give a concrete
+    # next-step instead of the generic "try anal" hint.
+    try:
+        cip = client.get_reg("cip")
+        sym = client.get_symbol_at(cip)
+        mod_name = (sym.mod or "").lower() if sym else ""
+        if mod_name in ("ntdll.dll", "kernelbase.dll", "kernel32.dll"):
+            mods = client.get_modules()
+            if len(mods) <= 1:
+                return (
+                    "System breakpoint: the debuggee is at the initial ntdll loader breakpoint. "
+                    "The main image is not fully initialized yet. "
+                    "Run go() then pause() after the entry point is reached before setting breakpoints."
+                )
+    except Exception:
+        pass
+    # --- Memory diagnostics -----------------------------------------------------
     try:
         page = client.virt_query(addr)
         if page is None:
-            return f"0x{addr:X} is not mapped in the process address space."
+            return (
+                f"0x{addr:X} is not mapped in the process address space. "
+                "If the debuggee is at a system breakpoint, run go() first to let the loader finish."
+            )
         state = page.state
         protect = page.protect & 0xFF
         if state != 0x1000:  # not MEM_COMMIT
@@ -797,7 +981,7 @@ def _diagnose_bp_failure(client, addr) -> str:
 
 
 @mcp.tool()
-def clear_breakpoint(address: str | None = None, bp_type: str = "software") -> str:
+def clear_breakpoint(address: str | None = None, bp_type: str = "software") -> dict:
     """Clear breakpoint(s).
 
     Args:
@@ -820,13 +1004,72 @@ def clear_breakpoint(address: str | None = None, bp_type: str = "software") -> s
         else:
             result = client.clear_breakpoint(target)
 
-        return "Breakpoint(s) cleared." if result else "Failed to clear breakpoint(s)."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Failed to clear breakpoint(s).", ErrorType.RPC_ERROR,
+                       hint=_ERROR_HINTS[ErrorType.RPC_ERROR])
+        return ok(address=address, bp_type=bp_type)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def toggle_breakpoint(address: str | None = None, bp_type: str = "software", enable: bool = True) -> str:
+def set_conditional_breakpoint(
+    address: str,
+    condition: str,
+    singleshot: bool = False,
+    name: str | None = None,
+) -> dict:
+    """Set a software breakpoint with an expression condition.
+
+    The breakpoint only fires when the condition evaluates to non-zero.
+    This is a convenience wrapper over set_breakpoint with bp_type='software'.
+
+    Args:
+        address: Hex address or symbol name.
+        condition: x64dbg expression; e.g. 'eax == 0', 'poi(rsp+8) == 1', 'cip > 0x401000'.
+        singleshot: Remove after the first hit.
+        name: Optional label for the breakpoint.
+    """
+    try:
+        client = _require_client()
+        try:
+            addr = _parse_address_or_expression(address)
+        except (ValueError, TypeError):
+            addr = address
+
+        result = client.set_breakpoint(addr, name=name, singleshoot=singleshot)
+        if not result:
+            hint = _diagnose_bp_failure(client, addr)
+            return err(
+                f"Failed to set conditional breakpoint at {address}.",
+                ErrorType.RPC_ERROR,
+                address=address,
+                condition=condition,
+                hint=hint,
+            )
+
+        condition_applied = False
+        if isinstance(addr, int):
+            try:
+                client.cmd_sync(f'SetBreakpointCondition {addr:#x}, "{condition}"')
+                condition_applied = True
+            except Exception:
+                pass
+
+        return ok(
+            address=address,
+            type="software",
+            condition=condition if condition_applied else condition,
+            condition_applied=condition_applied,
+            singleshot=singleshot,
+            name=name,
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
+
+
+@mcp.tool()
+def toggle_breakpoint(address: str | None = None, bp_type: str = "software", enable: bool = True) -> dict:
     """Enable or disable breakpoint(s).
 
     Args:
@@ -850,14 +1093,17 @@ def toggle_breakpoint(address: str | None = None, bp_type: str = "software", ena
         else:
             result = client.toggle_breakpoint(target, on=enable)
 
-        action = "Enabled" if enable else "Disabled"
-        return f"{action} breakpoint(s)." if result else f"Failed to {action.lower()} breakpoint(s)."
-    except Exception as e:
-        return f"Error: {e}"
+        action = "enabled" if enable else "disabled"
+        if not result:
+            return err(f"Failed to {action} breakpoint(s).", ErrorType.RPC_ERROR,
+                       hint=_ERROR_HINTS[ErrorType.RPC_ERROR])
+        return ok(address=address, bp_type=bp_type, enabled=enable)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def list_breakpoints(bp_type: str = "software") -> str:
+def list_breakpoints(bp_type: str = "software") -> dict:
     """List all breakpoints of a given type.
 
     Args:
@@ -872,18 +1118,20 @@ def list_breakpoints(bp_type: str = "software") -> str:
         }
         bt = type_map.get(bp_type, BreakpointType.BpNormal)
         bps = client.get_breakpoints(bt)
-        if not bps:
-            return f"No {bp_type} breakpoints set."
-        lines = []
-        for bp in bps:
-            status = "ON" if bp.enabled else "OFF"
-            lines.append(
-                f"{_format_address(bp.addr)}  [{status}]  Name: {bp.name}  "
-                f"Module: {bp.mod}  Hits: {bp.hitCount}  Singleshot: {bp.singleshoot}"
-            )
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        breakpoints = [
+            {
+                "address": _format_address(bp.addr),
+                "enabled": bp.enabled,
+                "name": bp.name,
+                "module": bp.mod,
+                "hit_count": bp.hitCount,
+                "singleshot": bp.singleshoot,
+            }
+            for bp in bps
+        ]
+        return ok(bp_type=bp_type, breakpoints=breakpoints, total=len(breakpoints))
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -891,7 +1139,7 @@ def list_breakpoints(bp_type: str = "software") -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def disassemble(address: str, count: int = 10) -> str:
+def disassemble(address: str, count: int = 10) -> dict:
     """Disassemble instructions at an address.
 
     Args:
@@ -902,22 +1150,25 @@ def disassemble(address: str, count: int = 10) -> str:
         client = _require_client()
         addr = _parse_address_or_expression(address)
         count = min(count, 100)
-        lines = []
+        instructions = []
         current = addr
         for _ in range(count):
             ins = client.disassemble_at(current)
             if ins is None:
-                lines.append(f"{_format_address(current)}  ???")
                 break
-            lines.append(f"{_format_address(current)}  {ins.instruction}")
+            instructions.append({
+                "address": _format_address(current),
+                "mnemonic": ins.instruction,
+                "size": ins.instr_size,
+            })
             current += ins.instr_size
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(address=_format_address(addr), instructions=instructions, total=len(instructions))
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def assemble(address: str, instruction: str) -> str:
+def assemble(address: str, instruction: str) -> dict:
     """Assemble a single instruction at an address.
 
     Args:
@@ -929,10 +1180,11 @@ def assemble(address: str, instruction: str) -> str:
         addr = _parse_address_or_expression(address)
         size = client.assemble_at(addr, instruction)
         if size is None:
-            return f"Failed to assemble '{instruction}' at {_format_address(addr)}."
-        return f"Assembled '{instruction}' at {_format_address(addr)} ({size} bytes)."
-    except Exception as e:
-        return f"Error: {e}"
+            return err(f"Failed to assemble '{instruction}'.", ErrorType.BAD_ARGUMENT,
+                       hint=_ERROR_HINTS[ErrorType.BAD_ARGUMENT], address=_format_address(addr))
+        return ok(address=_format_address(addr), instruction=instruction, bytes_written=size)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -940,7 +1192,7 @@ def assemble(address: str, instruction: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def set_label(address: str, text: str) -> str:
+def set_label(address: str, text: str) -> dict:
     """Set a label at an address.
 
     Args:
@@ -951,13 +1203,15 @@ def set_label(address: str, text: str) -> str:
         client = _require_client()
         addr = _parse_address_or_expression(address)
         result = client.set_label_at(addr, text)
-        return f"Label set at {_format_address(addr)}." if result else "Failed to set label."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Failed to set label.", ErrorType.RPC_ERROR, hint=_ERROR_HINTS[ErrorType.RPC_ERROR])
+        return ok(address=_format_address(addr), text=text)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def get_label(address: str) -> str:
+def get_label(address: str) -> dict:
     """Get the label at an address.
 
     Args:
@@ -967,15 +1221,13 @@ def get_label(address: str) -> str:
         client = _require_client()
         addr = _parse_address_or_expression(address)
         label = client.get_label_at(addr)
-        if not label:
-            return f"No label at {_format_address(addr)}."
-        return f"{_format_address(addr)}: {label}"
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(address=_format_address(addr), label=label or "")
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def set_comment(address: str, text: str) -> str:
+def set_comment(address: str, text: str) -> dict:
     """Set a comment at an address.
 
     Args:
@@ -986,13 +1238,15 @@ def set_comment(address: str, text: str) -> str:
         client = _require_client()
         addr = _parse_address_or_expression(address)
         result = client.set_comment_at(addr, text)
-        return f"Comment set at {_format_address(addr)}." if result else "Failed to set comment."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Failed to set comment.", ErrorType.RPC_ERROR, hint=_ERROR_HINTS[ErrorType.RPC_ERROR])
+        return ok(address=_format_address(addr), text=text)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def get_comment(address: str) -> str:
+def get_comment(address: str) -> dict:
     """Get the comment at an address.
 
     Args:
@@ -1002,15 +1256,13 @@ def get_comment(address: str) -> str:
         client = _require_client()
         addr = _parse_address_or_expression(address)
         comment = client.get_comment_at(addr)
-        if not comment:
-            return f"No comment at {_format_address(addr)}."
-        return f"{_format_address(addr)}: {comment}"
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(address=_format_address(addr), comment=comment or "")
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def get_symbol(address: str) -> str:
+def get_symbol(address: str) -> dict:
     """Look up the symbol at an address.
 
     Args:
@@ -1021,15 +1273,17 @@ def get_symbol(address: str) -> str:
         addr = _parse_address_or_expression(address)
         sym = client.get_symbol_at(addr)
         if sym is None:
-            return f"No symbol at {_format_address(addr)}."
-        return (
-            f"Address: {_format_address(sym.addr)}\n"
-            f"Decorated: {sym.decoratedSymbol}\n"
-            f"Undecorated: {sym.undecoratedSymbol}\n"
-            f"Type: {sym.type}  Ordinal: {sym.ordinal}"
+            return ok(address=_format_address(addr), symbol=None, found=False)
+        return ok(
+            address=_format_address(sym.addr),
+            found=True,
+            decorated=sym.decoratedSymbol,
+            undecorated=sym.undecoratedSymbol,
+            type=sym.type,
+            ordinal=sym.ordinal,
         )
-    except Exception as e:
-        return f"Error: {e}"
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1037,7 +1291,7 @@ def get_symbol(address: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def create_thread(entry_address: str, argument: str = "0") -> str:
+def create_thread(entry_address: str, argument: str = "0") -> dict:
     """Create a new thread in the debuggee.
 
     Args:
@@ -1050,14 +1304,14 @@ def create_thread(entry_address: str, argument: str = "0") -> str:
         arg = _parse_address_or_expression(argument)
         tid = client.thread_create(addr, arg)
         if tid is None:
-            return "Failed to create thread."
-        return f"Thread created. TID: {tid}"
-    except Exception as e:
-        return f"Error: {e}"
+            return err("Failed to create thread.", ErrorType.RPC_ERROR, hint=_ERROR_HINTS[ErrorType.RPC_ERROR])
+        return ok(tid=tid, entry_address=_format_address(addr))
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def terminate_thread(tid: int) -> str:
+def terminate_thread(tid: int) -> dict:
     """Terminate a thread in the debuggee.
 
     Args:
@@ -1066,13 +1320,16 @@ def terminate_thread(tid: int) -> str:
     try:
         client = _require_client()
         result = client.thread_terminate(tid)
-        return f"Thread {tid} terminated." if result else f"Failed to terminate thread {tid}."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err(f"Failed to terminate thread {tid}.", ErrorType.RPC_ERROR,
+                       hint=_ERROR_HINTS[ErrorType.RPC_ERROR], tid=tid)
+        return ok(tid=tid)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def pause_resume_thread(tid: int, action: str = "pause") -> str:
+def pause_resume_thread(tid: int, action: str = "pause") -> dict:
     """Pause or resume a thread.
 
     Args:
@@ -1083,16 +1340,18 @@ def pause_resume_thread(tid: int, action: str = "pause") -> str:
         client = _require_client()
         if action == "resume":
             result = client.thread_resume(tid)
-            return f"Thread {tid} resumed." if result else f"Failed to resume thread {tid}."
         else:
             result = client.thread_pause(tid)
-            return f"Thread {tid} paused." if result else f"Failed to pause thread {tid}."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err(f"Failed to {action} thread {tid}.", ErrorType.RPC_ERROR,
+                       hint=_ERROR_HINTS[ErrorType.RPC_ERROR], tid=tid)
+        return ok(tid=tid, action=action)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def switch_thread(tid: int) -> str:
+def switch_thread(tid: int) -> dict:
     """Switch the debugger's active thread context.
 
     Args:
@@ -1101,9 +1360,12 @@ def switch_thread(tid: int) -> str:
     try:
         client = _require_client()
         result = client.switch_thread(tid)
-        return f"Switched to thread {tid}." if result else f"Failed to switch to thread {tid}."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err(f"Failed to switch to thread {tid}.", ErrorType.RPC_ERROR,
+                       hint=_ERROR_HINTS[ErrorType.RPC_ERROR], tid=tid)
+        return ok(tid=tid)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1111,25 +1373,21 @@ def switch_thread(tid: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_latest_event() -> str:
+def get_latest_event() -> dict:
     """Pop the latest debug event from the event queue."""
     try:
         client = _require_client()
         event = client.get_latest_debug_event()
         if event is None:
-            return "No events in queue."
-        data_str = ""
-        if event.event_data is not None:
-            data_str = "\n" + "\n".join(
-                f"  {k}: {v}" for k, v in event.event_data.model_dump().items()
-            )
-        return f"Event: {event.event_type}{data_str}"
-    except Exception as e:
-        return f"Error: {e}"
+            return ok(has_event=False, event=None)
+        event_data = event.event_data.model_dump() if event.event_data is not None else None
+        return ok(has_event=True, event_type=str(event.event_type), event_data=event_data)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def wait_for_event(event_type: str, timeout: int = 5) -> str:
+def wait_for_event(event_type: str, timeout: int = 5) -> dict:
     """Wait for a specific debug event type.
 
     Args:
@@ -1138,18 +1396,19 @@ def wait_for_event(event_type: str, timeout: int = 5) -> str:
     """
     try:
         client = _require_client()
-        et = EventType(event_type)
+        try:
+            et = EventType(event_type)
+        except ValueError:
+            return err(f"Unknown event type: {event_type}", ErrorType.BAD_ARGUMENT,
+                       hint="Valid types include EVENT_BREAKPOINT, EVENT_LOAD_DLL, EVENT_UNLOAD_DLL.")
         event = client.wait_for_debug_event(et, timeout=timeout)
         if event is None:
-            return f"Timed out waiting for {event_type}."
-        data_str = ""
-        if event.event_data is not None:
-            data_str = "\n" + "\n".join(
-                f"  {k}: {v}" for k, v in event.event_data.model_dump().items()
-            )
-        return f"Event: {event.event_type}{data_str}"
-    except Exception as e:
-        return f"Error: {e}"
+            return err(f"Timed out waiting for {event_type}.", ErrorType.TIMEOUT,
+                       hint=_ERROR_HINTS[ErrorType.TIMEOUT])
+        event_data = event.event_data.model_dump() if event.event_data is not None else None
+        return ok(event_type=str(event.event_type), event_data=event_data)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1157,7 +1416,7 @@ def wait_for_event(event_type: str, timeout: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_setting(section: str, name: str, type: str = "string") -> str:
+def get_setting(section: str, name: str, type: str = "string") -> dict:
     """Read an x64dbg setting.
 
     Args:
@@ -1172,14 +1431,15 @@ def get_setting(section: str, name: str, type: str = "string") -> str:
         else:
             val = client.get_setting_str(section, name)
         if val is None:
-            return f"Setting [{section}]{name} not found."
-        return f"[{section}]{name} = {val}"
-    except Exception as e:
-        return f"Error: {e}"
+            return err(f"Setting [{section}]{name} not found.", ErrorType.NOT_FOUND,
+                       hint=_ERROR_HINTS[ErrorType.NOT_FOUND])
+        return ok(section=section, name=name, value=val)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def set_setting(section: str, name: str, value: str, type: str = "string") -> str:
+def set_setting(section: str, name: str, value: str, type: str = "string") -> dict:
     """Write an x64dbg setting.
 
     Args:
@@ -1194,9 +1454,11 @@ def set_setting(section: str, name: str, value: str, type: str = "string") -> st
             result = client.set_setting_int(section, name, int(value))
         else:
             result = client.set_setting_str(section, name, value)
-        return f"Setting [{section}]{name} updated." if result else "Failed to update setting."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Failed to update setting.", ErrorType.RPC_ERROR, hint=_ERROR_HINTS[ErrorType.RPC_ERROR])
+        return ok(section=section, name=name, value=value)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1204,7 +1466,7 @@ def set_setting(section: str, name: str, value: str, type: str = "string") -> st
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def log_message(message: str) -> str:
+def log_message(message: str) -> dict:
     """Log a message to the x64dbg log window.
 
     Args:
@@ -1213,20 +1475,24 @@ def log_message(message: str) -> str:
     try:
         client = _require_client()
         result = client.log(message)
-        return "Message logged." if result else "Failed to log message."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Failed to log message.", ErrorType.RPC_ERROR, hint=_ERROR_HINTS[ErrorType.RPC_ERROR])
+        return ok(message=message)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def refresh_gui() -> str:
+def refresh_gui() -> dict:
     """Refresh all x64dbg GUI views."""
     try:
         client = _require_client()
         result = client.gui_refresh_views()
-        return "GUI refreshed." if result else "Failed to refresh GUI."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("Failed to refresh GUI.", ErrorType.RPC_ERROR, hint=_ERROR_HINTS[ErrorType.RPC_ERROR])
+        return ok()
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1234,7 +1500,7 @@ def refresh_gui() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def analyze_entropy(address: str, size: int = 4096, window_size: int = 0) -> str:
+def analyze_entropy(address: str, size: int = 4096, window_size: int = 0) -> dict:
     """Calculate Shannon entropy of a debuggee memory region.
 
     High entropy (>7.0) = encrypted/compressed.
@@ -1248,27 +1514,41 @@ def analyze_entropy(address: str, size: int = 4096, window_size: int = 0) -> str
         addr = _parse_address_or_expression(address)
         data = client.read_memory(addr, size)
 
+        def _verdict(e: float) -> str:
+            if e > 7.0:
+                return "ENCRYPTED/COMPRESSED"
+            if 4.5 <= e <= 6.5:
+                return "LIKELY CODE"
+            return "LIKELY DATA"
+
         if window_size > 0:
             results = sliding_entropy(data, window_size)
-            lines = [f"Sliding entropy (window={window_size}):"]
-            for offset, ent in results:
-                marker = "ENCRYPTED" if ent > 7.0 else ("CODE" if 4.5 <= ent <= 6.5 else "DATA")
-                lines.append(f"  {_format_address(addr + offset)}: {ent:.4f} [{marker}]")
-            return "\n".join(lines)
+            sliding = [
+                {
+                    "offset": offset,
+                    "address": _format_address(addr + offset),
+                    "entropy": round(ent, 4),
+                    "verdict": _verdict(ent),
+                }
+                for offset, ent in results
+            ]
+            return ok(address=_format_address(addr), size=size, window_size=window_size, sliding=sliding)
 
         ent = shannon_entropy(data)
-        verdict = (
-            "ENCRYPTED/COMPRESSED" if ent > 7.0
-            else "LIKELY CODE" if 4.5 <= ent <= 6.5
-            else "LIKELY DATA"
+        return ok(
+            address=_format_address(addr),
+            size=size,
+            entropy=round(ent, 4),
+            verdict=_verdict(ent),
+            is_code=4.5 <= ent <= 6.5,
+            is_encrypted=ent > 7.0,
         )
-        return f"Region {_format_address(addr)}–{_format_address(addr + size)}: entropy={ent:.4f} — {verdict}"
-    except Exception as e:
-        return f"Error: {e}"
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def find_strings(address: str, size: int = 65536, min_length: int = 4, encoding: str = "both") -> str:
+def find_strings(address: str, size: int = 65536, min_length: int = 4, encoding: str = "both") -> dict:
     """Extract printable strings from a debuggee memory region."""
     try:
         client = _require_client()
@@ -1282,21 +1562,25 @@ def find_strings(address: str, size: int = 65536, min_length: int = 4, encoding:
         if encoding in ("utf16le", "both"):
             results.extend(find_strings_utf16le(data, min_length))
 
-        if not results:
-            return "No strings found."
-
-        lines = [f"Strings in {_format_address(addr)} ({len(results)} found):"]
-        for offset, s in results[:100]:
-            lines.append(f"  {_format_address(addr + offset)}: {s}")
-        if len(results) > 100:
-            lines.append(f"  ... and {len(results) - 100} more")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        shown = results[:100]
+        strings = [
+            {"offset": offset, "address": _format_address(addr + offset), "value": s}
+            for offset, s in shown
+        ]
+        return ok(
+            address=_format_address(addr),
+            size=size,
+            encoding=encoding,
+            strings=strings,
+            total=len(results),
+            shown=len(shown),
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def scan_hex_pattern(address: str, size: int, pattern: str) -> str:
+def scan_hex_pattern(address: str, size: int, pattern: str) -> dict:
     """Scan a debuggee memory region for a hex pattern with ?? wildcards.
 
     Example: '55 8B EC' (x86 function prologue)
@@ -1307,18 +1591,17 @@ def scan_hex_pattern(address: str, size: int, pattern: str) -> str:
         addr = _parse_address_or_expression(address)
         data = client.read_memory(addr, size)
         matches = scan_pattern(data, pattern)
-
-        if not matches:
-            return f"No matches for pattern '{pattern}' in {_format_address(addr)}–{_format_address(addr + size)}"
-
-        lines = [f"Pattern '{pattern}' — {len(matches)} matches:"]
-        for off in matches[:50]:
-            lines.append(f"  {_format_address(addr + off)}")
-        if len(matches) > 50:
-            lines.append(f"  ... and {len(matches) - 50} more")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        shown = matches[:50]
+        return ok(
+            pattern=pattern,
+            address=_format_address(addr),
+            size=size,
+            matches=[_format_address(addr + off) for off in shown],
+            total=len(matches),
+            shown=len(shown),
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
@@ -1326,7 +1609,7 @@ def find_x86_prologues(
     address: str,
     size: int = 65536,
     patterns: list[str] | None = None,
-) -> str:
+) -> dict:
     """Find x86/x64 function prologues in a debuggee memory region.
 
     Detects common function-entry byte patterns. High density indicates
@@ -1365,27 +1648,29 @@ def find_x86_prologues(
             except Exception:
                 pass
 
-        if not all_prologues:
-            return "No function prologues found in region."
-
         pages = max(1, len(data) / 4096)
         density = len(all_prologues) / pages
-        verdict = "DECRYPTED CODE (high confidence)" if density > 1.0 else ("POSSIBLE CODE" if density > 0.1 else "SPARSE")
-
-        lines = [
-            f"Found {len(all_prologues)} function prologues (scanned {len(pattern_list)} patterns)",
-            f"Density: {density:.1f} per 4KB page",
-            f"Interpretation: {verdict}",
-        ]
-        for off in sorted(all_prologues)[:20]:
-            lines.append(f"  {_format_address(addr + off)}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        verdict = (
+            "DECRYPTED CODE (high confidence)" if density > 1.0
+            else "POSSIBLE CODE" if density > 0.1
+            else "SPARSE"
+        )
+        shown = sorted(all_prologues)[:20]
+        return ok(
+            address=_format_address(addr),
+            size=size,
+            prologues=[_format_address(addr + off) for off in shown],
+            total=len(all_prologues),
+            shown=len(shown),
+            density=round(density, 2),
+            verdict=verdict,
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def analyze_region_full(address: str, size: int = 65536) -> str:
+def analyze_region_full(address: str, size: int = 65536) -> dict:
     """Run comprehensive analysis on a debuggee memory region.
 
     Returns: entropy, string count, known strings in target binary,
@@ -1396,27 +1681,24 @@ def analyze_region_full(address: str, size: int = 65536) -> str:
         addr = _parse_address_or_expression(address)
         data = client.read_memory(addr, size)
         result = _analyze_region(data, addr)
-
-        lines = [
-            f"=== Region {_format_address(addr)} ({result['size']} bytes) ===",
-            f"Entropy: {result['entropy']:.4f}",
-            f"Likely code: {'YES' if result['is_likely_code'] else 'NO'}",
-            f"ASCII strings: {result['string_count']}",
-            f"Function prologues: {result['prologue_count']}",
-            "",
-            "Strings of interest found:",
-        ]
-        for offset, s in result["known_strings"]:
-            lines.append(f"  '{s}' @ {_format_address(offset)}")
-        if not result["known_strings"]:
-            lines.append("  (none)")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            address=_format_address(addr),
+            size=result["size"],
+            entropy=round(result["entropy"], 4),
+            is_likely_code=result["is_likely_code"],
+            string_count=result["string_count"],
+            prologue_count=result["prologue_count"],
+            known_strings=[
+                {"address": _format_address(offset), "value": s}
+                for offset, s in result["known_strings"]
+            ],
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def compare_memory(address_a: str, address_b: str, size: int = 4096) -> str:
+def compare_memory(address_a: str, address_b: str, size: int = 4096) -> dict:
     """Compare two debuggee memory regions byte-by-byte."""
     try:
         client = _require_client()
@@ -1426,15 +1708,25 @@ def compare_memory(address_a: str, address_b: str, size: int = 4096) -> str:
         data_b = client.read_memory(b, size)
 
         if data_a == data_b:
-            return f"Regions are identical ({_format_address(a)} and {_format_address(b)}, {size} bytes)"
+            return ok(equal=True, address_a=_format_address(a), address_b=_format_address(b),
+                      size=size, total_differences=0, differences=[])
 
         diffs = [(i, data_a[i], data_b[i]) for i in range(size) if data_a[i] != data_b[i]]
-        lines = [f"Differences ({len(diffs)} bytes differ):"]
-        for offset, va, vb in diffs[:50]:
-            lines.append(f"  {_format_address(a + offset)}: {va:02X} vs {vb:02X}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        shown = diffs[:50]
+        return ok(
+            equal=False,
+            address_a=_format_address(a),
+            address_b=_format_address(b),
+            size=size,
+            total_differences=len(diffs),
+            differences=[
+                {"address": _format_address(a + offset), "value_a": f"{va:02X}", "value_b": f"{vb:02X}"}
+                for offset, va, vb in shown
+            ],
+            shown=len(shown),
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1442,7 +1734,7 @@ def compare_memory(address_a: str, address_b: str, size: int = 4096) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def launch_process_no_debug(exe_path: str, args: str = "", cwd: str = "", wait: bool = False) -> str:
+def launch_process_no_debug(exe_path: str, args: str = "", cwd: str = "", wait: bool = False) -> dict:
     """Launch a process WITHOUT debugger attachment. Returns the PID.
 
     Use this to run targets normally, then dump them after decryption completes.
@@ -1455,14 +1747,14 @@ def launch_process_no_debug(exe_path: str, args: str = "", cwd: str = "", wait: 
         proc = subprocess.Popen(cmd, cwd=cwd or None, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if wait:
             proc.wait()
-            return f"Process completed with exit code {proc.returncode}"
-        return f"Process launched. PID={proc.pid}"
-    except Exception as e:
-        return f"Error: {e}"
+            return ok(exe_path=exe_path, pid=proc.pid, exit_code=proc.returncode, completed=True)
+        return ok(exe_path=exe_path, pid=proc.pid, completed=False)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def dump_process_no_debugger(pid: int, output_dir: str = "", method: str = "procdump") -> str:
+def dump_process_no_debugger(pid: int, output_dir: str = "", method: str = "procdump") -> dict:
     """Dump process memory WITHOUT debugger attachment.
 
     Methods:
@@ -1471,41 +1763,45 @@ def dump_process_no_debugger(pid: int, output_dir: str = "", method: str = "proc
       - minidump: Python ctypes call to MiniDumpWriteDump
     """
     try:
+        if method not in ("procdump", "comsvcs", "minidump"):
+            return err(f"Unknown method '{method}'. Use: procdump, comsvcs, minidump.",
+                       ErrorType.BAD_ARGUMENT, hint=_ERROR_HINTS[ErrorType.BAD_ARGUMENT])
         if not output_dir:
             output_dir = os.path.join(Path.cwd(), "dumps")
         os.makedirs(output_dir, exist_ok=True)
         dump_path = os.path.join(output_dir, f"dump_{pid}.dmp")
 
         if method == "procdump":
-            ok = dump_via_procdump_clone(pid, dump_path)
+            result = dump_via_procdump_clone(pid, dump_path)
         elif method == "comsvcs":
-            ok = dump_via_comsvcs(pid, dump_path)
-        elif method == "minidump":
-            ok = dump_via_minidumpwritedump(pid, dump_path)
+            result = dump_via_comsvcs(pid, dump_path)
         else:
-            return f"ERROR: Unknown method '{method}'. Use: procdump, comsvcs, minidump."
+            result = dump_via_minidumpwritedump(pid, dump_path)
 
-        if ok and os.path.exists(dump_path):
-            size = os.path.getsize(dump_path)
-            return f"Dump: {dump_path} ({size:,} bytes)"
-        return "Dump failed. Run as Administrator?"
-    except Exception as e:
-        return f"Error: {e}"
+        if result and os.path.exists(dump_path):
+            dump_size = os.path.getsize(dump_path)
+            return ok(pid=pid, method=method, dump_path=dump_path, size=dump_size)
+        return err("Dump failed.", ErrorType.SNAPSHOT_FAILED,
+                   hint=_ERROR_HINTS[ErrorType.SNAPSHOT_FAILED], pid=pid, method=method)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def wait_for_window_title(pid: int, title_substring: str, timeout_sec: int = 120) -> str:
+def wait_for_window_title(pid: int, title_substring: str, timeout_sec: int = 120) -> dict:
     """Wait until a process window with a specific title appears.
 
     Use as a signal that initialization is complete.
     """
     if wait_for_window(pid, title_substring, timeout_sec):
-        return f"Window containing '{title_substring}' found for PID {pid}."
-    return f"TIMEOUT: Window '{title_substring}' not found within {timeout_sec}s."
+        return ok(pid=pid, title_substring=title_substring)
+    return err(f"Window '{title_substring}' not found within {timeout_sec}s.",
+               ErrorType.TIMEOUT, hint=_ERROR_HINTS[ErrorType.TIMEOUT],
+               pid=pid, timeout_sec=timeout_sec)
 
 
 @mcp.tool()
-def list_running_processes(filter_name: str = "") -> str:
+def list_running_processes(filter_name: str = "") -> dict:
     """List running processes, optionally filtered by name."""
     import psutil
     try:
@@ -1516,43 +1812,47 @@ def list_running_processes(filter_name: str = "") -> str:
                 name = info["name"] or "???"
                 if filter_name and filter_name.lower() not in name.lower():
                     continue
-                procs.append((info["pid"], name))
+                procs.append({"pid": info["pid"], "name": name})
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        if not procs:
-            return "No matching processes." if filter_name else "No processes found."
-        return "\n".join(f"{pid:>8}  {name}" for pid, name in sorted(procs))
-    except Exception as e:
-        return f"Error: {e}"
+        procs.sort(key=lambda p: p["pid"])
+        return ok(processes=procs, total=len(procs), filter=filter_name)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def terminate_process(pid: int) -> str:
+def terminate_process(pid: int) -> dict:
     """Terminate a process by PID."""
     import psutil
     try:
         proc = psutil.Process(pid)
         proc.terminate()
         proc.wait(timeout=5)
-        return f"Process {pid} terminated."
+        return ok(pid=pid, action="terminated")
     except psutil.NoSuchProcess:
-        return f"Process {pid} not found."
+        return err(f"Process {pid} not found.", ErrorType.NOT_FOUND,
+                   hint=_ERROR_HINTS[ErrorType.NOT_FOUND], pid=pid)
     except psutil.TimeoutExpired:
         try:
             proc.kill()
         except Exception:
             pass
-        return f"Process {pid} killed (terminate timed out)."
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(pid=pid, action="killed")
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def suspend_process(pid: int) -> str:
+def suspend_process(pid: int) -> dict:
     """Suspend all threads in a process WITHOUT debugger attachment."""
-    if nt_suspend_process(pid):
-        return f"Process {pid} suspended."
-    return f"Failed to suspend process {pid}. Run as Administrator?"
+    try:
+        if nt_suspend_process(pid):
+            return ok(pid=pid)
+        return err(f"Failed to suspend process {pid}.", ErrorType.PERMISSION_DENIED,
+                   hint=_ERROR_HINTS[ErrorType.PERMISSION_DENIED], pid=pid)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1560,7 +1860,7 @@ def suspend_process(pid: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def analyze_pe(pe_path: str) -> str:
+def analyze_pe(pe_path: str) -> dict:
     """Parse PE headers, sections, entry point, TLS callbacks (read-only).
 
     NO patching — PE integrity checks block modified executables.
@@ -1571,29 +1871,29 @@ def analyze_pe(pe_path: str) -> str:
         ep = get_entry_point(pe_path)
         base = get_image_base(pe_path)
         bits = get_bitness(pe_path)
-
-        lines = [
-            f"=== {os.path.basename(pe_path)} ===",
-            f"Bitness: {bits}-bit",
-            f"Image Base: {_format_address(base)}",
-            f"Entry Point: {_format_address(base + ep)} (RVA 0x{ep:X})",
-            f"TLS Callbacks: {len(tls)}",
-        ]
-        for i, cb in enumerate(tls):
-            lines.append(f"  [{i}] RVA 0x{cb:X}")
-
-        lines.append(f"\nSections ({len(sections)}):")
-        fmt = "{:<14} {:<14} {:<10} {:<10}"
-        lines.append(fmt.format("Name", "VA", "VSize", "RawSize"))
-        for sec in sections:
-            lines.append(fmt.format(sec["name"], _format_address(sec["virtual_address"]), hex(sec["virtual_size"]), hex(sec["size_of_raw_data"])))
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            file=os.path.basename(pe_path),
+            bitness=bits,
+            image_base=_format_address(base),
+            entry_point=_format_address(base + ep),
+            entry_point_rva=f"0x{ep:X}",
+            tls_callbacks=[f"0x{cb:X}" for cb in tls],
+            sections=[
+                {
+                    "name": sec["name"],
+                    "virtual_address": _format_address(sec["virtual_address"]),
+                    "virtual_size": f"0x{sec['virtual_size']:X}",
+                    "raw_size": f"0x{sec['size_of_raw_data']:X}",
+                }
+                for sec in sections
+            ],
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def get_pe_imports(pe_path: str, dll_filter: str = "") -> str:
+def get_pe_imports(pe_path: str, dll_filter: str = "") -> dict:
     """List imported functions from a PE file."""
     try:
         imports = get_imports(pe_path, dll_filter)
@@ -1601,21 +1901,21 @@ def get_pe_imports(pe_path: str, dll_filter: str = "") -> str:
         for imp in imports:
             dll = imp["dll"]
             by_dll.setdefault(dll, []).append(imp["function_name"])
-
-        lines = [f"=== Imports ({os.path.basename(pe_path)}) ==="]
-        for dll, funcs in sorted(by_dll.items()):
-            lines.append(f"\n{dll} ({len(funcs)} functions):")
-            for f in funcs[:20]:
-                lines.append(f"  {f}")
-            if len(funcs) > 20:
-                lines.append(f"  ... and {len(funcs) - 20} more")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            file=os.path.basename(pe_path),
+            dll_filter=dll_filter,
+            imports=[
+                {"dll": dll, "functions": funcs, "count": len(funcs)}
+                for dll, funcs in sorted(by_dll.items())
+            ],
+            total_imports=len(imports),
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def get_pe_exports(pe_path: str, filter_name: str = "") -> str:
+def get_pe_exports(pe_path: str, filter_name: str = "") -> dict:
     """List exported functions from a PE file (DLL or EXE with exports).
 
     Useful for resolving DLL exports that the target binary calls by
@@ -1629,67 +1929,72 @@ def get_pe_exports(pe_path: str, filter_name: str = "") -> str:
         exports = get_exports(pe_path)
         if filter_name:
             exports = [e for e in exports if filter_name.lower() in (e.get("name") or "").lower()]
-        if not exports:
-            return f"No exports found in {os.path.basename(pe_path)}."
-        lines = [f"=== Exports ({os.path.basename(pe_path)}) — {len(exports)} entries ==="]
-        for exp in exports[:200]:
-            name = exp.get("name") or "<unnamed>"
-            ordinal = exp.get("ordinal", "?")
-            va = exp.get("virtual_address", 0)
-            lines.append(f"  [{ordinal:>5}]  {_format_address(va)}  {name}")
-        if len(exports) > 200:
-            lines.append(f"  ... and {len(exports) - 200} more (use filter_name to narrow results)")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        shown = exports[:200]
+        return ok(
+            file=os.path.basename(pe_path),
+            filter=filter_name,
+            exports=[
+                {
+                    "ordinal": exp.get("ordinal"),
+                    "address": _format_address(exp.get("virtual_address", 0)),
+                    "name": exp.get("name") or "",
+                }
+                for exp in shown
+            ],
+            total=len(exports),
+            shown=len(shown),
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def check_pe_security(pe_path: str) -> str:
+def check_pe_security(pe_path: str) -> dict:
     """Check PE security mitigations: NX, ASLR, CFG, Integrity Check."""
     try:
         result = check_security(pe_path)
-        lines = [f"=== Security: {os.path.basename(pe_path)} ==="]
-        for k, v in result.items():
-            lines.append(f"  {k}: {'YES' if v else 'NO'}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(file=os.path.basename(pe_path), mitigations=result)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def locate_protected_sections(pe_path: str) -> str:
-    """Locate protected sections: Stext, Sdata, and other common obfuscation sections."""
+def locate_protected_sections(pe_path: str) -> dict:
+    """Locate sections with non-standard or obfuscated names.
+
+    Searches for sections whose names contain typical packer/protection
+    indicators (e.g. 'text', 'data', 'rsrc', or user-provided patterns).
+    """
     try:
         sections = get_sections(pe_path)
-        target = {"stext", "sdata", "srdata"}
-        lines = ["=== Sections ==="]
-        found = False
+        target = {"text", "data", "rsrc", "code", "bss"}
+        found = []
         for sec in sections:
             name_lower = sec["name"].lower().strip("\x00").rstrip("\x00")
             if name_lower in target or any(t in name_lower for t in target):
-                found = True
-                lines.append(f"  {sec['name']}: VA={_format_address(sec['virtual_address'])}  Size=0x{sec['virtual_size']:X} ({sec['virtual_size']:,} bytes)")
-        if not found:
-            lines.append("  No protected sections found.")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+                found.append({
+                    "name": sec["name"],
+                    "virtual_address": _format_address(sec["virtual_address"]),
+                    "virtual_size": f"0x{sec['virtual_size']:X}",
+                    "virtual_size_bytes": sec["virtual_size"],
+                })
+        return ok(file=os.path.basename(pe_path), interesting_sections=found, total=len(found))
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def get_pe_tls_callbacks(pe_path: str) -> str:
+def get_pe_tls_callbacks(pe_path: str) -> dict:
     """List TLS callback addresses from a PE file."""
     try:
         callbacks = get_tls_callbacks(pe_path)
-        if not callbacks:
-            return f"No TLS callbacks in {os.path.basename(pe_path)}."
-        lines = [f"TLS Callbacks in {os.path.basename(pe_path)}:"]
-        for i, cb in enumerate(callbacks):
-            lines.append(f"  [{i}] RVA 0x{cb:X}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            file=os.path.basename(pe_path),
+            callbacks=[f"0x{cb:X}" for cb in callbacks],
+            total=len(callbacks),
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1697,7 +2002,7 @@ def get_pe_tls_callbacks(pe_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def extract_section_from_dump(dump_path: str, section_va: str, size: int, output_path: str) -> str:
+def extract_section_from_dump(dump_path: str, section_va: str, size: int, output_path: str) -> dict:
     """Extract raw bytes at a VA from a process minidump file.
 
     Uses memprocfs if available, falls back to the ``minidump`` library for
@@ -1764,17 +2069,19 @@ def extract_section_from_dump(dump_path: str, section_va: str, size: int, output
                 pass
 
         if extracted is None:
-            return f"Could not extract bytes at VA {_format_address(va)} from dump."
+            return err(f"Could not extract bytes at VA {_format_address(va)} from dump.",
+                       ErrorType.NOT_FOUND, hint=_ERROR_HINTS[ErrorType.NOT_FOUND],
+                       section_va=_format_address(va), dump_path=dump_path)
 
         with open(output_path, "wb") as f:
             f.write(extracted)
-        return f"Extracted {len(extracted):,} bytes to {output_path}"
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(section_va=_format_address(va), size=len(extracted), output_path=output_path)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def validate_extracted_binary(binary_path: str, expected_va: int = 0) -> str:
+def validate_extracted_binary(binary_path: str, expected_va: int = 0) -> dict:
     """Validate an extracted section: entropy, prologues, known strings.
 
     Scores 0–100. >=70 = VALID, >=40 = SUSPECT, <40 = INVALID.
@@ -1783,32 +2090,31 @@ def validate_extracted_binary(binary_path: str, expected_va: int = 0) -> str:
         with open(binary_path, "rb") as f:
             data = f.read()
         result = validate_extracted_section(data, os.path.basename(binary_path))
-        lines = [
-            f"=== Validation: {os.path.basename(binary_path)} ===",
-            f"Size: {result['size']:,} bytes",
-            f"Entropy: {result['entropy']:.4f}",
-            f"Prologues: {result['prologue_count']}",
-            f"Score: {result['score']}/100 — {result['verdict']}",
-        ]
-        for check in result["checks"]:
-            lines.append(f"  {check}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            file=os.path.basename(binary_path),
+            size=result["size"],
+            entropy=round(result["entropy"], 4),
+            prologue_count=result["prologue_count"],
+            score=result["score"],
+            verdict=result["verdict"],
+            checks=result["checks"],
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def extract_protected_sections(dump_path: str, output_dir: str = "") -> str:
-    """Extract protected sections from a dump file.
+def extract_protected_sections(dump_path: str, output_dir: str = "") -> dict:
+    """Extract sections from a process dump file.
 
-    Extracts known sections: Stext (0x67A000), Sdata (0x1122000), and other protected regions.
+    Extracts all sections defined in the target binary's section table.
     """
     try:
         if not output_dir:
             output_dir = os.path.join(Path.cwd(), "extracted")
         os.makedirs(output_dir, exist_ok=True)
 
-        results = []
+        sections = []
         for name, (va, size) in TARGET_SECTIONS.items():
             output = os.path.join(output_dir, f"{name.lower()}.bin")
             extracted = None
@@ -1828,7 +2134,7 @@ def extract_protected_sections(dump_path: str, output_dir: str = "") -> str:
                 pass
 
             if extracted is None:
-                results.append(f"  {name}: FAILED to extract")
+                sections.append({"name": name, "success": False, "output_path": None})
                 continue
 
             with open(output, "wb") as f:
@@ -1836,11 +2142,20 @@ def extract_protected_sections(dump_path: str, output_dir: str = "") -> str:
 
             ent = shannon_entropy(extracted)
             prologues = len(scan_pattern(extracted, "55 8B EC")) + len(scan_pattern(extracted, "55 89 E5"))
-            results.append(f"  {name}: {output} ({len(extracted):,}b, entropy={ent:.2f}, {prologues} prologues)")
+            sections.append({
+                "name": name,
+                "success": True,
+                "output_path": output,
+                "size": len(extracted),
+                "entropy": round(ent, 4),
+                "prologues": prologues,
+            })
 
-        return "\n".join(results)
-    except Exception as e:
-        return f"Error: {e}"
+        succeeded = sum(1 for s in sections if s["success"])
+        return ok(dump_path=dump_path, output_dir=output_dir, sections=sections,
+                  total=len(sections), succeeded=succeeded)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1854,19 +2169,21 @@ def workflow_extract_binary(
     dump_method: str = "procdump",
     output_dir: str = "",
     validate: bool = True,
-) -> str:
-    """Extract decrypted sections from a protected binary.
+    window_title: str = "Ready",
+) -> dict:
+    """Extract sections from a binary via cold dump (no debugger, no patching).
 
-    Steps: launch -> wait for dialog window -> dump process -> extract sections -> validate.
+    Steps: launch -> wait for initialization -> dump process -> extract sections -> validate.
 
-    NO debugger, NO PE patching. Works against PE integrity checks.
+    NO debugger, NO PE patching. Works against run-time integrity checks.
 
     Args:
         target_exe: Full path to the target executable
-        timeout_sec: Max wait for serial dialog (default 120)
+        timeout_sec: Max wait for initialization signal (default 120)
         dump_method: 'procdump' (recommended), 'comsvcs', or 'minidump'
         output_dir: Output directory (default: ./extracted/)
         validate: Run entropy + string analysis after extraction
+        window_title: Window title substring to wait for as init signal (default 'Ready')
     """
     try:
         if not output_dir:
@@ -1879,30 +2196,31 @@ def workflow_extract_binary(
             output_dir=output_dir,
             validate=validate,
             terminate_after=True,
+            window_title=window_title,
         )
 
-        lines = [f"=== Extraction {'SUCCESS' if result.success else 'FAILED'} ==="]
-        lines.append(f"PID: {result.pid}  Method: {result.dump_method}")
-        lines.append(f"Dump: {result.dump_path}")
-        lines.append(f"Elapsed: {result.elapsed_sec:.1f}s")
-
+        sections = []
         for section, path in result.sections_extracted.items():
-            size = os.path.getsize(path) if os.path.exists(path) else 0
+            entry = {"name": section, "path": path, "size": os.path.getsize(path) if os.path.exists(path) else 0}
             analysis = result.analysis.get(section, {})
-            lines.append(f"\n  {section}: {path} ({size:,} bytes)")
             if analysis:
-                lines.append(f"    Score: {analysis['score']}/100 — {analysis['verdict']}")
-                for check in analysis.get("checks", []):
-                    lines.append(f"      {check}")
+                entry["score"] = analysis.get("score")
+                entry["verdict"] = analysis.get("verdict")
+                entry["checks"] = analysis.get("checks", [])
+            sections.append(entry)
 
-        if result.errors:
-            lines.append("\nErrors:")
-            for err in result.errors:
-                lines.append(f"  X {err}")
-
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            success=result.success,
+            target_exe=target_exe,
+            pid=result.pid,
+            dump_method=result.dump_method,
+            dump_path=result.dump_path,
+            elapsed_sec=round(result.elapsed_sec, 1),
+            sections=sections,
+            errors=result.errors,
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
@@ -1911,13 +2229,13 @@ def workflow_batch_cold_dump(
     iterations: int = 5,
     dump_method: str = "procdump",
     output_dir: str = "",
-) -> str:
+) -> dict:
     """Run extraction multiple times, compare dumps for consistency."""
     try:
         if not output_dir:
             output_dir = os.path.join(Path.cwd(), "extracted")
 
-        results_data = []
+        runs = []
         for i in range(iterations):
             iteration_dir = os.path.join(output_dir, f"run_{i + 1:02d}")
             result = workflow_extract_binary(
@@ -1928,16 +2246,19 @@ def workflow_batch_cold_dump(
                 validate=True,
                 terminate_after=True,
             )
-            results_data.append(result)
+            analysis = result.analysis.get("Stext", {})
+            runs.append({
+                "run": i + 1,
+                "success": result.success,
+                "score": analysis.get("score", 0),
+                "entropy": analysis.get("entropy"),
+            })
 
-        lines = [f"=== Batch Results ({iterations} runs) ==="]
-        for i, r in enumerate(results_data):
-            status = "OK" if r.success else "FAIL"
-            analysis = r.analysis.get("Stext", {})
-            lines.append(f"  [{i + 1}] {status}  score={analysis.get('score', 0)}/100  entropy={analysis.get('entropy', '?')}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        succeeded = sum(1 for r in runs if r["success"])
+        return ok(target_exe=target_exe, iterations=iterations, runs=runs,
+                  succeeded=succeeded, failed=iterations - succeeded)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1945,25 +2266,20 @@ def workflow_batch_cold_dump(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_debugee_tls_callbacks() -> str:
+def get_debugee_tls_callbacks() -> dict:
     """Get TLS callback RVAs from the debuggee's PE file on disk."""
     try:
         client = _require_client()
         callbacks = client.get_tls_callbacks()
-        if not callbacks:
-            return "No TLS callbacks found in debuggee."
-        lines = [f"TLS Callbacks ({len(callbacks)}):"]
-        for i, cb in enumerate(callbacks):
-            lines.append(f"  [{i}] RVA 0x{cb:X}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(callbacks=[f"0x{cb:X}" for cb in callbacks], total=len(callbacks))
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def debuggee_virtual_protect_ex(address: str, size: int, new_protection: int = 0x20) -> str:
+def debuggee_virtual_protect_ex(address: str, size: int, new_protection: int = 0x20) -> dict:
     """Change memory protection on a debuggee region.
-    
+
     Uses VirtualProtectEx. Common values:
     0x20 = PAGE_EXECUTE_READ, 0x04 = PAGE_READWRITE, 0x40 = PAGE_EXECUTE_READWRITE
     """
@@ -1971,57 +2287,61 @@ def debuggee_virtual_protect_ex(address: str, size: int, new_protection: int = 0
         client = _require_client()
         addr = _parse_address_or_expression(address)
         result = client.virtual_protect_ex(addr, size, new_protection)
-        return f"Page protection changed at {_format_address(addr)}." if result else "VirtualProtectEx failed."
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            return err("VirtualProtectEx failed.", ErrorType.RPC_ERROR,
+                       hint=_ERROR_HINTS[ErrorType.RPC_ERROR], address=_format_address(addr))
+        return ok(address=_format_address(addr), size=size, protection=f"0x{new_protection:02X}")
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def debuggee_suspend_all_threads() -> str:
+def debuggee_suspend_all_threads() -> dict:
     """Suspend all threads in the debuggee via ToolHelp snapshot."""
     try:
         client = _require_client()
-        ok = client.suspend_all_threads()
-        return "All threads suspended." if ok else "Suspend failed."
-    except Exception as e:
-        return f"Error: {e}"
+        result = client.suspend_all_threads()
+        if not result:
+            return err("Failed to suspend threads.", ErrorType.RPC_ERROR,
+                       hint=_ERROR_HINTS[ErrorType.RPC_ERROR])
+        return ok()
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def debuggee_get_peb() -> str:
+def debuggee_get_peb() -> dict:
     """Read the debuggee's PEB: BeingDebugged, NtGlobalFlag, HeapFlags."""
     try:
         client = _require_client()
         peb = client.get_peb()
-        lines = [
-            f"BeingDebugged: {peb.being_debugged}",
-            f"NtGlobalFlag: 0x{peb.nt_global_flag:08X}",
-            f"HeapFlags: 0x{peb.heap_flags:08X}",
-            f"HeapForceFlags: 0x{peb.heap_force_flags:08X}",
-        ]
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            being_debugged=peb.being_debugged,
+            nt_global_flag=f"0x{peb.nt_global_flag:08X}",
+            heap_flags=f"0x{peb.heap_flags:08X}",
+            heap_force_flags=f"0x{peb.heap_force_flags:08X}",
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def debuggee_get_process_info() -> str:
+def debuggee_get_process_info() -> dict:
     """Get debuggee process metadata: PID, entry point, image base, size, path."""
     try:
         client = _require_client()
         info = client.get_process_info()
-        lines = [
-            f"PID: {info.pid}",
-            f"Main Thread: {info.main_thread_id}",
-            f"Entry Point: {_format_address(info.image_base + info.entry_point)}",
-            f"Image Base: {_format_address(info.image_base)}",
-            f"Image Size: {info.image_size:,} bytes",
-            f"64-bit: {info.is_64bit}",
-            f"Path: {info.exe_path}",
-        ]
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            pid=info.pid,
+            main_thread_id=info.main_thread_id,
+            entry_point=_format_address(info.image_base + info.entry_point),
+            image_base=_format_address(info.image_base),
+            image_size=info.image_size,
+            is_64bit=info.is_64bit,
+            exe_path=info.exe_path,
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -2029,8 +2349,8 @@ def debuggee_get_process_info() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def debug_protected_tls_callbacks(target_exe: str) -> str:
-    """Launch target in x64dbg with ScyllaHide, enumerate TLS callbacks."""
+def debug_and_enumerate_tls(target_exe: str) -> dict:
+    """Launch target in x64dbg, apply anti-debug profile, and enumerate TLS callbacks."""
     try:
         client = _require_client()
         client.load_executable(target_exe)
@@ -2038,42 +2358,55 @@ def debug_protected_tls_callbacks(target_exe: str) -> str:
         callbacks = client.get_tls_callbacks()
         peb = client.get_peb()
         info = client.get_process_info()
-
-        lines = [
-            f"=== TLS Analysis: {target_exe} ===",
-            f"Entry Point: {_format_address(info.image_base + info.entry_point)}",
-            f"Image Base: {_format_address(info.image_base)}",
-            f"PEB.BeingDebugged: {peb.being_debugged}",
-            f"PEB.NtGlobalFlag: 0x{peb.nt_global_flag:08X}",
-            f"TLS Callbacks ({len(callbacks)}):",
-        ]
-        for i, cb in enumerate(callbacks):
-            lines.append(f"  [{i}] RVA 0x{cb:X} (VA {_format_address(info.image_base + cb)})")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
+        return ok(
+            target_exe=target_exe,
+            image_base=_format_address(info.image_base),
+            entry_point=_format_address(info.image_base + info.entry_point),
+            peb_being_debugged=peb.being_debugged,
+            peb_nt_global_flag=f"0x{peb.nt_global_flag:08X}",
+            tls_callbacks=[
+                {"index": i, "rva": f"0x{cb:X}", "va": _format_address(info.image_base + cb)}
+                for i, cb in enumerate(callbacks)
+            ],
+            total_callbacks=len(callbacks),
+        )
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 @mcp.tool()
-def bypass_execute_protect(section_name: str = "Stext") -> str:
-    """Change protected section memory protection from PAGE_EXECUTE to PAGE_EXECUTE_READ."""
-    section_map = {
-        "Stext": (0x00A7A000, 0x00A18DF0),
-        "Sdata": (0x01522000, 0x0034381C),
-        ".protected": (0x0186D000, 0x00172A4C),
+def change_memory_protection(address: str, size: int, protection: str = "PAGE_EXECUTE_READ") -> dict:
+    """Change memory protection at a specific address.
+
+    Args:
+        address: Target address (hex string or expression).
+        size: Number of bytes to affect.
+        protection: Windows protection constant name (default: PAGE_EXECUTE_READ).
+                    Supported: PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+                    PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE.
+    """
+    protection_map = {
+        "PAGE_NOACCESS": 0x01,
+        "PAGE_READONLY": 0x02,
+        "PAGE_READWRITE": 0x04,
+        "PAGE_EXECUTE": 0x10,
+        "PAGE_EXECUTE_READ": 0x20,
+        "PAGE_EXECUTE_READWRITE": 0x40,
     }
-    if section_name not in section_map:
-        return f"Unknown section '{section_name}'. Known: {list(section_map.keys())}"
-    va, size = section_map[section_name]
-    PAGE_EXECUTE_READ = 0x20
+    prot_val = protection_map.get(protection)
+    if prot_val is None:
+        return err(f"Unknown protection '{protection}'.", ErrorType.BAD_ARGUMENT,
+                   hint=f"Supported: {list(protection_map.keys())}")
     try:
         client = _require_client()
-        ok = client.virtual_protect_ex(va, size, PAGE_EXECUTE_READ)
-        if ok:
-            return f"Changed {section_name} ({_format_address(va)}, {size:,}b) to PAGE_EXECUTE_READ"
-        return f"VirtualProtectEx failed for {section_name}"
-    except Exception as e:
-        return f"Error: {e}"
+        addr = _parse_address_or_expression(address)
+        result = client.virtual_protect_ex(addr, size, prot_val)
+        if not result:
+            return err(f"VirtualProtectEx failed for {address}.", ErrorType.RPC_ERROR,
+                       hint=_ERROR_HINTS[ErrorType.RPC_ERROR], address=address)
+        return ok(address=_format_address(addr), size=size, protection=protection)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -2278,7 +2611,7 @@ def session_summary(sandbox_id: str = "") -> dict:
     # --- breakpoints ---
     if client is not None:
         try:
-            bps = client.get_breakpoints()
+            bps = _get_all_breakpoints(client)
             summary["breakpoints"] = {
                 "total": len(bps),
                 "enabled": sum(1 for bp in bps if bp.enabled),
@@ -2299,6 +2632,82 @@ def session_summary(sandbox_id: str = "") -> dict:
 # ---------------------------------------------------------------------------
 # P1 — Agent Orientation & Discovery
 # ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_tools_by_group(group: str = "", limit: int = 50) -> dict:
+    """List MCP tools filtered by functional group.
+
+    Groups are heuristic categories based on tool names and descriptions.
+    Use this to discover tools in a specific domain.
+
+    Args:
+        group: Group name — 'session', 'memory', 'register', 'breakpoint',
+               'analysis', 'antidebug', 'execution', 'trace', 'workflow',
+               'offline', 'semantic', 'macro', 'infrastructure'. Use '' for all.
+        limit: Maximum results per group (default 50)
+    """
+    try:
+        tm = getattr(mcp, "_tool_manager", None)
+        if tm is None:
+            return {"success": False, "error": "Tool manager not available"}
+        tools = getattr(tm, "_tools", {})
+
+        group_keywords: dict[str, list[str]] = {
+            "session": ["session", "connect", "disconnect", "start", "terminate", "list_sessions"],
+            "memory": ["memory", "read_memory", "write_memory", "allocate", "free", "virt", "memmap"],
+            "register": ["register", "reg", "get_reg", "set_reg"],
+            "breakpoint": ["breakpoint", "bp", "conditional", "hardware", "memory_breakpoint"],
+            "analysis": ["analyze", "disassemble", "cfg", "threads", "modules", "symbols", "stack", "seh"],
+            "antidebug": ["anti", "debug", "peb", "scylla", "hide", "timing", "tls"],
+            "execution": ["go", "pause", "step", "skip", "run_to", "trace"],
+            "trace": ["trace", "single_step", "execution_trace"],
+            "workflow": ["workflow", "extract", "dump", "protected", "process"],
+            "offline": ["pe_", "entropy", "string", "pattern", "extract", "validate", "analyze_pe"],
+            "semantic": ["memory_record", "memory_query", "memory_list", "memory_get", "memory_stats", "memory_export", "memory_import", "memory_delete"],
+            "macro": ["macro", "script"],
+            "infrastructure": ["report", "summary", "tool_search", "suggest", "health", "coverage", "checkpoint"],
+        }
+
+        results: list[dict] = []
+        groups_found: set[str] = set()
+
+        for name, tool_obj in tools.items():
+            desc = getattr(tool_obj, "description", "") or ""
+            text = f"{name} {desc}".lower()
+
+            matched_groups: list[str] = []
+            for g, keywords in group_keywords.items():
+                if any(kw in text for kw in keywords):
+                    matched_groups.append(g)
+
+            if not group or group.lower() in matched_groups:
+                results.append({
+                    "name": name,
+                    "description": desc.split("\n")[0] if desc else "",
+                    "groups": matched_groups,
+                })
+                groups_found.update(matched_groups)
+
+        if group and not results:
+            return {
+                "success": True,
+                "group": group,
+                "total": 0,
+                "results": [],
+                "available_groups": sorted(group_keywords.keys()),
+                "hint": f"No tools matched group '{group}'. Try one of the available_groups.",
+            }
+
+        return {
+            "success": True,
+            "group": group or "all",
+            "total": len(results),
+            "results": results[:limit],
+            "available_groups": sorted(groups_found) if group else sorted(group_keywords.keys()),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 
 @mcp.tool()
 def tool_search(query: str, limit: int = 10) -> dict:
@@ -2400,7 +2809,7 @@ def suggest_next_actions(context: str = "") -> dict:
 
                 # Check if we have breakpoints
                 try:
-                    bps = client.get_breakpoints()
+                    bps = _get_all_breakpoints(client)
                     if not bps:
                         suggestions.append({
                             "priority": 3,
@@ -2563,7 +2972,7 @@ def report_generate(title: str = "", include_memory: bool = True) -> dict:
 
             # --- Breakpoints ---
             try:
-                bps = client.get_breakpoints()
+                bps = _get_all_breakpoints(client)
                 lines.append("## Breakpoints")
                 if bps:
                     for bp in bps:
@@ -2607,7 +3016,7 @@ def report_generate(title: str = "", include_memory: bool = True) -> dict:
 
 
 @mcp.tool()
-def resume_process(pid: int) -> str:
+def resume_process(pid: int) -> dict:
     """Resume all threads in a process WITHOUT debugger attachment.
 
     Uses NtResumeProcess to atomically resume all threads. Pairs with
@@ -2617,9 +3026,13 @@ def resume_process(pid: int) -> str:
     Args:
         pid: Process ID to resume
     """
-    if nt_resume_process(pid):
-        return f"Process {pid} resumed."
-    return f"Failed to resume process {pid}. Run as Administrator?"
+    try:
+        if nt_resume_process(pid):
+            return ok(pid=pid)
+        return err(f"Failed to resume process {pid}.", ErrorType.PERMISSION_DENIED,
+                   hint=_ERROR_HINTS[ErrorType.PERMISSION_DENIED], pid=pid)
+    except Exception as exc:
+        return err_from_exc(exc)
 
 
 # ---------------------------------------------------------------------------

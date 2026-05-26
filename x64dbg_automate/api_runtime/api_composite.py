@@ -360,6 +360,228 @@ def trace_execution(
     return ok(sandbox_id=sandbox_id, steps_recorded=len(trace_log), trace=trace_log)
 
 
+@tool
+def trace_until_call(
+    target_addr: str,
+    sandbox_id: str | None = None,
+    max_steps: int = 500,
+    timeout_sec: int = 60,
+) -> dict:
+    """Single-step until a CALL instruction to the target address is encountered.
+
+    Uses software single-stepping and disassembles each instruction. Stops when
+    a CALL (E8 / FF) targeting the specified address is found, or when max_steps
+    or timeout is reached.
+
+    Args:
+        target_addr: Address to watch for CALLs to (hex, symbol, or expression).
+        sandbox_id: Sandbox to operate on.
+        max_steps: Maximum steps to trace (default 500, max 2000).
+        timeout_sec: Max seconds for the entire trace.
+    """
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    try:
+        target = resolve_addr(client, target_addr)
+    except ValueError as exc:
+        return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+
+    max_steps = max(1, min(max_steps, 2000))
+    deadline = time.time() + timeout_sec
+    trace_log: list[dict] = []
+
+    try:
+        mgr.ensure_stopped(client)
+        for step in range(max_steps):
+            if time.time() > deadline:
+                return err("Trace exceeded timeout.", ErrorType.TIMEOUT,
+                           sandbox_id=sandbox_id, steps_recorded=len(trace_log),
+                           hint="Increase timeout_sec or reduce max_steps.")
+
+            cip = client.get_reg("cip")
+            ins = client.disassemble_at(cip)
+            if ins is None:
+                trace_log.append({"address": f"0x{cip:X}", "mnemonic": "<invalid>", "size": 0})
+                break
+
+            entry: dict = {
+                "step": step,
+                "address": f"0x{cip:X}",
+                "mnemonic": ins.instruction,
+                "size": ins.instr_size,
+            }
+            trace_log.append(entry)
+
+            # Detect CALL to target: E8 rel32 (relative) or FF /2 or FF /3 (indirect)
+            mnemonic_lower = ins.instruction.lower()
+            if mnemonic_lower.startswith("call"):
+                # Try to resolve the call target via expression evaluator
+                try:
+                    # Extract operand after "call "
+                    operand = ins.instruction[5:].strip()
+                    val, success = client.eval_sync(operand)
+                    if success and val == target:
+                        return ok(
+                            sandbox_id=sandbox_id,
+                            target=f"0x{target:X}",
+                            steps_recorded=len(trace_log),
+                            hit_at=f"0x{cip:X}",
+                            trace=trace_log,
+                        )
+                except Exception:
+                    pass
+                # Also check if instruction bytes encode a relative CALL to target
+                try:
+                    data = client.read_memory(cip, ins.instr_size)
+                    if data and len(data) >= 5 and data[0] == 0xE8:
+                        rel = int.from_bytes(data[1:5], "little", signed=True)
+                        if cip + 5 + rel == target:
+                            return ok(
+                                sandbox_id=sandbox_id,
+                                target=f"0x{target:X}",
+                                steps_recorded=len(trace_log),
+                                hit_at=f"0x{cip:X}",
+                                trace=trace_log,
+                            )
+                except Exception:
+                    pass
+
+            client.stepi()
+            if not client.wait_until_stopped(5):
+                return err("Step did not complete (target may be running or dead).",
+                           ErrorType.TIMEOUT, sandbox_id=sandbox_id,
+                           steps_recorded=len(trace_log))
+    except Exception as exc:  # noqa: BLE001
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id,
+                   steps_recorded=len(trace_log))
+
+    return ok(
+        sandbox_id=sandbox_id,
+        target=f"0x{target:X}",
+        steps_recorded=len(trace_log),
+        hit_at=None,
+        trace=trace_log,
+        hint="No CALL to target observed within step limit. Try increasing max_steps.",
+    )
+
+
+@tool
+def trace_until_register_equals(
+    register: str,
+    value: str,
+    sandbox_id: str | None = None,
+    max_steps: int = 500,
+    timeout_sec: int = 60,
+) -> dict:
+    """Single-step until a register equals the specified value.
+
+    Args:
+        register: Register name to monitor (e.g. 'rax', 'eip', 'r8').
+        value: Hex or decimal value to match (e.g. '0x401000', '42').
+        sandbox_id: Sandbox to operate on.
+        max_steps: Maximum steps to trace (default 500, max 2000).
+        timeout_sec: Max seconds for the entire trace.
+    """
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    try:
+        target_val = int(value, 0)
+    except ValueError:
+        return err(f"Cannot parse value: {value}", ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+
+    max_steps = max(1, min(max_steps, 2000))
+    deadline = time.time() + timeout_sec
+    trace_log: list[dict] = []
+
+    try:
+        mgr.ensure_stopped(client)
+        for step in range(max_steps):
+            if time.time() > deadline:
+                return err("Trace exceeded timeout.", ErrorType.TIMEOUT,
+                           sandbox_id=sandbox_id, steps_recorded=len(trace_log),
+                           hint="Increase timeout_sec or reduce max_steps.")
+
+            cip = client.get_reg("cip")
+            try:
+                reg_val = client.get_reg(register)
+            except Exception:
+                return err(f"Cannot read register: {register}", ErrorType.BAD_ARGUMENT,
+                           sandbox_id=sandbox_id)
+
+            ins = client.disassemble_at(cip)
+            mnemonic = ins.instruction if ins else "<invalid>"
+            trace_log.append({
+                "step": step,
+                "address": f"0x{cip:X}",
+                "mnemonic": mnemonic,
+                f"{register}": f"0x{reg_val:X}",
+            })
+
+            if reg_val == target_val:
+                return ok(
+                    sandbox_id=sandbox_id,
+                    register=register,
+                    target_value=f"0x{target_val:X}",
+                    steps_recorded=len(trace_log),
+                    hit_at=f"0x{cip:X}",
+                    trace=trace_log,
+                )
+
+            client.stepi()
+            if not client.wait_until_stopped(5):
+                return err("Step did not complete (target may be running or dead).",
+                           ErrorType.TIMEOUT, sandbox_id=sandbox_id,
+                           steps_recorded=len(trace_log))
+    except Exception as exc:  # noqa: BLE001
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id,
+                   steps_recorded=len(trace_log))
+
+    return ok(
+        sandbox_id=sandbox_id,
+        register=register,
+        target_value=f"0x{target_val:X}",
+        steps_recorded=len(trace_log),
+        hit_at=None,
+        trace=trace_log,
+        hint="Register did not reach target value within step limit. Try increasing max_steps.",
+    )
+
+
+@tool
+def trace_until_write(
+    address: str,
+    size: int = 1,
+    sandbox_id: str | None = None,
+    timeout_sec: int = 30,
+) -> dict:
+    """Resume the target until a memory region is written (alias for trace_until_memory_change).
+
+    Sets a memory-write breakpoint on the region and waits for it to fire.
+
+    Args:
+        address: Region start (address, symbol, or expression).
+        size: Number of bytes to monitor.
+        sandbox_id: Sandbox to operate on.
+        timeout_sec: Max seconds to wait for a change.
+    """
+    # Delegate to the existing implementation for consistency
+    from x64dbg_automate.api_runtime.api_composite import trace_until_memory_change
+    return trace_until_memory_change(
+        sandbox_id=sandbox_id,
+        address=address,
+        size=size,
+        timeout_sec=timeout_sec,
+    )
+
+
 def _scan_region(client, base: int, size: int, scan_mode: str,
                  chunk: int = 1 << 20, overlap: int = 512) -> tuple[list[dict], int]:
     """Read a region in overlapping chunks and detect crypto constants. Returns (findings, bytes_read)."""

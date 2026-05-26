@@ -195,7 +195,7 @@ def sandbox_checkpoint(*, sandbox_id: str | None = None, name: str, regions: lis
     Args:
         sandbox_id: Sandbox to snapshot.
         name: Checkpoint label (re-using a name overwrites it).
-        regions: Memory regions to capture as 'addr:size' strings (e.g. ['0x448300:4096']).
+        regions: Memory regions to capture as 'addr:size' strings (e.g. ['0x7FF6A0001000:4096']).
     """
     mgr = get_manager()
     parsed: list[tuple[int, int]] = []

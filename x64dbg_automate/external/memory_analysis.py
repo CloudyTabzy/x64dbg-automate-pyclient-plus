@@ -1,6 +1,6 @@
 """Composite memory region analysis — entropy + strings + patterns.
 
-One-pass analysis over a buffer, used for validating extracted Stext sections.
+One-pass analysis over a buffer, used for validating extracted code sections.
 """
 
 from .entropy import shannon_entropy, is_likely_code
@@ -9,8 +9,8 @@ from .pattern_scanner import scan_multiple
 
 
 DEFAULT_TARGET_STRINGS = [
-    "TerrainEditor", "GuiTerrPreviewCtrl", "MissionAreaEditor",
-    "CUSTOM", "Invalid serial format", "activation failed",
+    "malloc", "free", "memcpy", "strlen",
+    "kernel32", "ntdll", "msvcrt",
     "game", "server", "error",
 ]
 

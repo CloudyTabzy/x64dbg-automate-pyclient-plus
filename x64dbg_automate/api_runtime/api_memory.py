@@ -192,7 +192,7 @@ def resolve_iat_slot(*, sandbox_id: str | None = None, address: str) -> dict:
 
     Args:
         sandbox_id: Sandbox to read from.
-        address: IAT slot address (e.g. '0x43D070').
+        address: IAT slot address (e.g. '0x7FF6A0002000').
     """
     mgr = get_manager()
     try:

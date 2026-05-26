@@ -20,7 +20,7 @@ Example workflow:
                    {"address_or_symbol": "{addr}", "singleshot": True})
     macro_add_step("capture_func", "go", {"pass_exceptions": True})
     macro_add_step("capture_func", "get_all_registers", {}, save_as="entry_regs")
-    macro_run("capture_func", {"addr": "0x1496B60"})
+    macro_run("capture_func", {"addr": "0x401000"})
 """
 
 from __future__ import annotations

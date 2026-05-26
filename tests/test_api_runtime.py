@@ -33,10 +33,10 @@ class TestParseInt:
         assert parse_int(0x1000) == 0x1000
 
     def test_hex_prefixed(self):
-        assert parse_int("0x448300") == 0x448300
+        assert parse_int("0x7FF6A0001000") == 0x7FF6A0001000
 
     def test_bare_hex_default(self):
-        assert parse_int("448300") == 0x448300
+        assert parse_int("7FF6A0001000") == 0x7FF6A0001000
 
     def test_decimal_default_for_size(self):
         assert parse_int("4096", hex_default=False) == 4096
@@ -51,18 +51,18 @@ class TestParseInt:
 
 class TestParseRegion:
     def test_hex_addr_decimal_size(self):
-        assert parse_region("0x448300:4096") == (0x448300, 4096)
+        assert parse_region("0x7FF6A0001000:4096") == (0x7FF6A0001000, 4096)
 
     def test_hex_size(self):
-        assert parse_region("0x448300:0x1000") == (0x448300, 0x1000)
+        assert parse_region("0x7FF6A0001000:0x1000") == (0x7FF6A0001000, 0x1000)
 
     def test_missing_colon(self):
         with pytest.raises(ValueError):
-            parse_region("0x448300")
+            parse_region("0x7FF6A0001000")
 
     def test_nonpositive_size(self):
         with pytest.raises(ValueError):
-            parse_region("0x448300:0")
+            parse_region("0x7FF6A0001000:0")
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +187,9 @@ class TestSandboxManager:
         client.get_reg.side_effect = lambda r: 0x10
         client.read_memory.return_value = b"\xaa\xbb\xcc\xdd"
 
-        cp = mgr.checkpoint("aa11", "cp1", regions=[(0x448300, 4)])
+        cp = mgr.checkpoint("aa11", "cp1", regions=[(0x7FF6A0001000, 4)])
         assert isinstance(cp, Checkpoint)
-        assert cp.memory[0x448300] == b"\xaa\xbb\xcc\xdd"
+        assert cp.memory[0x7FF6A0001000] == b"\xaa\xbb\xcc\xdd"
         assert "rax" in cp.registers
 
         client.set_reg.return_value = True
@@ -335,7 +335,7 @@ class TestCompositeTools:
         c.go.return_value = True
         c.wait_until_stopped.return_value = True
         c.get_reg.return_value = 0x401234
-        r = trace_until_memory_change(sandbox_id="aa11", address="0x448300", size=4, timeout_sec=5)
+        r = trace_until_memory_change(sandbox_id="aa11", address="0x7FF6A0001000", size=4, timeout_sec=5)
         assert r["success"] and r["before"] == "00000000" and r["after"] == "11223344"
         assert r["changed_by_instruction"] == "0x401234"
 
@@ -364,14 +364,6 @@ class TestCompositeTools:
         assert r["entry_hit"] is True
         assert r["return_hit"] is True
         assert "register_inputs" in r and "register_outputs" in r
-
-
-class TestWorkflowGuards:
-    def test_bad_region_before_launch(self):
-        from x64dbg_automate.api_runtime.api_workflow import workflow_capture_binary_state
-
-        r = workflow_capture_binary_state(target_exe="x.exe", regions=["bogus"])
-        assert r["success"] is False and r["error_type"] == ErrorType.BAD_ARGUMENT
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +454,99 @@ class TestTraceExecution:
         assert r["success"]
         assert r["steps_recorded"] == 3
         assert len(r["trace"]) == 3
+
+
+class TestTraceAbstractions:
+    def test_trace_until_call_hit(self, manager):
+        from x64dbg_automate.api_runtime.api_composite import trace_until_call
+
+        sb = _mock_sandbox(manager, arch="x64")
+        c = sb.client
+        c.is_running.return_value = False
+        # Step 0: nop at 0x401000, Step 1: call 0x402000 at 0x401001
+        reg_vals = [0x401000, 0x401001]
+        c.get_reg.side_effect = lambda r: reg_vals.pop(0)
+        ins_nop = type("Ins", (), {"instruction": "nop", "instr_size": 1})()
+        ins_call = type("Ins", (), {"instruction": "call 0x402000", "instr_size": 5})()
+        c.disassemble_at.side_effect = lambda addr: ins_nop if addr == 0x401000 else ins_call
+        c.eval_sync.return_value = (0x402000, True)
+        c.step_into.return_value = True
+        c.wait_until_stopped.return_value = True
+        r = trace_until_call(target_addr="0x402000", sandbox_id="aa11", max_steps=10)
+        assert r["success"]
+        assert r["hit_at"] == "0x401001"
+        assert r["steps_recorded"] == 2
+
+    def test_trace_until_call_miss(self, manager):
+        from x64dbg_automate.api_runtime.api_composite import trace_until_call
+
+        sb = _mock_sandbox(manager, arch="x64")
+        c = sb.client
+        c.is_running.return_value = False
+        c.get_reg.return_value = 0x401000
+        ins = type("Ins", (), {"instruction": "nop", "instr_size": 1})()
+        c.disassemble_at.return_value = ins
+        c.step_into.return_value = True
+        c.wait_until_stopped.return_value = True
+        r = trace_until_call(target_addr="0x402000", sandbox_id="aa11", max_steps=3)
+        assert r["success"]  # returns ok with hit_at=None
+        assert r["hit_at"] is None
+        assert r["steps_recorded"] == 3
+
+    def test_trace_until_register_equals_hit(self, manager):
+        from x64dbg_automate.api_runtime.api_composite import trace_until_register_equals
+
+        sb = _mock_sandbox(manager, arch="x64")
+        c = sb.client
+        c.is_running.return_value = False
+        # Return cip values for steps, then rax values interleaved
+        call_count = 0
+        def _get_reg(reg_name):
+            nonlocal call_count
+            call_count += 1
+            if reg_name.lower() == "cip":
+                return 0x401000 + (call_count // 2)  # cip advances each step
+            return 0x42 if (call_count // 2) >= 2 else 0x0  # rax hits 0x42 on step 2
+        c.get_reg.side_effect = _get_reg
+        ins = type("Ins", (), {"instruction": "mov rax, 0x42", "instr_size": 5})()
+        c.disassemble_at.return_value = ins
+        c.step_into.return_value = True
+        c.wait_until_stopped.return_value = True
+        r = trace_until_register_equals(register="rax", value="0x42", sandbox_id="aa11", max_steps=5)
+        assert r["success"]
+        assert r["hit_at"] == "0x401001"  # step 2 (0-indexed), cip = 0x401001
+        assert r["steps_recorded"] == 2
+
+    def test_trace_until_register_equals_miss(self, manager):
+        from x64dbg_automate.api_runtime.api_composite import trace_until_register_equals
+
+        sb = _mock_sandbox(manager, arch="x64")
+        c = sb.client
+        c.is_running.return_value = False
+        c.get_reg.return_value = 0x0
+        ins = type("Ins", (), {"instruction": "nop", "instr_size": 1})()
+        c.disassemble_at.return_value = ins
+        c.step_into.return_value = True
+        c.wait_until_stopped.return_value = True
+        r = trace_until_register_equals(register="rax", value="0x42", sandbox_id="aa11", max_steps=3)
+        assert r["success"]  # returns ok with hit_at=None
+        assert r["hit_at"] is None
+        assert r["steps_recorded"] == 3
+
+    def test_trace_until_write_delegates(self, manager):
+        from x64dbg_automate.api_runtime.api_composite import trace_until_write
+
+        sb = _mock_sandbox(manager, arch="x64")
+        c = sb.client
+        c.is_running.return_value = False
+        c.read_memory.return_value = b"\x00" * 16
+        c.set_memory_breakpoint.return_value = True
+        c.clear_memory_breakpoint.return_value = True
+        c.go.return_value = True
+        c.wait_until_stopped.return_value = True
+        r = trace_until_write(address="0x404000", size=16, sandbox_id="aa11", timeout_sec=1)
+        assert r["success"] is False  # timeout because memory never changes
+        assert r["error_type"] == ErrorType.TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +763,49 @@ class TestSemanticMemory:
         r = memory_delete_key("")
         assert r["success"] is False
         assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_export_import(self, monkeypatch):
+        from x64dbg_automate.api_runtime.semantic_memory import (
+            memory_record_finding, memory_export, memory_import, memory_list_keys,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp_store = os.path.join(os.getcwd(), "test_semantic_export.jsonl")
+        tmp_export = os.path.join(os.getcwd(), "test_export.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp_store)
+        monkeypatch.setattr(sem, "_store", None)
+
+        memory_record_finding(
+            category="crypto",
+            key="aes_key",
+            value={"bytes": "deadbeef"},
+            tags=["protected"],
+        )
+        keys_before = memory_list_keys()["keys"]
+        assert "aes_key" in keys_before
+
+        r1 = memory_export(tmp_export)
+        assert r1["success"]
+        assert r1["entries_exported"] >= 1
+        assert os.path.exists(tmp_export)
+
+        # Clear store by deleting the backing file and resetting singleton
+        monkeypatch.setattr(sem, "_store", None)
+        if os.path.exists(tmp_store):
+            os.remove(tmp_store)
+        keys_after_clear = memory_list_keys()["keys"]
+        assert "aes_key" not in keys_after_clear
+
+        r2 = memory_import(tmp_export)
+        assert r2["success"]
+        assert r2["entries_imported"] >= 1
+
+        keys_after_import = memory_list_keys()["keys"]
+        assert "aes_key" in keys_after_import
+
+        for f in [tmp_store, tmp_export]:
+            if os.path.exists(f):
+                os.remove(f)
 
 
 # ---------------------------------------------------------------------------

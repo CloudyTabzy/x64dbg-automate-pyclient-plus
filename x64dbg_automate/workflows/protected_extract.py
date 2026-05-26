@@ -1,6 +1,6 @@
-"""Stext extraction workflow for protected binaries.
+"""Protected binary extraction workflow.
 
-VALIDATED approach: launch original exe, wait for initialization,
+Generic approach: launch original exe, wait for initialization signal,
 dump process via non-debugger method, extract and validate sections.
 """
 
@@ -20,22 +20,17 @@ from x64dbg_automate.external.process_dumper import (
 )
 
 
-STEXT_VA = 0x00A7A000      # loaded VA = 0x400000 (image base) + 0x67A000 (RVA)
-STEXT_SIZE = 0x00A18DF0
-SDATA_VA = 0x01522000      # loaded VA = 0x400000 + 0x1122000
-SDATA_SIZE = 0x0034381C
-PROTECTED_VA = 0x0186D000    # loaded VA = 0x400000 + 0x146D000
-PROTECTED_SIZE = 0x00172A4C
-
 TARGET_SECTIONS = {
-    "Stext": (STEXT_VA, STEXT_SIZE),
-    "Sdata": (SDATA_VA, SDATA_SIZE),
-    ".protected": (PROTECTED_VA, PROTECTED_SIZE),
+    ".text": (0x1000, 0x10000),
+    ".data": (0x11000, 0x5000),
+    ".rsrc": (0x16000, 0x2000),
 }
 
-KNOWN_STRINGS = [
-    "TerrainEditor", "GuiTerrPreviewCtrl", "MissionAreaEditor",
-    "CUSTOM", "Invalid serial format", "activation failed",
+# Generic strings useful for validating extracted code/data.
+# Override via the ``strings`` parameter in ``workflow_extract_binary``.
+DEFAULT_KNOWN_STRINGS = [
+    "malloc", "free", "memcpy", "strlen",
+    "kernel32", "ntdll", "msvcrt",
 ]
 
 
@@ -59,6 +54,7 @@ def workflow_extract_binary(
     sections: list[str] | None = None,
     validate: bool = True,
     terminate_after: bool = True,
+    window_title: str = "Ready",
 ) -> ExtractionResult:
     start_time = time.time()
     result = ExtractionResult(
@@ -90,9 +86,9 @@ def workflow_extract_binary(
         result.errors.append(f"Launch failed: {e}")
         return result
 
-    # Step 2: Wait for serial dialog
-    if not wait_for_window(result.pid, "Serial", timeout_sec):
-        result.errors.append(f"Serial dialog not found within {timeout_sec}s")
+    # Step 2: Wait for initialization signal (window title substring)
+    if not wait_for_window(result.pid, window_title, timeout_sec):
+        result.errors.append(f"Initialization window not found within {timeout_sec}s")
         if terminate_after:
             proc.terminate()
         return result
@@ -199,10 +195,10 @@ def _extract_region_from_dump(dump_path: str, va: int, size: int) -> bytes | Non
     return None
 
 
-def _validate_section(name: str, data: bytes) -> dict:
+def _validate_section(name: str, data: bytes, known_strings: list[str] | None = None) -> dict:
     entropy = shannon_entropy(data)
     prologues = scan_pattern(data, "55 8B EC") + scan_pattern(data, "55 89 E5")
-    found = find_specific_strings(data, KNOWN_STRINGS)
+    found = find_specific_strings(data, known_strings or DEFAULT_KNOWN_STRINGS)
     pages = max(1, len(data) / 4096)
     density = len(prologues) / pages
 
@@ -269,7 +265,7 @@ def main():
     """CLI entry point: automate-extract <target_exe> [options]"""
     import argparse
     parser = argparse.ArgumentParser(
-        description="Protected binary section extractor"
+        description="Generic binary section extractor from process dumps"
     )
     parser.add_argument("target_exe", help="Path to target executable")
     parser.add_argument("--method", default="procdump", choices=["procdump", "comsvcs", "minidump"])
@@ -289,7 +285,7 @@ def main():
                 target_exe=args.target_exe,
                 dump_method=args.method,
                 output_dir=iteration_dir,
-                sections=["Stext"],
+                sections=list(TARGET_SECTIONS.keys()),
                 validate=not args.no_validate,
                 terminate_after=not args.no_terminate,
             )

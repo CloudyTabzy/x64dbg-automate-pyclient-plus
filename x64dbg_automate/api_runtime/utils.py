@@ -19,7 +19,7 @@ def parse_int(value: Any, *, hex_default: bool = True) -> int:
     """Parse an int from an int or string.
 
     ``0x``-prefixed strings are always hex. Otherwise ``hex_default`` decides the
-    base — True for addresses (bare ``448300`` => 0x448300), False for sizes/counts
+    base — True for addresses (bare ``7FF6A0001000`` => 0x7FF6A0001000), False for sizes/counts
     (bare ``4096`` => 4096).
     """
     if isinstance(value, int):
@@ -42,13 +42,13 @@ def parse_int(value: Any, *, hex_default: bool = True) -> int:
 def parse_region(spec: str) -> tuple[int, int]:
     """Parse an ``'addr:size'`` region spec into ``(addr, size)``.
 
-    Address is hex by default (``0x448300`` or ``448300``); size is decimal by
+    Address is hex by default (``0x7FF6A0001000`` or ``7FF6A0001000``); size is decimal by
     default (``4096``) but honors a ``0x`` prefix. Address must be numeric here —
     resolve symbols/expressions in the tool layer before calling.
     """
     text = str(spec)
     if ":" not in text:
-        raise ValueError(f"Region must be 'addr:size' (e.g. '0x448300:4096'), got: {spec!r}")
+        raise ValueError(f"Region must be 'addr:size' (e.g. '0x7FF6A0001000:4096'), got: {spec!r}")
     addr_s, size_s = text.split(":", 1)
     addr = parse_int(addr_s, hex_default=True)
     size = parse_int(size_s, hex_default=False)

@@ -151,19 +151,19 @@ Setting `X64DBG_PATH` lets the MCP tools resolve x64dbg automatically — no nee
 
 ---
 
-## Example: SecuROM Extraction Workflow
+## Example: Cold Dump Extraction Workflow
 
-One validated use-case from this project is extracting decrypted code from SecuROM v7–v8 protected binaries without patching the on-disk PE (integrity checks would kill it):
+One validated use-case is extracting in-memory sections from a protected binary without patching the on-disk PE (integrity checks would kill any modification):
 
 1. Launch original **unpatched** executable as a subprocess (**no debugger**)
-2. Wait for the "Serial" dialog (decrypted section now in RAM)
+2. Wait for an initialization signal (window title, timer, or manual trigger)
 3. Dump process via ProcDump `-r` (clone mode)
-4. Extract `.stext` section (VA `0x0067A000`, ~10 MB)
+4. Extract target sections (e.g. `.text`, `.data`) from the dump
 5. Validate via entropy, function prologues, and known strings
 
 The `automate-extract` CLI command wraps this entire pipeline:
 ```sh
-automate-extract --target "C:\\path\\to\\BoneCrafterModKit.exe" --output-dir ./dump
+automate-extract --target "C:\\path\\to\\Target.exe" --output-dir ./dump
 ```
 
 ---

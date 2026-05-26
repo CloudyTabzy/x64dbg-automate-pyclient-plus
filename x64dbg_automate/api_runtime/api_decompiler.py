@@ -380,7 +380,7 @@ def rename_local_variable(
     Args:
         function_address: Address of the function containing the variable.
         old_name: Current pseudocode name (e.g. ``local_1`` or ``param1``).
-        new_name: Desired meaningful name (e.g. ``aes_key`` or ``serial_len``).
+        new_name: Desired meaningful name (e.g. ``aes_key`` or ``buffer_len``).
         sandbox_id: Optional sandbox; uses active session if omitted.
 
     Returns:
