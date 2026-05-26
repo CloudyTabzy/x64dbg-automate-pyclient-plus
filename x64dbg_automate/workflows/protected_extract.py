@@ -4,9 +4,10 @@ Generic approach: launch original exe, wait for initialization signal,
 dump process via non-debugger method, extract and validate sections.
 """
 
+import concurrent.futures
 import os
-import time
 import subprocess
+import time
 from dataclasses import dataclass, field
 
 from x64dbg_automate.external.entropy import shannon_entropy, is_likely_code
@@ -55,6 +56,7 @@ def workflow_extract_binary(
     validate: bool = True,
     terminate_after: bool = True,
     window_title: str = "Ready",
+    _proc_ref: list | None = None,
 ) -> ExtractionResult:
     start_time = time.time()
     result = ExtractionResult(
@@ -82,6 +84,8 @@ def workflow_extract_binary(
             stderr=subprocess.DEVNULL,
         )
         result.pid = proc.pid
+        if _proc_ref is not None:
+            _proc_ref.append(proc)
     except Exception as e:
         result.errors.append(f"Launch failed: {e}")
         return result
@@ -153,6 +157,39 @@ def workflow_extract_binary(
     result.success = len(result.sections_extracted) > 0
     result.elapsed_sec = time.time() - start_time
     return result
+
+
+def workflow_extract_binary_timed(
+    target_exe: str,
+    timeout_sec: float = 30.0,
+    **kwargs,
+) -> ExtractionResult:
+    """Run ``workflow_extract_binary`` in a background thread with a hard timeout.
+
+    If the thread exceeds *timeout_sec*, the spawned target process is
+    force-killed and a failure result is returned.  This prevents the
+    FastMCP server from blocking on a hung subprocess.
+    """
+    proc_ref: list[subprocess.Popen] = []
+    kwargs["_proc_ref"] = proc_ref
+    kwargs["timeout_sec"] = min(kwargs.get("timeout_sec", 120), int(timeout_sec))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(workflow_extract_binary, target_exe, **kwargs)
+        try:
+            return future.result(timeout=timeout_sec + 2)
+        except concurrent.futures.TimeoutError:
+            for p in proc_ref:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            return ExtractionResult(
+                success=False, pid=0, dump_path="",
+                dump_method=kwargs.get("dump_method", "procdump"),
+                sections_extracted={}, analysis={},
+                errors=[f"Workflow timed out after {timeout_sec}s — target process killed"],
+            )
 
 
 def _extract_region_from_dump(dump_path: str, va: int, size: int) -> bytes | None:

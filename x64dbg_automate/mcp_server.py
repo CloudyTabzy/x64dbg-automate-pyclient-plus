@@ -40,8 +40,7 @@ from x64dbg_automate.external.process_dumper import (
 )
 from x64dbg_automate.external.process_control import nt_suspend_process, nt_resume_process
 from x64dbg_automate.workflows.protected_extract import (
-    workflow_extract_binary as _workflow_extract_binary_impl,
-    ExtractionResult,
+    workflow_extract_binary_timed as _workflow_extract_binary_impl,
     TARGET_SECTIONS,
 )
 from x64dbg_automate.api_runtime.responses import (
@@ -2167,7 +2166,7 @@ def extract_protected_sections(dump_path: str, output_dir: str = "") -> dict:
 @mcp.tool()
 def workflow_extract_binary(
     target_exe: str,
-    timeout_sec: int = 120,
+    timeout_sec: int = 30,
     dump_method: str = "procdump",
     output_dir: str = "",
     validate: bool = True,
@@ -2178,10 +2177,11 @@ def workflow_extract_binary(
     Steps: launch -> wait for initialization -> dump process -> extract sections -> validate.
 
     NO debugger, NO PE patching. Works against run-time integrity checks.
+    Runs in a background thread with a hard timeout to prevent blocking the MCP server.
 
     Args:
         target_exe: Full path to the target executable
-        timeout_sec: Max wait for initialization signal (default 120)
+        timeout_sec: Max wait for initialization signal (default 30)
         dump_method: 'procdump' (recommended), 'comsvcs', or 'minidump'
         output_dir: Output directory (default: ./extracted/)
         validate: Run entropy + string analysis after extraction
@@ -2231,8 +2231,16 @@ def workflow_batch_cold_dump(
     iterations: int = 5,
     dump_method: str = "procdump",
     output_dir: str = "",
+    timeout_sec: int = 30,
 ) -> dict:
-    """Run extraction multiple times, compare dumps for consistency."""
+    """Run extraction multiple times, compare dumps for consistency.
+
+    Each iteration runs in a background thread with a hard timeout to prevent
+    blocking the MCP server on a hung subprocess.
+
+    Args:
+        timeout_sec: Per-iteration timeout (default 30s).
+    """
     try:
         if not output_dir:
             output_dir = os.path.join(Path.cwd(), "extracted")
@@ -2242,6 +2250,7 @@ def workflow_batch_cold_dump(
             iteration_dir = os.path.join(output_dir, f"run_{i + 1:02d}")
             result = _workflow_extract_binary_impl(
                 target_exe=target_exe,
+                timeout_sec=timeout_sec,
                 dump_method=dump_method,
                 output_dir=iteration_dir,
                 sections=["Stext"],
