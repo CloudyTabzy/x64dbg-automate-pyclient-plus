@@ -39,10 +39,12 @@ from x64dbg_automate.external.process_dumper import (
     wait_for_window, find_process_by_window_title,
 )
 from x64dbg_automate.external.process_control import nt_suspend_process, nt_resume_process
-from x64dbg_automate.workflows.protected_extract import (
-    workflow_extract_binary_timed as _workflow_extract_binary_impl,
-    TARGET_SECTIONS,
-)
+# Note: workflow_extract_binary and workflow_batch_cold_dump are intentionally
+# NOT exposed as MCP tools. They launch external OS subprocesses (ProcDump,
+# comsvcs, MiniDumpWriteDump) that can hang indefinitely on protected targets,
+# blocking the entire MCP server. Use the standalone CLI instead:
+#   python -m x64dbg_automate.workflows.protected_extract <target_exe>
+
 from x64dbg_automate.api_runtime.responses import (
     ErrorType, err, ok, err_from_exc, _ERROR_HINTS,
 )
@@ -2162,115 +2164,6 @@ def extract_protected_sections(dump_path: str, output_dir: str = "") -> dict:
 # ---------------------------------------------------------------------------
 # Master Workflow — protected binary extraction
 # ---------------------------------------------------------------------------
-
-@mcp.tool()
-def workflow_extract_binary(
-    target_exe: str,
-    timeout_sec: int = 30,
-    dump_method: str = "procdump",
-    output_dir: str = "",
-    validate: bool = True,
-    window_title: str = "Ready",
-) -> dict:
-    """Extract sections from a binary via cold dump (no debugger, no patching).
-
-    Steps: launch -> wait for initialization -> dump process -> extract sections -> validate.
-
-    NO debugger, NO PE patching. Works against run-time integrity checks.
-    Runs in a background thread with a hard timeout to prevent blocking the MCP server.
-
-    Args:
-        target_exe: Full path to the target executable
-        timeout_sec: Max wait for initialization signal (default 30)
-        dump_method: 'procdump' (recommended), 'comsvcs', or 'minidump'
-        output_dir: Output directory (default: ./extracted/)
-        validate: Run entropy + string analysis after extraction
-        window_title: Window title substring to wait for as init signal (default 'Ready')
-    """
-    try:
-        if not output_dir:
-            output_dir = os.path.join(Path.cwd(), "extracted")
-
-        result = _workflow_extract_binary_impl(
-            target_exe=target_exe,
-            timeout_sec=timeout_sec,
-            dump_method=dump_method,
-            output_dir=output_dir,
-            validate=validate,
-            terminate_after=True,
-            window_title=window_title,
-        )
-
-        sections = []
-        for section, path in result.sections_extracted.items():
-            entry = {"name": section, "path": path, "size": os.path.getsize(path) if os.path.exists(path) else 0}
-            analysis = result.analysis.get(section, {})
-            if analysis:
-                entry["score"] = analysis.get("score")
-                entry["verdict"] = analysis.get("verdict")
-                entry["checks"] = analysis.get("checks", [])
-            sections.append(entry)
-
-        return ok(
-            success=result.success,
-            target_exe=target_exe,
-            pid=result.pid,
-            dump_method=result.dump_method,
-            dump_path=result.dump_path,
-            elapsed_sec=round(result.elapsed_sec, 1),
-            sections=sections,
-            errors=result.errors,
-        )
-    except Exception as exc:
-        return err_from_exc(exc)
-
-
-@mcp.tool()
-def workflow_batch_cold_dump(
-    target_exe: str,
-    iterations: int = 5,
-    dump_method: str = "procdump",
-    output_dir: str = "",
-    timeout_sec: int = 30,
-) -> dict:
-    """Run extraction multiple times, compare dumps for consistency.
-
-    Each iteration runs in a background thread with a hard timeout to prevent
-    blocking the MCP server on a hung subprocess.
-
-    Args:
-        timeout_sec: Per-iteration timeout (default 30s).
-    """
-    try:
-        if not output_dir:
-            output_dir = os.path.join(Path.cwd(), "extracted")
-
-        runs = []
-        for i in range(iterations):
-            iteration_dir = os.path.join(output_dir, f"run_{i + 1:02d}")
-            result = _workflow_extract_binary_impl(
-                target_exe=target_exe,
-                timeout_sec=timeout_sec,
-                dump_method=dump_method,
-                output_dir=iteration_dir,
-                sections=["Stext"],
-                validate=True,
-                terminate_after=True,
-            )
-            analysis = result.analysis.get("Stext", {})
-            runs.append({
-                "run": i + 1,
-                "success": result.success,
-                "score": analysis.get("score", 0),
-                "entropy": analysis.get("entropy"),
-            })
-
-        succeeded = sum(1 for r in runs if r["success"])
-        return ok(target_exe=target_exe, iterations=iterations, runs=runs,
-                  succeeded=succeeded, failed=iterations - succeeded)
-    except Exception as exc:
-        return err_from_exc(exc)
-
 
 # ---------------------------------------------------------------------------
 # Phase 2 — New debugger commands
