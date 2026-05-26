@@ -960,3 +960,63 @@ class TestErrorPaths:
         mock_client.eval_sync.side_effect = Exception("eval failed")
         result = mcp_mod.eval_expression("bad")
         assert "Error" in result
+
+
+class TestToolSearch:
+    def test_search_memory(self):
+        result = mcp_mod.tool_search("memory")
+        assert result["success"] is True
+        assert result["total"] > 0
+        assert len(result["results"]) <= 10
+        names = [r["name"] for r in result["results"]]
+        assert any("memory" in n.lower() for n in names)
+
+    def test_search_limit(self):
+        result = mcp_mod.tool_search("a", limit=3)
+        assert result["success"] is True
+        assert len(result["results"]) <= 3
+
+    def test_search_no_matches(self):
+        result = mcp_mod.tool_search("xyz_nonexistent_12345")
+        assert result["success"] is True
+        assert result["total"] == 0
+        assert result["results"] == []
+
+
+class TestSuggestNextActions:
+    def test_no_session_suggests_connect(self):
+        original = mcp_mod._client
+        mcp_mod._client = None
+        try:
+            result = mcp_mod.suggest_next_actions()
+            assert result["success"] is True
+            actions = [s["action"] for s in result["suggestions"]]
+            assert any("start_session" in a or "connect_to_session" in a for a in actions)
+        finally:
+            mcp_mod._client = original
+
+    def test_context_aware_crypto(self):
+        result = mcp_mod.suggest_next_actions(context="looking for crypto keys")
+        assert result["success"] is True
+        actions = [s["action"] for s in result["suggestions"]]
+        assert any("crypto_material_search" in a for a in actions)
+
+
+class TestReportGenerate:
+    def test_generates_markdown(self):
+        result = mcp_mod.report_generate("Unit Test Report")
+        assert result["success"] is True
+        assert result["title"] == "Unit Test Report"
+        assert "# Unit Test Report" in result["report"]
+        assert "## Session Summary" in result["report"]
+
+    def test_default_title(self):
+        result = mcp_mod.report_generate()
+        assert result["success"] is True
+        assert "Axon MCP Session Report" in result["title"]
+
+
+class TestResumeProcess:
+    def test_invalid_pid_fails_gracefully(self):
+        result = mcp_mod.resume_process(99999)
+        assert "Failed" in result or "resumed" in result

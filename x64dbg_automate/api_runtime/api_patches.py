@@ -2,7 +2,7 @@
 
 Tracks original and patched bytes for every write, enabling clean rollback and
 a persistent audit trail. Patches target live process memory only — the on-disk
-PE is NEVER modified (SecuROM CRC32 integrity constraint).
+PE is NEVER modified (PE integrity constraint).
 
 Patch record shape (stored in ``ProcessSandbox.patches``)::
 

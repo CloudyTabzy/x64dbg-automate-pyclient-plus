@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 import msgpack
 import psutil
 import shutil
@@ -55,6 +56,13 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
         self.sess_pub_sub_port = pub_sub_port
         self.remote_host = remote_host
         self._req_lock = threading.Lock()
+
+        # Hardened execution infrastructure
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerStateMachine, HealthMonitor
+        from x64dbg_automate.api_runtime.execution_context import ExecutionContextManager
+        self._axon_state_machine = DebuggerStateMachine()
+        self._axon_exec_ctx = ExecutionContextManager(self, self._axon_state_machine)
+        self._axon_health_monitor = HealthMonitor(self, self._axon_state_machine)
         all_instances.append(self)
 
     def __init__(self, x64dbg_path: str = "x64dbg"):
@@ -108,6 +116,7 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
 
     
     def _init_connection(self) -> None:
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState
         if self.req_socket is not None:
             self._close_connection()
 
@@ -128,10 +137,15 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
         self.sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self.sub_thread = threading.Thread(target=self._sub_thread)
         self.sub_thread.start()
+        self._axon_state_machine.transition(DebuggerState.CONNECTING, reason="ZMQ connection established")
+        self._axon_health_monitor.start()
 
     def _close_connection(self) -> None:
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState
         if self.req_socket is None:
             return
+        self._axon_health_monitor.stop()
+        self._axon_state_machine.transition(DebuggerState.DISCONNECTED, reason="Connection closed")
         self.req_socket.close()
         self.sub_socket.close()
         self.req_socket = None
@@ -186,6 +200,8 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
                 self.terminate_session()
                 raise RuntimeError("Failed to load executable")
             self.wait_cmd_ready()
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState
+        self._axon_state_machine.transition(DebuggerState.STOPPED, reason="Target loaded, at system breakpoint")
         return self.session_pid
 
     def start_session_attach(self, pid: int) -> int:
@@ -208,6 +224,9 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
             raise RuntimeError("Failed to attach to process")
 
         self.wait_until_debugging()
+        self.wait_until_stopped()
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState
+        self._axon_state_machine.transition(DebuggerState.STOPPED, reason="Attached to process")
         return self.session_pid
     
     @staticmethod
@@ -243,19 +262,25 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
         self.sess_pub_sub_port = session.sess_pub_sub_port
         self._init_connection()
         self._assert_connection_compat()
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState
+        self._axon_state_machine.transition(DebuggerState.STOPPED, reason="Attached to existing session")
     
     def detach_session(self) -> None:
         """
         Detach from the current x64dbg session, leaving the debugger process running.
         """
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState
+        self._axon_state_machine.transition(DebuggerState.DISCONNECTED, reason="Session detached")
         self._close_connection()
 
     def terminate_session(self) -> None:
         """
         End the current x64dbg session, terminating the debugger process.
         """
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState
         sid = self.session_pid
         self._xauto_terminate_session()
+        self._axon_state_machine.transition(DebuggerState.DISCONNECTED, reason="Session terminated")
         self._close_connection()
         if not _IS_WINDOWS or self.x64dbg_path is None:
             # Remote mode — cannot poll local lockfiles for confirmation
@@ -348,4 +373,52 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
                     break
 
         return sessions
-    
+
+    def ensure_running(self, timeout: float = 1.0) -> bool:
+        """Resume the debuggee if x64dbg has paused it.
+
+        This is a defensive helper for AI agents that inject code or create
+        remote threads — if x64dbg pauses on an event (e.g. OutputDebugString),
+        the agent can call ``ensure_running()`` to unblock execution without
+        interfering with legitimate breakpoints.
+
+        Args:
+            timeout: Max seconds to wait for the process to enter running state.
+
+        Returns:
+            True if the debuggee is running when the call returns.
+        """
+        if not self.is_running():
+            self.go()
+            self.wait_until_running(timeout=timeout)
+        return self.is_running()
+
+    @contextmanager
+    def running_guard(self, auto_resume_events: set | None = None, timeout: float = 5.0):
+        """Context manager that auto-resumes x64dbg when specified events fire.
+
+        Delegates to the hardened ``ExecutionContextManager`` which supports
+        nested guards, catch-all pause detection, and state-machine tracking.
+
+        Usage::
+
+            with client.running_guard({EventType.EVENT_OUTPUT_DEBUG_STRING}):
+                hThread = CreateRemoteThread(...)
+                WaitForSingleObject(hThread, 5000)
+
+        Args:
+            auto_resume_events: Event types that should trigger an automatic
+                ``go()``.  If ``None``, no events are auto-resumed.
+            timeout: Upper bound (seconds) for the guarded block.
+
+        Yields:
+            GuardContext: Snapshot of the guard's state.
+        """
+        from x64dbg_automate.api_runtime.execution_context import ResumePolicy
+        with self._axon_exec_ctx.running_guard(
+            tracked_events=auto_resume_events,
+            policy=ResumePolicy.TRACKED_EVENTS,
+            timeout=timeout,
+        ) as ctx:
+            yield ctx
+

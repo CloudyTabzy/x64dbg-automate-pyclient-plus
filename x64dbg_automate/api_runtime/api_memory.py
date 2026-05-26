@@ -284,7 +284,7 @@ def read_memory_range(
 ) -> dict:
     """Read a large memory region in one call, returning hex-encoded chunks.
 
-    Designed for reading multi-MB regions (SecuROM Stext section is ~10 MB) without
+    Designed for reading multi-MB regions (large sections ~10 MB) without
     the 4096-byte cap of the legacy ``read_memory`` tool. Reads are done in
     ``chunk_size``-byte pieces and reassembled.
 

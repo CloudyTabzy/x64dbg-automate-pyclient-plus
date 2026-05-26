@@ -3,7 +3,7 @@
 Provides three capabilities:
 
 1. **Ordinal resolution** — convert ``(dll_path, ordinal)`` to an export name using
-   the existing PE analyzer. Fills the gap where SecuROM calls imports by ordinal.
+   the existing PE analyzer. Fills the gap where some targets call imports by ordinal.
 
 2. **Type layout** — static field schema for common Windows structures (PEB, TEB,
    UNICODE_STRING, LDR_DATA_TABLE_ENTRY, LIST_ENTRY, IMAGE_DOS_HEADER, …).

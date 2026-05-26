@@ -39,8 +39,8 @@ from x64dbg_automate.external.process_dumper import (
     wait_for_window, find_process_by_window_title,
 )
 from x64dbg_automate.external.process_control import nt_suspend_process, nt_resume_process
-from x64dbg_automate.workflows.securom_extract import (
-    workflow_extract_securom, ExtractionResult, TARGET_SECTIONS,
+from x64dbg_automate.workflows.protected_extract import (
+    workflow_extract_binary, ExtractionResult, TARGET_SECTIONS,
 )
 
 mcp = FastMCP(
@@ -1322,33 +1322,62 @@ def scan_hex_pattern(address: str, size: int, pattern: str) -> str:
 
 
 @mcp.tool()
-def find_x86_prologues(address: str, size: int = 65536) -> str:
-    """Find x86 function prologues in a debuggee memory region.
+def find_x86_prologues(
+    address: str,
+    size: int = 65536,
+    patterns: list[str] | None = None,
+) -> str:
+    """Find x86/x64 function prologues in a debuggee memory region.
 
-    Detects 'push ebp; mov ebp, esp' patterns.
-    High density indicates decrypted machine code.
+    Detects common function-entry byte patterns. High density indicates
+    decrypted machine code.
+
+    Args:
+        address: Region start address.
+        size: Number of bytes to scan.
+        patterns: Optional list of custom hex patterns (e.g. ["55 8B EC"]).
+            If omitted, a built-in set of x86 and x64 prologue patterns is used.
     """
     try:
         client = _require_client()
         addr = _parse_address_or_expression(address)
         data = client.read_memory(addr, size)
 
-        prologues = scan_pattern(data, "55 8B EC") + scan_pattern(data, "55 89 E5")
-        all_prologues = sorted(set(prologues))
+        if patterns:
+            pattern_list = patterns
+        else:
+            # Built-in prologue signatures covering x86 and x64
+            pattern_list = [
+                "55 8B EC",          # x86: push ebp; mov ebp, esp
+                "55 89 E5",          # x86: push ebp; mov ebp, esp (alt)
+                "40 55",             # x64: push rbp (with REX prefix)
+                "48 89 5C 24",       # x64: mov [rsp+8], rbx
+                "48 8B EC",          # x64: mov rbp, rsp
+                "48 83 EC",          # x64: sub rsp, imm8
+                "48 81 EC",          # x64: sub rsp, imm32
+                "55 48 8B EC",       # x64: push rbp; mov rbp, rsp
+            ]
+
+        all_prologues: set[int] = set()
+        for pat in pattern_list:
+            try:
+                all_prologues.update(scan_pattern(data, pat))
+            except Exception:
+                pass
 
         if not all_prologues:
-            return f"No x86 function prologues found in region."
+            return "No function prologues found in region."
 
         pages = max(1, len(data) / 4096)
         density = len(all_prologues) / pages
         verdict = "DECRYPTED CODE (high confidence)" if density > 1.0 else ("POSSIBLE CODE" if density > 0.1 else "SPARSE")
 
         lines = [
-            f"Found {len(all_prologues)} function prologues",
+            f"Found {len(all_prologues)} function prologues (scanned {len(pattern_list)} patterns)",
             f"Density: {density:.1f} per 4KB page",
             f"Interpretation: {verdict}",
         ]
-        for off in all_prologues[:20]:
+        for off in sorted(all_prologues)[:20]:
             lines.append(f"  {_format_address(addr + off)}")
         return "\n".join(lines)
     except Exception as e:
@@ -1359,7 +1388,7 @@ def find_x86_prologues(address: str, size: int = 65536) -> str:
 def analyze_region_full(address: str, size: int = 65536) -> str:
     """Run comprehensive analysis on a debuggee memory region.
 
-    Returns: entropy, string count, known SecuROM/Torque engine strings,
+    Returns: entropy, string count, known strings in target binary,
     function prologue density, and a code/data/encrypted verdict.
     """
     try:
@@ -1375,7 +1404,7 @@ def analyze_region_full(address: str, size: int = 65536) -> str:
             f"ASCII strings: {result['string_count']}",
             f"Function prologues: {result['prologue_count']}",
             "",
-            "Known SecuROM strings found:",
+            "Strings of interest found:",
         ]
         for offset, s in result["known_strings"]:
             lines.append(f"  '{s}' @ {_format_address(offset)}")
@@ -1416,8 +1445,7 @@ def compare_memory(address_a: str, address_b: str, size: int = 4096) -> str:
 def launch_process_no_debug(exe_path: str, args: str = "", cwd: str = "", wait: bool = False) -> str:
     """Launch a process WITHOUT debugger attachment. Returns the PID.
 
-    Use this to run SecuROM-protected targets normally,
-    then dump them after decryption completes.
+    Use this to run targets normally, then dump them after decryption completes.
     """
     import subprocess
     try:
@@ -1469,7 +1497,7 @@ def dump_process_no_debugger(pid: int, output_dir: str = "", method: str = "proc
 def wait_for_window_title(pid: int, title_substring: str, timeout_sec: int = 120) -> str:
     """Wait until a process window with a specific title appears.
 
-    For SecuROM: wait for 'Serial' dialog = Stext decrypted in memory.
+    Use as a signal that initialization is complete.
     """
     if wait_for_window(pid, title_substring, timeout_sec):
         return f"Window containing '{title_substring}' found for PID {pid}."
@@ -1535,7 +1563,7 @@ def suspend_process(pid: int) -> str:
 def analyze_pe(pe_path: str) -> str:
     """Parse PE headers, sections, entry point, TLS callbacks (read-only).
 
-    NO patching — SecuROM CRC32 check blocks modified executables.
+    NO patching — PE integrity checks block modified executables.
     """
     try:
         sections = get_sections(pe_path)
@@ -1590,7 +1618,7 @@ def get_pe_imports(pe_path: str, dll_filter: str = "") -> str:
 def get_pe_exports(pe_path: str, filter_name: str = "") -> str:
     """List exported functions from a PE file (DLL or EXE with exports).
 
-    Useful for resolving DLL exports that SecuROM or the target binary calls by
+    Useful for resolving DLL exports that the target binary calls by
     ordinal, and for building a symbol map before attaching the debugger.
 
     Args:
@@ -1630,12 +1658,12 @@ def check_pe_security(pe_path: str) -> str:
 
 
 @mcp.tool()
-def locate_securom_sections(pe_path: str) -> str:
-    """Locate SecuROM-specific sections: Stext, Sdata, .securom."""
+def locate_protected_sections(pe_path: str) -> str:
+    """Locate protected sections: Stext, Sdata, and other common obfuscation sections."""
     try:
         sections = get_sections(pe_path)
-        target = {"stext", "sdata", ".securom", "srdata"}
-        lines = ["=== SecuROM Sections ==="]
+        target = {"stext", "sdata", "srdata"}
+        lines = ["=== Sections ==="]
         found = False
         for sec in sections:
             name_lower = sec["name"].lower().strip("\x00").rstrip("\x00")
@@ -1643,7 +1671,7 @@ def locate_securom_sections(pe_path: str) -> str:
                 found = True
                 lines.append(f"  {sec['name']}: VA={_format_address(sec['virtual_address'])}  Size=0x{sec['virtual_size']:X} ({sec['virtual_size']:,} bytes)")
         if not found:
-            lines.append("  No SecuROM sections found.")
+            lines.append("  No protected sections found.")
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
@@ -1672,13 +1700,15 @@ def get_pe_tls_callbacks(pe_path: str) -> str:
 def extract_section_from_dump(dump_path: str, section_va: str, size: int, output_path: str) -> str:
     """Extract raw bytes at a VA from a process minidump file.
 
-    Uses memprocfs if available, falls back to pefile-based raw search.
-    Use this to extract Stext/Sdata/.securom from a process dump.
+    Uses memprocfs if available, falls back to the ``minidump`` library for
+    proper MINIDUMP_MEMORY_DESCRIPTOR stream parsing, then tries a pefile
+    embedded-PE search as a last resort.
     """
     try:
         va = _parse_address_or_expression(section_va)
 
         extracted = None
+        # Fallback 1: memprocfs (works on raw dumps and VM snapshots)
         try:
             import memprocfs
             vmm = memprocfs.Vmm(["-device", dump_path])
@@ -1693,6 +1723,20 @@ def extract_section_from_dump(dump_path: str, section_va: str, size: int, output
         except Exception:
             pass
 
+        # Fallback 2: proper minidump stream parsing
+        if extracted is None:
+            try:
+                from minidump.minidumpfile import MinidumpFile
+                mf = MinidumpFile.parse(dump_path)
+                reader = mf.get_reader()
+                data = reader.read(va, size)
+                if data and len(data) == size:
+                    extracted = bytes(data)
+            except Exception:
+                pass
+
+        # Fallback 3: embedded PE search (crude, only works if the dump
+        # happens to contain a raw PE mapping at a file offset)
         if extracted is None:
             try:
                 import pefile as pef
@@ -1754,10 +1798,10 @@ def validate_extracted_binary(binary_path: str, expected_va: int = 0) -> str:
 
 
 @mcp.tool()
-def extract_securom_sections(dump_path: str, output_dir: str = "") -> str:
-    """Extract all known SecuROM sections from a dump file.
+def extract_protected_sections(dump_path: str, output_dir: str = "") -> str:
+    """Extract protected sections from a dump file.
 
-    Extracts Stext (0x67A000), Sdata (0x1122000), .securom (0x146D000).
+    Extracts known sections: Stext (0x67A000), Sdata (0x1122000), and other protected regions.
     """
     try:
         if not output_dir:
@@ -1800,25 +1844,25 @@ def extract_securom_sections(dump_path: str, output_dir: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Master Workflow — SecuROM extraction
+# Master Workflow — protected binary extraction
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def workflow_extract_securom(
+def workflow_extract_binary(
     target_exe: str,
     timeout_sec: int = 120,
     dump_method: str = "procdump",
     output_dir: str = "",
     validate: bool = True,
 ) -> str:
-    """Extract decrypted Stext/Sdata/.securom from BoneCrafterModKit.exe.
+    """Extract decrypted sections from a protected binary.
 
-    Steps: launch -> wait for serial dialog -> dump process -> extract sections -> validate.
+    Steps: launch -> wait for dialog window -> dump process -> extract sections -> validate.
 
-    NO debugger, NO PE patching. Works against SecuROM v7-v8 integrity checks.
+    NO debugger, NO PE patching. Works against PE integrity checks.
 
     Args:
-        target_exe: Full path to BoneCrafterModKit.exe
+        target_exe: Full path to the target executable
         timeout_sec: Max wait for serial dialog (default 120)
         dump_method: 'procdump' (recommended), 'comsvcs', or 'minidump'
         output_dir: Output directory (default: ./extracted/)
@@ -1828,7 +1872,7 @@ def workflow_extract_securom(
         if not output_dir:
             output_dir = os.path.join(Path.cwd(), "extracted")
 
-        result = workflow_extract_securom(
+        result = workflow_extract_binary(
             target_exe=target_exe,
             timeout_sec=timeout_sec,
             dump_method=dump_method,
@@ -1876,7 +1920,7 @@ def workflow_batch_cold_dump(
         results_data = []
         for i in range(iterations):
             iteration_dir = os.path.join(output_dir, f"run_{i + 1:02d}")
-            result = workflow_extract_securom(
+            result = workflow_extract_binary(
                 target_exe=target_exe,
                 dump_method=dump_method,
                 output_dir=iteration_dir,
@@ -1981,11 +2025,11 @@ def debuggee_get_process_info() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Phase 6 — x64dbg SecuROM fallback tools
+# Phase 6 — x64dbg fallback tools
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def debug_securom_tls_callbacks(target_exe: str) -> str:
+def debug_protected_tls_callbacks(target_exe: str) -> str:
     """Launch target in x64dbg with ScyllaHide, enumerate TLS callbacks."""
     try:
         client = _require_client()
@@ -2011,12 +2055,12 @@ def debug_securom_tls_callbacks(target_exe: str) -> str:
 
 
 @mcp.tool()
-def bypass_securom_execute_protect(section_name: str = "Stext") -> str:
-    """Change Stext/Sdata/.securom from PAGE_EXECUTE to PAGE_EXECUTE_READ."""
+def bypass_execute_protect(section_name: str = "Stext") -> str:
+    """Change protected section memory protection from PAGE_EXECUTE to PAGE_EXECUTE_READ."""
     section_map = {
         "Stext": (0x00A7A000, 0x00A18DF0),
         "Sdata": (0x01522000, 0x0034381C),
-        ".securom": (0x0186D000, 0x00172A4C),
+        ".protected": (0x0186D000, 0x00172A4C),
     }
     if section_name not in section_map:
         return f"Unknown section '{section_name}'. Known: {list(section_map.keys())}"
@@ -2030,70 +2074,6 @@ def bypass_securom_execute_protect(section_name: str = "Stext") -> str:
         return f"VirtualProtectEx failed for {section_name}"
     except Exception as e:
         return f"Error: {e}"
-
-
-# ---------------------------------------------------------------------------
-# DEPRECATED legacy tools — superseded by api_runtime equivalents
-# These are kept for backward compatibility but agents should prefer:
-#   configure_scyllahide  →  configure_scyllahide (runtime API)
-#   check_peb_after_hide  →  check_antidebug_status (runtime API)
-#   freeze_debugee_for_dump  →  sandbox_dump (runtime API)
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def freeze_debugee_for_dump() -> str:
-    """[DEPRECATED] Use sandbox_dump instead. Suspend all debugee threads, dump via comsvcs, then resume."""
-    try:
-        client = _require_client()
-        pid = client.get_process_info().pid
-        if not client.suspend_all_threads():
-            return "[DEPRECATED → use sandbox_dump] Failed to suspend threads."
-        from x64dbg_automate.external.process_dumper import dump_via_comsvcs
-        output = os.path.join(Path.cwd(), "dumps", f"frozen_dump_{pid}.dmp")
-        os.makedirs(os.path.dirname(output), exist_ok=True)
-        ok = dump_via_comsvcs(pid, output)
-        return f"[DEPRECATED → use sandbox_dump] Dump: {output} ({'OK' if ok else 'FAILED'})"
-    except Exception as e:
-        return f"[DEPRECATED → use sandbox_dump] Error: {e}"
-
-
-@mcp.tool()
-def configure_scyllahide_for_securom() -> str:
-    """[DEPRECATED] Use configure_scyllahide(sandbox_id) instead. Configure ScyllaHide settings for SecuROM v8 anti-debug."""
-    try:
-        client = _require_client()
-        settings = [
-            ("ScyllaHide", "PEBBeingDebugged", 0),
-            ("ScyllaHide", "PEBHeapFlags", 0),
-            ("ScyllaHide", "NtQueryInformationProcess", 1),
-            ("ScyllaHide", "NtSetInformationThread", 1),
-            ("ScyllaHide", "NtQuerySystemInformation", 1),
-            ("ScyllaHide", "GetTickCount", 1),
-            ("ScyllaHide", "NtClose", 1),
-        ]
-        for section, key, val in settings:
-            client.set_setting_int(section, key, val)
-        return "[DEPRECATED → use configure_scyllahide(sandbox_id)] ScyllaHide configured for SecuROM (7 settings)"
-    except Exception as e:
-        return f"[DEPRECATED → use configure_scyllahide(sandbox_id)] Error: {e}"
-
-
-@mcp.tool()
-def check_peb_after_hide() -> str:
-    """[DEPRECATED] Use check_antidebug_status(sandbox_id) instead. Verify PEB patches are active after ScyllaHide configuration."""
-    try:
-        client = _require_client()
-        peb = client.get_peb()
-        lines = [
-            "[DEPRECATED → use check_antidebug_status(sandbox_id)]",
-            f"BeingDebugged: {peb.being_debugged} (expect False)",
-            f"NtGlobalFlag: 0x{peb.nt_global_flag:08X} (expect 0x00)",
-            f"HeapFlags: 0x{peb.heap_flags:08X} (expect 0x02)",
-            f"HeapForceFlags: 0x{peb.heap_force_flags:08X} (expect 0x00)",
-        ]
-        return "\n".join(lines)
-    except Exception as e:
-        return f"[DEPRECATED → use check_antidebug_status(sandbox_id)] Error: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -2314,6 +2294,332 @@ def session_summary(sandbox_id: str = "") -> dict:
         summary["semantic_memory"] = {"error": str(exc)}
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# P1 — Agent Orientation & Discovery
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def tool_search(query: str, limit: int = 10) -> dict:
+    """Search available MCP tools by keyword.
+
+    Searches tool names and descriptions. Returns the best matches so agents
+    can discover capabilities without scrolling through 162 tools.
+
+    Args:
+        query: Keyword to search (e.g. 'entropy', 'breakpoint', 'cfg', 'suspend')
+        limit: Maximum results to return (default 10)
+    """
+    try:
+        q = query.lower()
+        results = []
+        # FastMCP stores registered tools in the tool manager
+        tm = getattr(mcp, "_tool_manager", None)
+        if tm is None:
+            return {"success": False, "error": "Tool manager not available"}
+        tools = getattr(tm, "_tools", {})
+        for name, tool_obj in tools.items():
+            desc = getattr(tool_obj, "description", "") or ""
+            score = 0
+            if q in name.lower():
+                score += 100
+            if q in desc.lower():
+                score += 50
+            if score > 0:
+                results.append({
+                    "name": name,
+                    "description": desc.split("\n")[0] if desc else "",
+                    "score": score,
+                })
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return {"success": True, "query": query, "total": len(results), "results": results[:limit]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def suggest_next_actions(context: str = "") -> dict:
+    """Suggest logical next actions based on current debugger state and history.
+
+    Analyzes the active session (debugger state, CIP, breakpoints, semantic
+    memory) and returns a prioritized list of recommended tools with rationale.
+
+    Args:
+        context: Optional extra context from the agent (e.g. 'looking for crypto')
+    """
+    suggestions = []
+    try:
+        client = _client
+        mgr = _get_unified_manager()
+        # Try to get active sandbox info
+        sandbox = None
+        try:
+            sandbox = mgr.get_sandbox()
+        except Exception:
+            pass
+
+        # --- State-based rules ---
+        if client is None:
+            suggestions.append({
+                "priority": 0,
+                "action": "start_session or connect_to_session",
+                "rationale": "No active debugger session.",
+            })
+        else:
+            try:
+                debugging = client.is_debugging()
+                running = client.is_running()
+            except Exception:
+                debugging = False
+                running = False
+
+            if debugging and running:
+                suggestions.append({
+                    "priority": 1,
+                    "action": "pause or sandbox_pause",
+                    "rationale": "Debuggee is running — pause to inspect state.",
+                })
+            elif debugging and not running:
+                suggestions.append({
+                    "priority": 1,
+                    "action": "get_all_registers + disassemble at CIP",
+                    "rationale": "Debuggee is paused — inspect current context.",
+                })
+                try:
+                    cip = client.get_reg("cip")
+                    sym = client.get_symbol_at(cip)
+                    if sym and sym.undecoratedSymbol:
+                        suggestions.append({
+                            "priority": 2,
+                            "action": "analyze_function_cfg",
+                            "rationale": f"At known function {sym.undecoratedSymbol} — extract CFG.",
+                        })
+                except Exception:
+                    pass
+
+                # Check if we have breakpoints
+                try:
+                    bps = client.get_breakpoints()
+                    if not bps:
+                        suggestions.append({
+                            "priority": 3,
+                            "action": "set_breakpoint",
+                            "rationale": "No breakpoints set — consider placing one on a target function.",
+                        })
+                except Exception:
+                    pass
+
+                # Check modules
+                try:
+                    mods = client.get_modules()
+                    if len(mods) <= 1:
+                        suggestions.append({
+                            "priority": 4,
+                            "action": "wait_until_stopped or go",
+                            "rationale": "Only main module loaded — let execution continue to load imports.",
+                        })
+                except Exception:
+                    pass
+
+            elif not debugging:
+                suggestions.append({
+                    "priority": 1,
+                    "action": "start_session or connect_to_session",
+                    "rationale": "Debugger is attached but not debugging any process.",
+                })
+
+        # --- Semantic memory rules ---
+        try:
+            from x64dbg_automate.api_runtime.semantic_memory import _get_store
+            mem_stats = _get_store().stats()
+            if mem_stats.get("total_entries", 0) == 0:
+                suggestions.append({
+                    "priority": 5,
+                    "action": "memory_record_finding",
+                    "rationale": "Semantic memory is empty — record findings as you discover them.",
+                })
+            else:
+                suggestions.append({
+                    "priority": 5,
+                    "action": "memory_query_findings or memory_list_keys",
+                    "rationale": f"Semantic memory has {mem_stats['total_entries']} entries — query past findings.",
+                })
+        except Exception:
+            pass
+
+        # --- Context-aware rules ---
+        ctx = context.lower()
+        if "crypto" in ctx or "encrypt" in ctx or "decrypt" in ctx:
+            suggestions.append({
+                "priority": 2,
+                "action": "crypto_material_search",
+                "rationale": "Context mentions crypto — search for high-entropy key material.",
+            })
+        if "unpack" in ctx or "dump" in ctx or "extract" in ctx:
+            suggestions.append({
+                "priority": 2,
+                "action": "dump_process_section or extract_section_from_dump",
+                "rationale": "Context mentions extraction — use dump tools.",
+            })
+        if "anti-debug" in ctx or "antidebug" in ctx or "rdtsc" in ctx:
+            suggestions.append({
+                "priority": 2,
+                "action": "detect_timing_attacks or check_debug_port",
+                "rationale": "Context mentions anti-debug — run detection suite.",
+            })
+        if "strings" in ctx:
+            suggestions.append({
+                "priority": 3,
+                "action": "extract_strings or get_string_at",
+                "rationale": "Context mentions strings — search for interesting strings.",
+            })
+
+        # --- Sandbox rules ---
+        if sandbox is not None:
+            try:
+                if not sandbox.checkpoints:
+                    suggestions.append({
+                        "priority": 3,
+                        "action": "sandbox_checkpoint",
+                        "rationale": "No checkpoints saved — create one before risky operations.",
+                    })
+            except Exception:
+                pass
+
+        suggestions.sort(key=lambda x: x["priority"])
+        return {"success": True, "suggestions": suggestions}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def report_generate(title: str = "", include_memory: bool = True) -> dict:
+    """Generate a markdown report of the current session for agent handoffs.
+
+    Compiles debugger state, module list, breakpoints, semantic memory findings,
+    and sandbox metadata into a single markdown document suitable for sharing
+    across agent sessions or archiving.
+
+    Args:
+        title: Report title (default: auto-generated from timestamp)
+        include_memory: Include semantic memory findings in the report
+    """
+    try:
+        from datetime import datetime, timezone
+        from x64dbg_automate.api_runtime.semantic_memory import _get_store
+
+        report_title = title or f"Axon MCP Session Report — {datetime.now(timezone.utc).isoformat(timespec='minutes')}"
+        lines = [f"# {report_title}", ""]
+
+        # --- Session summary ---
+        try:
+            summary = session_summary()
+            lines.append("## Session Summary")
+            lines.append(f"```json")
+            import json
+            lines.append(json.dumps(summary, indent=2, default=str))
+            lines.append("```")
+            lines.append("")
+        except Exception as exc:
+            lines.append(f"## Session Summary\n*Error: {exc}*\n")
+
+        # --- Debugger details ---
+        client = _client
+        if client is not None:
+            try:
+                lines.append("## Debugger State")
+                lines.append(f"- Debugging: {client.is_debugging()}")
+                lines.append(f"- Running: {client.is_running()}")
+                try:
+                    lines.append(f"- Debuggee PID: {client.debugee_pid()}")
+                except Exception:
+                    pass
+                try:
+                    lines.append(f"- Bitness: {client.debugee_bitness()}")
+                except Exception:
+                    pass
+                try:
+                    cip = client.get_reg("cip")
+                    lines.append(f"- CIP: `0x{cip:X}`")
+                    sym = client.get_symbol_at(cip)
+                    if sym and sym.undecoratedSymbol:
+                        lines.append(f"- Symbol: `{sym.undecoratedSymbol}`")
+                except Exception:
+                    pass
+                lines.append("")
+            except Exception as exc:
+                lines.append(f"## Debugger State\n*Error: {exc}*\n")
+
+            # --- Modules ---
+            try:
+                mods = client.get_modules()
+                lines.append("## Loaded Modules")
+                for mod in mods:
+                    lines.append(f"- `{mod.name}` @ `0x{mod.base:X}` (size {mod.size:,})")
+                lines.append("")
+            except Exception as exc:
+                lines.append(f"## Loaded Modules\n*Error: {exc}*\n")
+
+            # --- Breakpoints ---
+            try:
+                bps = client.get_breakpoints()
+                lines.append("## Breakpoints")
+                if bps:
+                    for bp in bps:
+                        status = "ON" if bp.enabled else "OFF"
+                        lines.append(f"- `0x{bp.addr:X}` [{status}] {bp.name or ''}")
+                else:
+                    lines.append("*None set.*")
+                lines.append("")
+            except Exception as exc:
+                lines.append(f"## Breakpoints\n*Error: {exc}*\n")
+
+        # --- Semantic Memory ---
+        if include_memory:
+            try:
+                store = _get_store()
+                stats = store.stats()
+                lines.append("## Semantic Memory")
+                lines.append(f"- Total entries: {stats.get('total_entries', 0)}")
+                lines.append(f"- Unique keys: {stats.get('unique_keys', 0)}")
+                lines.append(f"- Store path: `{stats.get('store_path', '')}`")
+                lines.append("")
+                entries = store.query(limit=20)
+                if entries:
+                    lines.append("### Recent Findings")
+                    for entry in entries:
+                        ts = entry.get("timestamp", "")
+                        key = entry.get("key", "")
+                        cat = entry.get("category", "")
+                        val = entry.get("value", {})
+                        lines.append(f"**{key}** (`{cat}`, {ts})")
+                        lines.append(f"```json")
+                        lines.append(json.dumps(val, indent=2, default=str))
+                        lines.append("```")
+                    lines.append("")
+            except Exception as exc:
+                lines.append(f"## Semantic Memory\n*Error: {exc}*\n")
+
+        return {"success": True, "report": "\n".join(lines), "title": report_title}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def resume_process(pid: int) -> str:
+    """Resume all threads in a process WITHOUT debugger attachment.
+
+    Uses NtResumeProcess to atomically resume all threads. Pairs with
+    suspend_process for cold-dump workflows where the target must be
+    frozen while a clone is dumped.
+
+    Args:
+        pid: Process ID to resume
+    """
+    if nt_resume_process(pid):
+        return f"Process {pid} resumed."
+    return f"Failed to resume process {pid}. Run as Administrator?"
 
 
 # ---------------------------------------------------------------------------

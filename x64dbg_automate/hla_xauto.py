@@ -183,11 +183,26 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
             prefix = 'se'
         else:
             prefix = ''
-        ip_start = self.get_reg('cip')
+        # Already running is a no-op success
+        try:
+            if self.is_running():
+                return True
+        except Exception:
+            pass
+        ip_start = None
+        try:
+            ip_start = self.get_reg('cip')
+        except Exception:
+            pass
         if not self.cmd_sync(f"{prefix}run"):
             return False
-        if self.get_reg('cip') == ip_start:
-            self.wait_until_running(timeout=1)
+        # If the target is still at the same IP, it hasn't started running yet.
+        # Wait briefly for it to enter the running state.
+        try:
+            if ip_start is not None and self.get_reg('cip') == ip_start:
+                self.wait_until_running(timeout=1)
+        except Exception:
+            pass
         return True
 
     
@@ -313,6 +328,12 @@ class XAutoHighLevelCommandAbstractionMixin(XAutoCommandsMixin):
         Returns:
             True if successful, False otherwise
         """
+        # Already paused is a no-op success
+        try:
+            if not self.is_running():
+                return True
+        except Exception:
+            pass
         if not self.cmd_sync(f"pause"):
             return False
         return self.wait_until_stopped()

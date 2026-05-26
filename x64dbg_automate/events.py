@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 from enum import StrEnum
 import time
+from typing import Callable
 
 from pydantic import BaseModel
 
@@ -216,6 +219,8 @@ class DbgEvent():
 class DebugEventQueueMixin():
     _debug_events_q: list[DbgEvent] = []
     listeners: dict[EventType, list[callable]] = {}
+    _auto_resume_events: set[EventType] = set()
+    _auto_resume_fn: Callable | None = None
 
     def debug_event_publish(self, raw_event_data: list[any]):
         event = DbgEvent(raw_event_data[0], raw_event_data[1:])
@@ -224,6 +229,8 @@ class DebugEventQueueMixin():
         self._debug_events_q.append(event)
         for listener in self.listeners.get(event.event_type, []):
             listener(event)
+        if event.event_type in self._auto_resume_events and self._auto_resume_fn is not None:
+            self._auto_resume_fn(event)
         return event
     
     def get_latest_debug_event(self) -> DbgEvent | None:

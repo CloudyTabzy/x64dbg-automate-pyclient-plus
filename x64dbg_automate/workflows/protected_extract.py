@@ -1,7 +1,7 @@
-"""SecuROM Stext extraction workflow for BoneCrafterModKit.exe.
+"""Stext extraction workflow for protected binaries.
 
-VALIDATED approach: launch original exe, wait for serial dialog,
-dump process via non-debugger method, extract and validate Stext.
+VALIDATED approach: launch original exe, wait for initialization,
+dump process via non-debugger method, extract and validate sections.
 """
 
 import os
@@ -24,13 +24,13 @@ STEXT_VA = 0x00A7A000      # loaded VA = 0x400000 (image base) + 0x67A000 (RVA)
 STEXT_SIZE = 0x00A18DF0
 SDATA_VA = 0x01522000      # loaded VA = 0x400000 + 0x1122000
 SDATA_SIZE = 0x0034381C
-SECUROM_VA = 0x0186D000    # loaded VA = 0x400000 + 0x146D000
-SECUROM_SIZE = 0x00172A4C
+PROTECTED_VA = 0x0186D000    # loaded VA = 0x400000 + 0x146D000
+PROTECTED_SIZE = 0x00172A4C
 
 TARGET_SECTIONS = {
     "Stext": (STEXT_VA, STEXT_SIZE),
     "Sdata": (SDATA_VA, SDATA_SIZE),
-    ".securom": (SECUROM_VA, SECUROM_SIZE),
+    ".protected": (PROTECTED_VA, PROTECTED_SIZE),
 }
 
 KNOWN_STRINGS = [
@@ -51,7 +51,7 @@ class ExtractionResult:
     elapsed_sec: float = 0.0
 
 
-def workflow_extract_securom(
+def workflow_extract_binary(
     target_exe: str,
     timeout_sec: int = 120,
     dump_method: str = "procdump",
@@ -269,9 +269,9 @@ def main():
     """CLI entry point: automate-extract <target_exe> [options]"""
     import argparse
     parser = argparse.ArgumentParser(
-        description="SecuROM Stext Extractor — BoneCrafterModKit preservation tool"
+        description="Protected binary section extractor"
     )
-    parser.add_argument("target_exe", help="Path to BoneCrafterModKit.exe")
+    parser.add_argument("target_exe", help="Path to target executable")
     parser.add_argument("--method", default="procdump", choices=["procdump", "comsvcs", "minidump"])
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--output", default="")
@@ -285,7 +285,7 @@ def main():
         for i in range(args.batch):
             print(f"\n=== Iteration {i + 1}/{args.batch} ===")
             iteration_dir = os.path.join(args.output or "./extracted", f"run_{i + 1:02d}")
-            r = workflow_extract_securom(
+            r = workflow_extract_binary(
                 target_exe=args.target_exe,
                 dump_method=args.method,
                 output_dir=iteration_dir,
@@ -298,7 +298,7 @@ def main():
         print(f"\n{'=' * 60}")
         print(f"Batch complete — {len(results)} runs")
     else:
-        result = workflow_extract_securom(
+        result = workflow_extract_binary(
             target_exe=args.target_exe,
             timeout_sec=args.timeout,
             dump_method=args.method,

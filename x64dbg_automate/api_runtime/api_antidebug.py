@@ -12,10 +12,10 @@ from x64dbg_automate.api_runtime.registry import tool
 from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, lookup_error, ok
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 
-# ScyllaHide settings tuned for SecuROM v7–v8 (written to x64dbg.ini under [ScyllaHide]).
+# ScyllaHide settings tuned for protected v7–v8 targets (written to x64dbg.ini under [ScyllaHide]).
 # These take full effect when the target is (re)started under the debugger; the live
 # PEB patch from hide_debugger_peb() applies immediately regardless.
-SCYLLAHIDE_SECUROM_PROFILE: list[tuple[str, str, int]] = [
+SCYLLAHIDE_PROTECTED_PROFILE: list[tuple[str, str, int]] = [
     ("ScyllaHide", "PEBBeingDebugged", 0),
     ("ScyllaHide", "PEBHeapFlags", 0),
     ("ScyllaHide", "PEBNtGlobalFlag", 0),
@@ -44,7 +44,7 @@ def _peb_status(client) -> dict:
 
 @tool
 def configure_scyllahide(sandbox_id: str | None = None) -> dict:
-    """Write the SecuROM ScyllaHide profile into x64dbg settings for this sandbox.
+    """Write the protected-binary ScyllaHide profile into x64dbg settings for this sandbox.
 
     Takes full effect when the target is (re)started under the debugger.
     """
@@ -55,12 +55,12 @@ def configure_scyllahide(sandbox_id: str | None = None) -> dict:
         return lookup_error(exc)
     applied: list[str] = []
     try:
-        for section, key, val in SCYLLAHIDE_SECUROM_PROFILE:
+        for section, key, val in SCYLLAHIDE_PROTECTED_PROFILE:
             client.set_setting_int(section, key, val)
             applied.append(key)
     except Exception as exc:  # noqa: BLE001
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id, applied=applied)
-    return ok(sandbox_id=sandbox_id, profile="securom", settings_applied=applied)
+    return ok(sandbox_id=sandbox_id, profile="protected", settings_applied=applied)
 
 
 @tool
@@ -68,7 +68,7 @@ def attach_safe(*, sandbox_id: str | None = None, breakpoint_tls: bool = False) 
     """Apply full anti-debug evasion to an already-created sandbox.
 
     Performs, in order:
-      1. Writes the SecuROM ScyllaHide profile.
+      1. Writes the protected-binary ScyllaHide profile.
       2. Patches the live PEB (BeingDebugged / NtGlobalFlag / heap flags) via x64dbg 'hide'.
       3. Enumerates TLS callbacks and (optionally) sets one-shot breakpoints on them so
          they can be observed before they fire.
@@ -89,7 +89,7 @@ def attach_safe(*, sandbox_id: str | None = None, breakpoint_tls: bool = False) 
     try:
         # 1. ScyllaHide profile
         scylla_applied = []
-        for section, key, val in SCYLLAHIDE_SECUROM_PROFILE:
+        for section, key, val in SCYLLAHIDE_PROTECTED_PROFILE:
             client.set_setting_int(section, key, val)
             scylla_applied.append(key)
         result["scyllahide_settings_applied"] = scylla_applied

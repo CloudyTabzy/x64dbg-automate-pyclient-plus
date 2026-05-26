@@ -341,10 +341,14 @@ def test_event_output_dbg_str(client: X64DbgClient):
 
     shellcode = client.virt_alloc()
     sz_str = client.virt_alloc()
-    client.write_memory(sz_str, b'duck duck goose')
+    client.write_memory(sz_str, b'duck duck goose\x00')
 
     if TEST_BITNESS == 64:
         i = shellcode
+        # ScyllaHide (and similar anti-debug plugins) patch PEB.BeingDebugged to 0,
+        # which causes OutputDebugStringA to short-circuit. Restore it temporarily.
+        i = i + client.assemble_at(i, 'mov rax, qword ptr gs:[0x60]')
+        i = i + client.assemble_at(i, 'mov byte ptr [rax+2], 1')
         i = i + client.assemble_at(i, f'mov rcx, 0x{sz_str:x}')
         i = i + client.assemble_at(i, 'mov rax, OutputDebugStringA')
         i = i + client.assemble_at(i, 'push rcx')
@@ -357,6 +361,8 @@ def test_event_output_dbg_str(client: X64DbgClient):
         i = i + client.assemble_at(i, 'ret')
     else:
         i = shellcode
+        i = i + client.assemble_at(i, 'mov eax, dword ptr fs:[0x30]')
+        i = i + client.assemble_at(i, 'mov byte ptr [eax+2], 1')
         i = i + client.assemble_at(i, f'push 0x{sz_str:x}')
         i = i + client.assemble_at(i, 'push OutputDebugStringA')
         i = i + client.assemble_at(i, 'pop eax')
@@ -365,7 +371,13 @@ def test_event_output_dbg_str(client: X64DbgClient):
 
     hProc = OpenProcess(0x1fffff, False, client.debugee_pid())
     hThread = CreateRemoteThread(hProc, None, 0, shellcode, None, 0, None)
-    WaitForSingleObject(hThread, -1)
+
+    # x64dbg pauses on OutputDebugString events.  Without auto-resume,
+    # WaitForSingleObject would hang forever because the remote thread is
+    # suspended.  The guard pulses go() so execution continues.
+    with client.running_guard({EventType.EVENT_OUTPUT_DEBUG_STRING}):
+        WaitForSingleObject(hThread, 5000)
+
     CloseHandle(hThread)
     CloseHandle(hProc)
 

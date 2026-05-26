@@ -6,7 +6,7 @@ A Synapse-style structured tool layer over the existing high-level client. It ad
 * **Anti-debug transparency** — one call applies ScyllaHide + PEB hiding + TLS surfacing.
 * **Composite capture** — function context, memory-change tracing, crypto discovery.
 * **Semantic memory** — typed struct reads, entropy discovery, IAT resolution, diffs.
-* **Workflows** — one-call SecuROM runtime extraction.
+* **Workflows** — one-call protected binary runtime extraction.
 
 Every tool returns a JSON-serializable structured dict (see :mod:`responses`), is
 read-only unless flagged ``@unsafe``, and operates on a ``sandbox_id``.
@@ -38,7 +38,9 @@ def register_runtime_tools(mcp) -> int:
         api_antidebug,
         api_composite,
         api_coverage,
+        api_decompiler,
         api_exceptions,
+        api_infrastructure,
         api_macros,
         api_memory,
         api_patches,

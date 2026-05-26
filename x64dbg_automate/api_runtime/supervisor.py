@@ -242,15 +242,37 @@ class SandboxManager:
             sandbox.state = "destroyed"
             return sandbox.state
         try:
-            if not client.is_debugging():
-                sandbox.state = "detached"
-            elif client.is_running():
-                sandbox.state = "running"
-            else:
-                sandbox.state = "stopped"
+            is_debugging = client.is_debugging()
+            is_running = client.is_running() if is_debugging else False
         except Exception as exc:  # RPC dead → debugger likely gone
             sandbox.state = "crashed"
             sandbox.last_error = str(exc)
+            return sandbox.state
+
+        # Sync state machine if available
+        sm = getattr(client, "_axon_state_machine", None)
+        if sm is not None:
+            from x64dbg_automate.api_runtime.debugger_state import DebuggerState
+            if not is_debugging:
+                sm.transition(DebuggerState.DISCONNECTED, reason="refresh_state: not debugging")
+            elif is_running:
+                if sm.current_state != DebuggerState.RUNNING:
+                    sm.transition(DebuggerState.RUNNING, reason="refresh_state: is_running")
+            else:
+                if sm.current_state == DebuggerState.RUNNING:
+                    sm.transition(DebuggerState.PAUSED_EVENT, reason="refresh_state: unexpected pause")
+                elif sm.current_state == DebuggerState.DISCONNECTED:
+                    sm.transition(DebuggerState.STOPPED, reason="refresh_state: debugging but stopped")
+            sandbox.state = str(sm.current_state)
+            return sandbox.state
+
+        # Fallback crude state
+        if not is_debugging:
+            sandbox.state = "detached"
+        elif is_running:
+            sandbox.state = "running"
+        else:
+            sandbox.state = "stopped"
         return sandbox.state
 
     # -- checkpoint / restore ---------------------------------------------

@@ -10,7 +10,7 @@ Instead of typing debugger commands by hand, LLM agents drive the entire reverse
 
 | Capability | Description |
 |-----------|-------------|
-| **120+ MCP Tools** | 42 new runtime API tools + 78 upstream tools, all exposed via FastMCP 3.2.4 with `readOnlyHint`/`destructiveHint` annotations |
+| **166 MCP Tools** | 46 new runtime API tools + 82 upstream tools, all exposed via FastMCP 3.2.4 with `readOnlyHint`/`destructiveHint` annotations |
 | **Sandbox Model** | Isolate every debugging session with automatic checkpoint/restore, read-only safety mode, and lifecycle management |
 | **Full CFG Analysis** | Extract control-flow graphs with basic blocks, branch targets, and instruction bytes via `analyze_function_cfg()` |
 | **Execution Tracing** | Software single-step trace (up to 500 steps) with register snapshots and configurable stop conditions |
@@ -31,7 +31,7 @@ Instead of typing debugger commands by hand, LLM agents drive the entire reverse
 │   Cursor, etc.) │                      │      x64dbg GUI         │
 └─────────────────┘                      └─────────────────────────┘
          ▲                                        │
-         │          120+ MCP tools                │
+         │          166+ MCP tools                │
          └────────────────────────────────────────┘
 ```
 
@@ -49,9 +49,8 @@ Requires **Python 3.10+** on Windows.
 pip install x64dbg_automate[mcp] --upgrade
 ```
 
-For YARA rule support (optional):
 ```sh
-pip install x64dbg_automate[mcp,yara] --upgrade
+pip install x64dbg_automate[mcp] --upgrade
 ```
 
 ---
@@ -137,12 +136,18 @@ Setting `X64DBG_PATH` lets the MCP tools resolve x64dbg automatically — no nee
 - `memory_record_finding` — append-only JSONL persistence
 - `memory_query_findings`, `memory_get_latest`, `memory_list_keys`, `memory_stats`
 
+### Agent Orientation (`api_orchestration`)
+- `tool_search` — keyword search across all 166 tools
+- `suggest_next_actions` — rule-based next-step recommendations from debugger state
+- `report_generate` — compile session findings into markdown for agent handoffs
+
 ### Offline Forensics (`external/`)
 - `calculate_entropy`, `find_function_prologues`, `extract_strings`
 - `search_pattern`, `dump_process_section` — ProcDump + PE analysis without a debugger
+- `suspend_process`, `resume_process` — freeze/resume target without debugger attachment
 
 ### Legacy Tools (`mcp_server.py`)
-- 78 upstream tools for breakpoints, labels, comments, assembly, direct command execution, etc.
+- 82 upstream tools for breakpoints, labels, comments, assembly, direct command execution, etc.
 
 ---
 
@@ -224,3 +229,8 @@ Upstream: [dariushoule/x64dbg-automate](https://github.com/dariushoule/x64dbg-au
 ## License
 
 This project extends the upstream x64dbg-automate ecosystem. All original upstream code retains its respective license. New contributions in the Axon MCP edition follow the same open-source spirit.
+
+### Bundled Dependencies
+
+- **minidump** (MIT) — Structured minidump parsing for process dump analysis. Bundled as a runtime dependency in `pyproject.toml`.
+- **memprocfs** (AGPL-3.0) — **Not bundled**. If already installed on the user's system, it is dynamically loaded at runtime as an optional enhancement for dump forensics.

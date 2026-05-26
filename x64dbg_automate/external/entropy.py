@@ -1,6 +1,6 @@
 """Shannon entropy calculator for memory region classification.
 
-Critical thresholds for SecuROM:
+Critical thresholds for encrypted/compressed data:
   - Entropy > 7.5  → encrypted / compressed (NOT valid code)
   - Entropy 4.5–6.5 → likely x86 machine code
   - Entropy < 3.0  → likely padding / zero-filled

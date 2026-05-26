@@ -100,15 +100,43 @@ def sandbox_info(sandbox_id: str | None = None) -> dict:
 @tool
 def sandbox_continue(sandbox_id: str | None = None) -> dict:
     """Resume execution of the sandbox's debuggee (lets it run toward the next event)."""
+    import time
+
     mgr = get_manager()
     try:
         client = mgr.get_client(sandbox_id)
     except (KeyError, SandboxError) as exc:
         return lookup_error(exc)
+
+    # Idempotent: already running is a success
+    try:
+        if client.is_running():
+            sandbox = mgr.get_sandbox(sandbox_id)
+            return ok(sandbox_id=sandbox_id, resumed=True, state=mgr.refresh_state(sandbox),
+                     note="Debuggee was already running.")
+    except Exception:
+        pass
+
     try:
         resumed = client.go()
     except Exception as exc:  # noqa: BLE001
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    # Verify with short poll
+    for _ in range(10):
+        try:
+            if client.is_running():
+                break
+        except Exception:
+            break
+        time.sleep(0.05)
+
+    # Transition state machine if available
+    sm = getattr(client, "_axon_state_machine", None)
+    if sm is not None and resumed:
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState
+        sm.transition(DebuggerState.RUNNING, reason="sandbox_continue")
+
     sandbox = mgr.get_sandbox(sandbox_id)
     return ok(sandbox_id=sandbox_id, resumed=bool(resumed), state=mgr.refresh_state(sandbox))
 
@@ -116,15 +144,43 @@ def sandbox_continue(sandbox_id: str | None = None) -> dict:
 @tool
 def sandbox_pause(sandbox_id: str | None = None) -> dict:
     """Pause the sandbox's debuggee so its state can be inspected."""
+    import time
+
     mgr = get_manager()
     try:
         client = mgr.get_client(sandbox_id)
     except (KeyError, SandboxError) as exc:
         return lookup_error(exc)
+
+    # Idempotent: already paused is a success
+    try:
+        if not client.is_running() and client.is_debugging():
+            sandbox = mgr.get_sandbox(sandbox_id)
+            return ok(sandbox_id=sandbox_id, paused=True, state=mgr.refresh_state(sandbox),
+                     note="Debuggee was already paused.")
+    except Exception:
+        pass
+
     try:
         paused = client.pause()
     except Exception as exc:  # noqa: BLE001
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    # Verify with short poll
+    for _ in range(10):
+        try:
+            if not client.is_running():
+                break
+        except Exception:
+            break
+        time.sleep(0.05)
+
+    # Transition state machine if available
+    sm = getattr(client, "_axon_state_machine", None)
+    if sm is not None and paused:
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState
+        sm.transition(DebuggerState.STOPPED, reason="sandbox_pause")
+
     sandbox = mgr.get_sandbox(sandbox_id)
     return ok(sandbox_id=sandbox_id, paused=bool(paused), state=mgr.refresh_state(sandbox))
 

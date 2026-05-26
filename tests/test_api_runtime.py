@@ -133,6 +133,7 @@ class TestResponses:
 
 def _mock_sandbox(mgr: SandboxManager, arch: str = "x64", sid: str = "aa11") -> ProcessSandbox:
     client = MagicMock()
+    client.debugee_bitness.return_value = 64 if arch == "x64" else 32
     sb = ProcessSandbox(
         sandbox_id=sid,
         debugger_pid=999,
@@ -367,9 +368,9 @@ class TestCompositeTools:
 
 class TestWorkflowGuards:
     def test_bad_region_before_launch(self):
-        from x64dbg_automate.api_runtime.api_workflow import workflow_capture_securom_state
+        from x64dbg_automate.api_runtime.api_workflow import workflow_capture_binary_state
 
-        r = workflow_capture_securom_state(target_exe="x.exe", regions=["bogus"])
+        r = workflow_capture_binary_state(target_exe="x.exe", regions=["bogus"])
         assert r["success"] is False and r["error_type"] == ErrorType.BAD_ARGUMENT
 
 
@@ -610,7 +611,7 @@ class TestSemanticMemory:
             key="sub_2ADEB7",
             value={"role": "decryption_entry", "confidence": 0.92},
             target_exe="test.exe",
-            tags=["securom"],
+            tags=["protected"],
         )
         assert r1["success"]
 
@@ -1089,12 +1090,12 @@ class TestExceptionTools:
         codes = [e["code"] for e in r["exceptions"]]
         assert "0xC0000094" in codes
 
-    def test_configure_securom(self, manager):
-        from x64dbg_automate.api_runtime.api_exceptions import exception_configure_securom
+    def test_configure_protected(self, manager):
+        from x64dbg_automate.api_runtime.api_exceptions import exception_configure_protected
 
         sb = _mock_sandbox(manager, sid="ex11")
         sb.client.is_running.return_value = False
-        r = exception_configure_securom(sandbox_id="ex11")
+        r = exception_configure_protected(sandbox_id="ex11")
         assert r["success"]
         assert r["all_succeeded"]
         assert len(r["applied"]) == 3
@@ -1441,3 +1442,303 @@ class TestMacroTools:
         monkeypatch.delenv("X64DBG_MCP_READ_ONLY", raising=False)
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+# ---------------------------------------------------------------------------
+# Decompiler (C1)
+# ---------------------------------------------------------------------------
+
+class TestDecompiler:
+    def test_simple_function(self):
+        from x64dbg_automate.external.decompiler import decompile_function
+
+        # push rbp; mov rbp, rsp; mov eax, 1; pop rbp; ret
+        code = bytes.fromhex('554889e5b8010000005dc3')
+        result = decompile_function(code, 0x401000, 'x64', 'simple')
+        assert result.function_name == "simple"
+        assert "eax = 1;" in result.pseudocode
+        assert "return;" in result.pseudocode
+        # Prologue/epilogue should be suppressed
+        assert "push rbp" not in result.pseudocode
+        assert "pop rbp" not in result.pseudocode
+
+    def test_if_else(self):
+        from x64dbg_automate.external.decompiler import decompile_function
+
+        # if/else with param1 == 5
+        code = bytes.fromhex('554889e583f9057507b801000000eb05b8020000005dc3')
+        result = decompile_function(code, 0x401000, 'x64', 'if_test')
+        assert "if (param1 == 5) {" in result.pseudocode
+        assert "eax = 1;" in result.pseudocode
+        assert "} else {" in result.pseudocode
+        assert "eax = 2;" in result.pseudocode
+
+    def test_prologue_detected(self):
+        from x64dbg_automate.external.decompiler import decompile_function
+
+        # Standard prologue: push rbp; mov rbp, rsp; sub rsp, 0x10
+        code = bytes.fromhex('554889e54883ec10b801000000c9c3')
+        result = decompile_function(code, 0x401000, 'x64', 'prologue')
+        assert result.calling_convention == "__fastcall"
+        assert result.stack_frame_size == 0x10
+        assert "push rbp" not in result.pseudocode
+
+    def test_local_var_recovery(self):
+        from x64dbg_automate.external.decompiler import decompile_function
+
+        # mov [rbp-8], rcx; mov rax, [rbp-8]  (Windows x64: rcx = param1)
+        code = bytes.fromhex('554889e54883ec1048894df8488b45f8c9c3')
+        result = decompile_function(code, 0x401000, 'x64', 'locals')
+        assert "local_1" in result.pseudocode
+        assert "param1" in result.pseudocode  # rcx mapped to param1
+        assert "param1" in result.pseudocode
+
+    def test_x86_function(self):
+        from x64dbg_automate.external.decompiler import decompile_function
+
+        # x86: push ebp; mov ebp, esp; mov eax, 42; pop ebp; ret
+        code = bytes.fromhex('5589e5b82a0000005dc3')
+        result = decompile_function(code, 0x401000, 'x32', 'x86_test')
+        assert result.arch == "x32"
+        assert "eax = 0x2A;" in result.pseudocode
+        assert "push ebp" not in result.pseudocode
+
+    def test_max_lines_truncation(self):
+        from x64dbg_automate.external.decompiler import decompile_function
+
+        # Many nops to make a long function
+        code = bytes.fromhex('554889e5') + b'\x90' * 100 + bytes.fromhex('5dc3')
+        result = decompile_function(code, 0x401000, 'x64', 'long', max_lines=10)
+        lines = result.pseudocode.splitlines()
+        assert len(lines) <= 12  # 10 + signature + closing brace
+        assert "more lines" in result.pseudocode or len(lines) <= 10
+
+    def test_decompile_range_tool(self, manager):
+        from x64dbg_automate.api_runtime.api_decompiler import decompile_range
+
+        sb = _mock_sandbox(manager)
+        # Mock memory with two functions separated by nops
+        sb.client.read_memory.return_value = (
+            bytes.fromhex('554889e5b8010000005dc3')  # func1 at +0
+            + b'\x90' * 16
+            + bytes.fromhex('554889e5b8020000005dc3')  # func2 at +32
+        )
+        r = decompile_range(start_address="0x401000", size=64, sandbox_id="aa11")
+        assert r["success"]
+        assert r["total_found"] >= 1
+        assert any("0x401000" == f["address"] for f in r["functions"])
+
+    def test_get_function_type(self, manager):
+        from x64dbg_automate.api_runtime.api_decompiler import get_function_type
+
+        sb = _mock_sandbox(manager)
+        sb.client.read_memory.return_value = bytes.fromhex('554889e54883ec10b801000000c9c3')
+        r = get_function_type(address="0x401000", sandbox_id="aa11")
+        assert r["success"]
+        assert "__fastcall" in r["signature"] or "fastcall" in r["calling_convention"]
+        assert len(r["args"]) >= 1
+
+    def test_rename_and_list(self, monkeypatch, manager):
+        from x64dbg_automate.api_runtime.api_decompiler import (
+            rename_local_variable, list_variable_renames,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_decompiler_renames.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        sb = _mock_sandbox(manager)
+        sb.client.read_memory.return_value = bytes.fromhex('554889e5b8010000005dc3')
+
+        r = rename_local_variable(
+            function_address="0x401000",
+            old_name="local_1",
+            new_name="aes_key",
+            sandbox_id="aa11",
+        )
+        assert r["success"]
+        assert r["new_name"] == "aes_key"
+
+        r2 = list_variable_renames(function_address="0x401000", sandbox_id="aa11")
+        assert r2["success"]
+        assert r2["renames"].get("local_1") == "aes_key"
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+class TestRunningGuard:
+    """Mock tests for ensure_running() and running_guard()."""
+
+    def test_ensure_running_when_paused(self, manager):
+        sb = _mock_sandbox(manager)
+        self._bind_mixin_methods(sb.client)
+        sb.client.is_running.side_effect = [False, True]
+        sb.client.go.return_value = True
+        sb.client.wait_until_running.return_value = True
+
+        assert sb.client.ensure_running(timeout=1.0) is True
+        sb.client.go.assert_called_once()
+        sb.client.wait_until_running.assert_called_once_with(timeout=1.0)
+
+    def test_ensure_running_when_already_running(self, manager):
+        sb = _mock_sandbox(manager)
+        self._bind_mixin_methods(sb.client)
+        sb.client.is_running.return_value = True
+
+        assert sb.client.ensure_running(timeout=1.0) is True
+        sb.client.go.assert_not_called()
+
+    def _bind_mixin_methods(self, mock_client):
+        import types
+        from x64dbg_automate import X64DbgClient
+        from x64dbg_automate.events import DebugEventQueueMixin
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerStateMachine
+        from x64dbg_automate.api_runtime.execution_context import ExecutionContextManager
+        mock_client._axon_state_machine = DebuggerStateMachine()
+        mock_client._axon_exec_ctx = ExecutionContextManager(mock_client, mock_client._axon_state_machine)
+        mock_client.ensure_running = types.MethodType(X64DbgClient.ensure_running, mock_client)
+        mock_client.running_guard = types.MethodType(X64DbgClient.running_guard, mock_client)
+        mock_client.debug_event_publish = types.MethodType(DebugEventQueueMixin.debug_event_publish, mock_client)
+
+    def test_running_guard_auto_resume_fires(self, manager):
+        from x64dbg_automate.events import EventType
+        sb = _mock_sandbox(manager)
+        self._bind_mixin_methods(sb.client)
+        sb.client.go.return_value = True
+
+        with sb.client.running_guard({EventType.EVENT_OUTPUT_DEBUG_STRING}):
+            # Simulate an OutputDebugString event being published
+            sb.client.debug_event_publish(["EVENT_OUTPUT_DEBUG_STRING", b"test\x00"])
+
+        # go() should have been called from the auto-resume handler
+        sb.client.go.assert_called()
+
+    def test_running_guard_no_resume_for_untracked_events(self, manager):
+        from x64dbg_automate.events import EventType
+        sb = _mock_sandbox(manager)
+        self._bind_mixin_methods(sb.client)
+        sb.client.go.return_value = True
+
+        with sb.client.running_guard({EventType.EVENT_OUTPUT_DEBUG_STRING}):
+            # Simulate a different event type
+            sb.client.debug_event_publish(["EVENT_RESUME_DEBUG"])
+
+        sb.client.go.assert_not_called()
+
+    def test_running_guard_restores_state_on_exit(self, manager):
+        from x64dbg_automate.events import EventType
+        sb = _mock_sandbox(manager)
+        self._bind_mixin_methods(sb.client)
+        sb.client.go.return_value = True
+
+        original_events = sb.client._auto_resume_events.copy()
+        original_fn = sb.client._auto_resume_fn
+
+        with sb.client.running_guard({EventType.EVENT_OUTPUT_DEBUG_STRING}):
+            assert EventType.EVENT_OUTPUT_DEBUG_STRING in sb.client._auto_resume_events
+
+        assert sb.client._auto_resume_events == original_events
+        assert sb.client._auto_resume_fn == original_fn
+
+
+class TestInfrastructureTools:
+    """Mock tests for get_debugger_state, wait_for_stable_state, force_resume, get_execution_log."""
+
+    def test_get_debugger_state_connected(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import get_debugger_state
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerStateMachine, DebuggerState
+        sb = _mock_sandbox(manager)
+        sm = DebuggerStateMachine()
+        sm.transition(DebuggerState.RUNNING, reason="test")
+        sb.client._axon_state_machine = sm
+
+        r = get_debugger_state(sandbox_id="aa11")
+        assert r["success"]
+        assert r["state"] == "running"
+        assert r["is_healthy"] is True
+        assert r["is_executing"] is True
+
+    def test_get_debugger_state_not_connected(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import get_debugger_state
+        r = get_debugger_state(sandbox_id="ghost")
+        assert not r["success"]
+        assert r["error_type"] == "NOT_CONNECTED"
+
+    def test_wait_for_stable_state_reaches_running(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import wait_for_stable_state
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = True
+        sb.client.is_debugging.return_value = True
+
+        r = wait_for_stable_state(sandbox_id="aa11", desired_state="running", timeout=1.0, poll_interval=0.05)
+        assert r["success"]
+        assert r["reached"] is True
+        assert r["actual_state"] == "running"
+
+    def test_wait_for_stable_state_timeout(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import wait_for_stable_state
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.is_debugging.return_value = True
+
+        r = wait_for_stable_state(sandbox_id="aa11", desired_state="running", timeout=0.1, poll_interval=0.05)
+        assert not r["success"]
+        assert r["error_type"] == "TIMEOUT"
+
+    def test_force_resume_success(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import force_resume
+        sb = _mock_sandbox(manager)
+        sb.client.go.return_value = True
+
+        r = force_resume(sandbox_id="aa11")
+        assert r["success"]
+        assert r["attempts"] == 1
+
+    def test_force_resume_eventual_success(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import force_resume
+        sb = _mock_sandbox(manager)
+        sb.client.go.side_effect = [False, False, True]
+
+        r = force_resume(sandbox_id="aa11")
+        assert r["success"]
+        assert r["attempts"] == 3
+
+    def test_force_resume_failure(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import force_resume
+        sb = _mock_sandbox(manager)
+        sb.client.go.return_value = False
+
+        r = force_resume(sandbox_id="aa11")
+        assert not r["success"]
+
+    def test_get_execution_log(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import get_execution_log
+        from x64dbg_automate.api_runtime.debugger_state import DebuggerState, DebuggerStateMachine
+        sb = _mock_sandbox(manager)
+        sm = DebuggerStateMachine()
+        sm.transition(DebuggerState.RUNNING, reason="test")
+        sm.transition(DebuggerState.STOPPED, reason="test_stop")
+        sb.client._axon_state_machine = sm
+
+        r = get_execution_log(sandbox_id="aa11", n=5)
+        assert r["success"]
+        assert r["count"] == 2
+        assert len(r["transitions"]) == 2
+
+    def test_get_execution_log_no_state_machine(self, manager):
+        from x64dbg_automate.api_runtime.api_infrastructure import get_execution_log
+        from x64dbg_automate.api_runtime.supervisor import get_manager
+        from unittest.mock import MagicMock
+        sb = _mock_sandbox(manager)
+        # Use a spec'd mock so _axon_state_machine is not auto-created
+        plain = MagicMock(spec=["is_running", "is_debugging"])
+        plain.is_running.return_value = True
+        plain.is_debugging.return_value = True
+        sb.client = plain
+        mgr = get_manager()
+        mgr._sandboxes["aa11"] = sb
+
+        r = get_execution_log(sandbox_id="aa11", n=5)
+        assert not r["success"]

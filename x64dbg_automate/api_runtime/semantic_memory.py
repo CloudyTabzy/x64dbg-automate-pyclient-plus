@@ -11,14 +11,14 @@ Storage layout (one JSON object per line):
         "timestamp": "2026-05-26T01:46:39",
         "sandbox_id": "a1b2c3d4",
         "category": "function_identification",
-        "target_exe": "BoneCrafterModKit.exe",
+        "target_exe": "target.exe",
         "key": "sub_2ADEB7",
         "value": {
             "role": "decryption_entry",
             "confidence": 0.92,
             "evidence": ["0x2ADEB7 called before Stext XOR loop", "..."]
         },
-        "tags": ["securom", "crypto"]
+        "tags": ["runtime", "crypto"]
     }
 """
 
@@ -220,7 +220,7 @@ def memory_record_finding(
         value: Arbitrary dict with the finding's details (confidence, evidence, etc.).
         target_exe: Optional executable this finding relates to.
         sandbox_id: Optional sandbox that produced it.
-        tags: Optional tags for filtering, e.g. ['securom', 'crypto'].
+        tags: Optional tags for filtering, e.g. ['protected', 'crypto'].
     """
     try:
         entry = _get_store().record(

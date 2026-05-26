@@ -8,10 +8,10 @@ from .string_finder import find_strings, find_specific_strings
 from .pattern_scanner import scan_multiple
 
 
-KNOWN_SECUROM_STRINGS = [
+DEFAULT_TARGET_STRINGS = [
     "TerrainEditor", "GuiTerrPreviewCtrl", "MissionAreaEditor",
     "CUSTOM", "Invalid serial format", "activation failed",
-    "BoneCraft", "BoneCrafter", "server error",
+    "game", "server", "error",
 ]
 
 KNOWN_X86_PATTERNS = {
@@ -32,7 +32,7 @@ def analyze_region(data: bytes, base_va: int = 0) -> dict:
     sig_counts = {name: len(matches) for name, matches in sig_matches.items()}
 
     strings = find_strings(data, min_length=4)
-    known = find_specific_strings(data, KNOWN_SECUROM_STRINGS)
+    known = find_specific_strings(data, DEFAULT_TARGET_STRINGS)
 
     return {
         "size": len(data),

@@ -9,10 +9,10 @@ Exception actions:
     ``"second"``   — Break only on second-chance exceptions.
     ``"all"``      — Break on first AND second chance.
 
-Common exception codes for SecuROM analysis::
+Common exception codes for protected binary analysis::
 
     0xC0000005  ACCESS_VIOLATION
-    0xC0000094  INT_DIVIDE_BY_ZERO   ← SecuROM anti-debug trap
+    0xC0000094  INT_DIVIDE_BY_ZERO   ← anti-debug trap
     0xC0000096  PRIVILEGED_INSTRUCTION
     0xC000001D  ILLEGAL_INSTRUCTION
     0x80000003  BREAKPOINT (INT 3)
@@ -158,7 +158,7 @@ def exception_list_known() -> dict:
     No debugger connection required — this is a static reference.
 
     Returns a list of ``{code, name}`` entries for common NTSTATUS exception
-    codes, useful for SecuROM anti-debug analysis.
+    codes, useful for protected binary anti-debug analysis.
     """
     entries = [
         {"code": f"0x{code:X}", "name": name}
@@ -169,11 +169,11 @@ def exception_list_known() -> dict:
 
 @tool
 @unsafe
-def exception_configure_securom(*, sandbox_id: str | None = None) -> dict:
-    """Apply the recommended exception handler configuration for SecuROM analysis.
+def exception_configure_protected(*, sandbox_id: str | None = None) -> dict:
+    """Apply the recommended exception handler configuration for protected binary analysis.
 
     Sets up x64dbg to:
-    - **Pass** through INT_DIVIDE_BY_ZERO (0xC0000094) — SecuROM anti-debug trap.
+    - **Pass** through INT_DIVIDE_BY_ZERO (0xC0000094) — anti-debug trap.
     - **Break** on ACCESS_VIOLATION (0xC0000005) — unexpected crashes.
     - **Pass** through SINGLE_STEP (0x80000004) — normal trace noise.
 
@@ -183,7 +183,7 @@ def exception_configure_securom(*, sandbox_id: str | None = None) -> dict:
         sandbox_id: Target sandbox (omit for active session).
     """
     steps = [
-        ("0xC0000094", "pass"),   # INT_DIVIDE_BY_ZERO — SecuROM trap, pass through
+        ("0xC0000094", "pass"),   # INT_DIVIDE_BY_ZERO — anti-debug trap, pass through
         ("0xC0000005", "break"),  # ACCESS_VIOLATION — real crash, break
         ("0x80000004", "pass"),   # SINGLE_STEP — trace noise, pass through
     ]

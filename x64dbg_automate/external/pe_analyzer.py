@@ -1,6 +1,6 @@
 """Read-only PE file analysis via LIEF (primary) or pefile (fallback).
 
-CRITICAL: Never modify the PE. SecuROM CRC32 integrity check at 0x1499EA2
+CRITICAL: Never modify the PE. PE integrity checks at runtime
 detects any on-disk modification and kills the process.
 
 API Notes

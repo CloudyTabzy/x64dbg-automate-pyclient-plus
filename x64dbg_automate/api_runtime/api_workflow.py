@@ -1,4 +1,4 @@
-"""High-level SecuROM-oriented workflows that orchestrate the runtime tools.
+"""High-level protected-binary workflows that orchestrate the runtime tools.
 
 These compose the lower-level tools (sandbox lifecycle, anti-debug, composite capture)
 into one-call investigations and return a single consolidated report.
@@ -20,16 +20,16 @@ from x64dbg_automate.external.entropy import shannon_entropy
 
 
 @tool
-def workflow_capture_securom_state(
+def workflow_capture_binary_state(
     target_exe: str,
     regions: list[str] | None = None,
     iat_slots: list[str] | None = None,
-    serial_window_title: str = "Serial",
+    serial_window_title: str = "",
     x64dbg_path: str = "",
     timeout_sec: int = 120,
     keep_sandbox: bool = False,
 ) -> dict:
-    """One-call SecuROM runtime capture: launch undebugged, attach after decryption, extract.
+    """One-call runtime capture: launch undebugged, attach after decryption, extract.
 
     Dual-path: the target is launched WITHOUT a debugger so its startup decryption/anti-debug
     runs unimpeded; once its serial dialog appears (tables are initialized in RAM), a sandbox

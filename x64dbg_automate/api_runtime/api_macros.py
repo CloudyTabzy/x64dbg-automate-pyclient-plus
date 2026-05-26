@@ -115,25 +115,57 @@ def _maybe_record_call(tool_name: str, arguments: dict[str, Any]) -> None:
 
 
 def install_macro_recorder(mcp: Any) -> bool:
-    """Monkey-patch ``mcp.call_tool`` to intercept every tool call for recording.
+    """Monkey-patch ``mcp.call_tool`` and the low-level request handler to
+    intercept every tool call for recording.
 
     Idempotent: safe to call multiple times. Returns True if installed (or
     already installed), False on error.
     """
+    from mcp.types import CallToolRequest
+
+    # Patch 1: high-level mcp.call_tool (for programmatic direct calls)
     try:
         original = mcp.call_tool
-        if getattr(original, "_axon_macro_recorder", False):
+        if not getattr(original, "_axon_macro_recorder", False):
+
+            @functools.wraps(original)
+            async def recorded_call_tool(
+                name: str, arguments: dict[str, Any], **kwargs: Any
+            ) -> Any:
+                _maybe_record_call(name, arguments)
+                return await original(name, arguments, **kwargs)
+
+            recorded_call_tool._axon_macro_recorder = True  # type: ignore[attr-defined]
+            mcp.call_tool = recorded_call_tool
+    except Exception:
+        pass
+
+    # Patch 2: low-level request handler (for actual MCP protocol traffic)
+    try:
+        server = getattr(mcp, "_mcp_server", None)
+        if server is None:
+            return False
+        handlers = getattr(server, "request_handlers", None)
+        if handlers is None:
+            return False
+        original_handler = handlers.get(CallToolRequest)
+        if original_handler is None:
+            return False
+        if getattr(original_handler, "_axon_macro_recorder", False):
             return True
 
-        @functools.wraps(original)
-        async def recorded_call_tool(
-            name: str, arguments: dict[str, Any], **kwargs: Any
-        ) -> Any:
-            _maybe_record_call(name, arguments)
-            return await original(name, arguments, **kwargs)
+        @functools.wraps(original_handler)
+        async def recorded_handler(req: Any) -> Any:
+            try:
+                name = req.params.name
+                arguments = req.params.arguments or {}
+                _maybe_record_call(name, arguments)
+            except Exception:
+                pass
+            return await original_handler(req)
 
-        recorded_call_tool._axon_macro_recorder = True  # type: ignore[attr-defined]
-        mcp.call_tool = recorded_call_tool
+        recorded_handler._axon_macro_recorder = True  # type: ignore[attr-defined]
+        handlers[CallToolRequest] = recorded_handler
         return True
     except Exception:
         return False
@@ -206,7 +238,15 @@ def _load_macro(macro_id: str) -> dict | None:
 
 
 def _list_macros() -> list[dict]:
-    return _get_store().query(category=_MACRO_CATEGORY)
+    """Return all macros, deduplicated by key (latest entry wins)."""
+    all_entries = _get_store().query(category=_MACRO_CATEGORY)
+    # Semantic memory is append-only; keep only the newest entry per macro_id.
+    seen: dict[str, dict] = {}
+    for entry in all_entries:
+        key = entry.get("key", "")
+        if key:
+            seen[key] = entry
+    return list(seen.values())
 
 
 # ── Tool definitions ────────────────────────────────────────────────────────
