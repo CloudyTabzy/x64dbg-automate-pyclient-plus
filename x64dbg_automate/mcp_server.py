@@ -2317,6 +2317,25 @@ def session_summary(sandbox_id: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Phase 9 — Macro recorder (C4) dispatch-level interceptor
+# ---------------------------------------------------------------------------
+try:
+    from x64dbg_automate.api_runtime.api_macros import (
+        install_macro_recorder,
+        set_mcp_instance,
+    )
+
+    set_mcp_instance(mcp)
+    _MACRO_RECORDER_INSTALLED = install_macro_recorder(mcp)
+except Exception as _macro_rec_err:  # pragma: no cover - defensive
+    print(
+        f"Warning: failed to install macro recorder: {_macro_rec_err}",
+        file=sys.stderr,
+    )
+    _MACRO_RECORDER_INSTALLED = False
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

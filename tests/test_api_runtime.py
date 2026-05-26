@@ -1098,3 +1098,346 @@ class TestExceptionTools:
         assert r["success"]
         assert r["all_succeeded"]
         assert len(r["applied"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Macro record-replay (C4)
+# ---------------------------------------------------------------------------
+
+class TestMacroTools:
+    def test_macro_create_and_get(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import (
+            macro_create, macro_get, macro_delete,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        r = macro_create("test_macro", "A test macro", steps=[
+            {"tool": "get_threads", "params": {}}
+        ])
+        assert r["success"]
+        assert r["macro_id"] == "test_macro"
+        assert r["step_count"] == 1
+
+        g = macro_get("test_macro")
+        assert g["success"]
+        assert g["description"] == "A test macro"
+        assert len(g["steps"]) == 1
+
+        macro_delete("test_macro")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_create_duplicate_rejected(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import macro_create
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_dup.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_create("dup_macro")
+        r = macro_create("dup_macro")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.INVALID_STATE
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_list(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import macro_create, macro_list, macro_delete
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_list.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_create("m1", "First")
+        macro_create("m2", "Second")
+        r = macro_list()
+        assert r["success"]
+        assert r["total"] == 2
+        ids = {m["macro_id"] for m in r["macros"]}
+        assert ids == {"m1", "m2"}
+
+        macro_delete("m1")
+        macro_delete("m2")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_add_step(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import macro_create, macro_add_step, macro_get
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_add.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_create("add_test")
+        r = macro_add_step("add_test", "get_threads", {"sandbox_id": "aa11"})
+        assert r["success"]
+        assert r["step_count"] == 1
+
+        r2 = macro_add_step("add_test", "get_modules", {}, save_as="mods")
+        assert r2["step_count"] == 2
+
+        g = macro_get("add_test")
+        assert g["steps"][1].get("save_as") == "mods"
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_remove_step(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import (
+            macro_create, macro_add_step, macro_remove_step, macro_get,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_rm.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_create("rm_test")
+        macro_add_step("rm_test", "a", {})
+        macro_add_step("rm_test", "b", {})
+        macro_add_step("rm_test", "c", {})
+
+        r = macro_remove_step("rm_test", 1)
+        assert r["success"]
+        assert r["step_count"] == 2
+
+        g = macro_get("rm_test")
+        assert [s["tool"] for s in g["steps"]] == ["a", "c"]
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_run_with_mock_tools(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import (
+            macro_create, macro_add_step, macro_run,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_run.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_create("run_test")
+        macro_add_step("run_test", "memory_stats", {})
+        macro_add_step("run_test", "memory_list_keys", {}, save_as="keys")
+
+        r = macro_run("run_test")
+        assert r["success"]
+        assert r["total_steps"] == 2
+        assert r["executed_steps"] == 2
+        assert r["all_success"] is True
+        assert "keys" in r["saved"]
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_run_param_override(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import (
+            macro_create, macro_add_step, macro_run,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_override.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_create("override_test")
+        macro_add_step("override_test", "memory_query_findings",
+                        {"key": "{target}"})
+
+        r = macro_run("override_test", {"target": "sub_1234"})
+        assert r["success"]
+        assert r["results"][0]["success"] is True
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_run_stop_on_error(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import (
+            macro_create, macro_add_step, macro_run,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_stop.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_create("stop_test")
+        macro_add_step("stop_test", "memory_stats", {})
+        macro_add_step("stop_test", "nonexistent_tool_xyz", {})
+        macro_add_step("stop_test", "memory_list_keys", {})
+
+        r = macro_run("stop_test", stop_on_error=True)
+        assert r["success"]  # macro_run itself succeeds
+        assert r["executed_steps"] == 2  # stopped at the failed step
+        assert r["all_success"] is False
+
+        r2 = macro_run("stop_test", stop_on_error=False)
+        assert r2["executed_steps"] == 3  # continued through errors
+        assert r2["all_success"] is False
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_export_import(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import (
+            macro_create, macro_add_step, macro_export, macro_import, macro_get, macro_delete,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_ei.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_create("ei_test", "Export/import test")
+        macro_add_step("ei_test", "memory_stats", {})
+
+        exp = macro_export("ei_test")
+        assert exp["success"]
+        assert "export" in exp
+        assert "format_version" in exp["export"]
+
+        macro_delete("ei_test")
+
+        r = macro_import(exp["export"])
+        assert r["success"]
+        assert r["macro_id"] == "ei_test"
+
+        g = macro_get("ei_test")
+        assert g["description"] == "Export/import test"
+
+        macro_delete("ei_test")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_record_start_stop(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import (
+            macro_record_start, macro_record_stop, macro_get,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_rec.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        r = macro_record_start("rec_test", "Test recording")
+        assert r["success"]
+        assert r["status"] == "recording"
+
+        # Simulate a recorded call by injecting into active recordings directly
+        from x64dbg_automate.api_runtime.api_macros import _ACTIVE_RECORDINGS
+        _ACTIVE_RECORDINGS["rec_test"]["steps"].append(
+            {"tool": "memory_stats", "params": {}}
+        )
+        _ACTIVE_RECORDINGS["rec_test"]["steps"].append(
+            {"tool": "memory_list_keys", "params": {}}
+        )
+
+        s = macro_record_stop("rec_test")
+        assert s["success"]
+        assert s["saved"] is True
+        assert s["step_count"] == 2
+
+        g = macro_get("rec_test")
+        assert len(g["steps"]) == 2
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_record_duplicate_rejected(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import macro_record_start
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_rec_dup.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_record_start("dup_rec")
+        r = macro_record_start("dup_rec")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.INVALID_STATE
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_delete_not_found(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import macro_delete
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", "unused.jsonl")
+        monkeypatch.setattr(sem, "_store", None)
+
+        r = macro_delete("no_such_macro")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_macro_run_not_found(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import macro_run
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", "unused.jsonl")
+        monkeypatch.setattr(sem, "_store", None)
+
+        r = macro_run("no_such_macro")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_macro_run_empty_steps(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import macro_create, macro_run
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_empty.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        macro_create("empty_test")
+        r = macro_run("empty_test")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.INVALID_STATE
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_macro_import_invalid_json(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_macros import macro_import
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", "unused.jsonl")
+        monkeypatch.setattr(sem, "_store", None)
+
+        r = macro_import("not json")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_macro_read_only_blocks_unsafe(self, monkeypatch, manager):
+        from x64dbg_automate.api_runtime.api_macros import (
+            macro_create, macro_add_step, macro_run,
+        )
+        # Ensure patch_apply is registered in _UNSAFE_NAMES
+        from x64dbg_automate.api_runtime.api_patches import patch_apply  # noqa: F401
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_macros_ro.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+        monkeypatch.setenv("X64DBG_MCP_READ_ONLY", "1")
+
+        macro_create("ro_test")
+        macro_add_step("ro_test", "patch_apply", {"sandbox_id": "aa11", "address": "0x401000", "hex_bytes": "90"})
+
+        r = macro_run("ro_test")
+        assert r["success"]  # macro_run succeeds
+        assert r["all_success"] is False
+        assert "read-only" in r["results"][0]["error"].lower()
+
+        monkeypatch.delenv("X64DBG_MCP_READ_ONLY", raising=False)
+        if os.path.exists(tmp):
+            os.remove(tmp)

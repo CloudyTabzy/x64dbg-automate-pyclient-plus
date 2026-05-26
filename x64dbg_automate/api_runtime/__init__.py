@@ -39,6 +39,7 @@ def register_runtime_tools(mcp) -> int:
         api_composite,
         api_coverage,
         api_exceptions,
+        api_macros,
         api_memory,
         api_patches,
         api_sandbox,
