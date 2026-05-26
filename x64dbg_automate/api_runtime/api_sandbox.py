@@ -218,11 +218,20 @@ def sandbox_checkpoint(*, sandbox_id: str | None = None, name: str, regions: lis
                 return err(str(exc), ErrorType.BAD_ARGUMENT)
     try:
         cp = mgr.checkpoint(sandbox_id, name, parsed)
-    except (KeyError, SandboxError) as exc:
+    except KeyError as exc:
         return lookup_error(exc)
+    except SandboxError as exc:
+        # Preserve the actionable message from ensure_stopped or other SandboxErrors.
+        return err(str(exc), ErrorType.INVALID_STATE, sandbox_id=sandbox_id)
     except Exception as exc:  # noqa: BLE001
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
-    return ok(sandbox_id=sandbox_id, checkpoint=cp.to_info())
+
+    result = ok(sandbox_id=sandbox_id, checkpoint=cp.to_info())
+    # Surface capture warnings at the top level so agents don't miss them.
+    capture_warnings = [w for w in cp.warnings if "fail" in w.lower()]
+    if capture_warnings:
+        result["capture_warnings"] = capture_warnings
+    return result
 
 
 @tool

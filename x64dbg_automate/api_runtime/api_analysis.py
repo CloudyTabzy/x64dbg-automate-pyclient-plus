@@ -301,6 +301,7 @@ class _CallGraphNode:
     name: str
     module: str
     size: int = 0
+    size_estimated: bool = False
     node_type: str = "function"  # function | import | unresolved
 
 
@@ -347,6 +348,8 @@ class _CallGraphBuilder:
         self.nodes: dict[int, _CallGraphNode] = {}
         self.edges: list[_CallGraphEdge] = []
         self.visited: set[int] = set()
+        self._unresolved_counter: int = 0
+        self._diagnostics: list[str] = []
 
         # Module cache for fast address→module lookups
         self._modules: list[Any] = []
@@ -386,13 +389,18 @@ class _CallGraphBuilder:
 
     # ── Function boundaries ───────────────────────────────────────────────
 
-    def _get_function_bounds(self, addr: int) -> tuple[int, int] | None:
+    def _get_function_bounds(self, addr: int) -> tuple[int, int]:
         """Return (start, end) for the function containing ``addr``.
 
         Tries x64dbg's ``get_function`` first; falls back to a heuristic scan
         (backward for prologue, forward for RET) so we still work on images
         where auto-analysis hasn't run.
+
+        Unlike the previous version this never returns ``None`` — if every
+        method fails we return a safe default window so the caller can still
+        disassemble something.
         """
+        # 1. x64dbg's own analysis
         try:
             fb = self.client.get_function(addr)
             if fb:
@@ -400,23 +408,50 @@ class _CallGraphBuilder:
         except Exception:
             pass
 
-        # Heuristic fallback — scan backward for common prologues
-        try:
-            prologue_patterns = (b"\x55\x8B\xEC", b"\x55\x89\xE5", b"\x48\x89\x5C\x24")
-            scan_start = max(0, addr - 0x2000)
-            for off in range(addr, scan_start, -1):
+        # 2. Heuristic — scan backward for common prologues, then forward for RET
+        prologue_patterns = (
+            b"\x55\x8B\xEC",      # push ebp; mov ebp, esp
+            b"\x55\x89\xE5",      # push ebp; mov ebp, esp (AT&T)
+            b"\x48\x89\x5C\x24",  # mov [rsp+...], rbx (x64)
+            b"\x48\x8B\xC4",      # mov rax, rsp (MSVC x64)
+            b"\x40\x55",          # push rbp (x64 with REX)
+        )
+        scan_start = max(0, addr - 0x2000)
+        for off in range(addr, scan_start, -1):
+            try:
                 data = self.client.read_memory(off, 8)
-                if any(data.startswith(p) for p in prologue_patterns):
-                    func_start = off
-                    # Scan forward for RET
-                    for foff in range(addr, addr + 0x8000):
+            except Exception:
+                continue
+            if not data:
+                continue
+            if any(data.startswith(p) for p in prologue_patterns):
+                func_start = off
+                # Scan forward for RET (bounded to avoid runaway)
+                for foff in range(addr, min(addr + 0x8000, off + 0x20000)):
+                    try:
                         b = self.client.read_memory(foff, 1)
-                        if b == b"\xC3" or b == b"\xC2":
-                            return func_start, foff + 1
-                    return func_start, addr + 0x1000
-        except Exception:
-            pass
-        return None
+                    except Exception:
+                        break
+                    if b == b"\xC3" or b == b"\xC2":
+                        return func_start, foff + 1
+                return func_start, addr + 0x1000
+
+        # 3. Last resort — scan forward from addr looking for RET without prologue
+        for foff in range(addr, addr + 0x4000):
+            try:
+                b = self.client.read_memory(foff, 1)
+            except Exception:
+                break
+            if b == b"\xC3" or b == b"\xC2":
+                return addr, foff + 1
+
+        # 4. Absolute fallback — fixed 4 KiB window.  This guarantees we never
+        #    return None, which was the root cause of the "1-node" symptom
+        #    when all other methods failed.
+        self._diagnostics.append(
+            f"Could not determine bounds for 0x{addr:X}; using 4 KiB fallback"
+        )
+        return addr, addr + 0x1000
 
     # ── Disassembly ───────────────────────────────────────────────────────
 
@@ -521,7 +556,9 @@ class _CallGraphBuilder:
         mod_name, _ = self._module_for_addr(addr)
         name = name_hint or self._node_name(addr)
 
+        # Try to get size from x64dbg analysis; if that fails use the heuristic
         size = 0
+        size_estimated = False
         try:
             fb = self.client.get_function(addr)
             if fb:
@@ -529,11 +566,18 @@ class _CallGraphBuilder:
         except Exception:
             pass
 
+        if size == 0:
+            bounds = self._get_function_bounds(addr)
+            if bounds:
+                size = bounds[1] - bounds[0]
+                size_estimated = True
+
         node = _CallGraphNode(
             address=addr,
             name=name,
             module=mod_name,
             size=size,
+            size_estimated=size_estimated,
             node_type=node_type,
         )
         self.nodes[addr] = node
@@ -552,7 +596,8 @@ class _CallGraphBuilder:
         self._ensure_node(start_addr)
 
         max_depth_reached = 0
-        unresolved_indirect = 0
+        unresolved_indirect: list[dict] = []
+        truncated = False
 
         while queue and len(self.nodes) < self.max_nodes:
             addr, depth = queue.popleft()
@@ -562,14 +607,17 @@ class _CallGraphBuilder:
                 continue
 
             bounds = self._get_function_bounds(addr)
-            if bounds is None:
-                continue
             func_start, func_end = bounds
 
-            if addr in self.nodes and self.nodes[addr].size == 0:
-                self.nodes[addr] = dataclasses.replace(
-                    self.nodes[addr], size=func_end - func_start
-                )
+            # Update size for the currently-processed node if we got real bounds
+            if addr in self.nodes:
+                old = self.nodes[addr]
+                if old.size == 0 or old.size_estimated:
+                    real_size = func_end - func_start
+                    if real_size > old.size:
+                        self.nodes[addr] = dataclasses.replace(
+                            old, size=real_size, size_estimated=False
+                        )
 
             instructions = self._disassemble_function(func_start, func_end)
             for insn in instructions:
@@ -584,18 +632,14 @@ class _CallGraphBuilder:
                     continue
 
                 if target is None and edge_type == "indirect_call":
-                    unresolved_indirect += 1
-                    pseudo_id = f"indirect_{addr:X}_{insn.address:X}"
-                    pseudo_addr = hash(pseudo_id) & 0xFFFFFFFFFFFFFFFF
-                    self._ensure_node(pseudo_addr, node_type="unresolved", name_hint=pseudo_id)
-                    self.edges.append(
-                        _CallGraphEdge(
-                            source=addr,
-                            target=pseudo_addr,
-                            edge_type="unresolved",
-                            instruction_address=insn.address,
-                        )
-                    )
+                    # Record unresolved indirect call as metadata — do NOT
+                    # create a synthetic hash-based node (fixes A2).
+                    self._unresolved_counter += 1
+                    unresolved_indirect.append({
+                        "source": f"0x{addr:X}",
+                        "instruction_address": f"0x{insn.address:X}",
+                        "reason": extra or "unknown indirect target",
+                    })
                     continue
 
                 if target is None:
@@ -603,6 +647,7 @@ class _CallGraphBuilder:
 
                 # Respect max_nodes — skip new nodes when at limit
                 if target not in self.nodes and len(self.nodes) >= self.max_nodes:
+                    truncated = True
                     continue
 
                 target_mod, _ = self._module_for_addr(target)
@@ -629,17 +674,24 @@ class _CallGraphBuilder:
                     self.visited.add(target)
                     queue.append((target, depth + 1))
 
-        return self._to_dict(start_addr, max_depth_reached, unresolved_indirect)
+        return self._to_dict(
+            start_addr, max_depth_reached, unresolved_indirect, truncated
+        )
 
     # ── Serialization ─────────────────────────────────────────────────────
 
-    def _to_dict(self, start_addr: int, max_depth: int, unresolved: int) -> dict:
+    def _to_dict(
+        self, start_addr: int, max_depth: int, unresolved: list[dict], truncated: bool
+    ) -> dict:
         return {
             "start_node": f"0x{start_addr:X}",
             "total_nodes": len(self.nodes),
             "total_edges": len(self.edges),
             "max_depth_reached": max_depth,
-            "unresolved_indirect_calls": unresolved,
+            "truncated": truncated,
+            "unresolved_indirect_calls": len(unresolved),
+            "unresolved_calls_detail": unresolved,
+            "diagnostics": self._diagnostics,
             "nodes": [
                 {
                     "id": f"0x{n.address:X}",
@@ -647,6 +699,7 @@ class _CallGraphBuilder:
                     "name": n.name,
                     "module": n.module,
                     "size": n.size,
+                    "size_estimated": n.size_estimated,
                     "type": n.node_type,
                 }
                 for n in self.nodes.values()

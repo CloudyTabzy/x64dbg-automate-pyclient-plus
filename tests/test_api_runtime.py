@@ -2230,9 +2230,9 @@ class TestCallGraphBuilder:
         result = builder.build(0x401000)
 
         assert result["unresolved_indirect_calls"] == 1
-        assert result["total_edges"] == 1
-        assert result["edges"][0]["type"] == "unresolved"
-        assert result["nodes"][1]["type"] == "unresolved"
+        assert result["total_edges"] == 0
+        assert len(result["unresolved_calls_detail"]) == 1
+        assert result["unresolved_calls_detail"][0]["reason"] == "rax"
 
     def test_tool_entry_default_entry_point(self, manager, monkeypatch):
         from x64dbg_automate.api_runtime.api_analysis import graph_call_graph
@@ -2748,3 +2748,121 @@ class TestCheckpointDiff:
         r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="clean_a", checkpoint_b="clean_b")
         assert r["success"]
         assert r["summary"] == "No changes detected"
+
+
+# ---------------------------------------------------------------------------
+# ensure_stopped error-raising (A4/A5 fix)
+# ---------------------------------------------------------------------------
+
+class TestEnsureStopped:
+    """Verify ensure_stopped raises SandboxError on failure, and that
+    sandbox_checkpoint() surfaces those as INVALID_STATE responses."""
+
+    def test_is_running_throws_raises_sandbox_error(self):
+        from x64dbg_automate.api_runtime.supervisor import SandboxError, SandboxManager
+
+        client = MagicMock()
+        client.is_running.side_effect = RuntimeError("RPC dead")
+
+        with pytest.raises(SandboxError, match="Cannot determine running state"):
+            SandboxManager.ensure_stopped(client)
+
+    def test_pause_returns_false_raises_sandbox_error(self):
+        from x64dbg_automate.api_runtime.supervisor import SandboxError, SandboxManager
+
+        client = MagicMock()
+        client.is_running.return_value = True
+        client.pause.return_value = False
+
+        with pytest.raises(SandboxError, match="did not stop after pause"):
+            SandboxManager.ensure_stopped(client)
+
+    def test_pause_raises_exception_raises_sandbox_error(self):
+        from x64dbg_automate.api_runtime.supervisor import SandboxError, SandboxManager
+
+        client = MagicMock()
+        client.is_running.return_value = True
+        client.pause.side_effect = OSError("handle closed")
+
+        with pytest.raises(SandboxError, match="Pause command raised an error"):
+            SandboxManager.ensure_stopped(client)
+
+    def test_already_stopped_does_not_raise(self):
+        from x64dbg_automate.api_runtime.supervisor import SandboxManager
+
+        client = MagicMock()
+        client.is_running.return_value = False
+
+        SandboxManager.ensure_stopped(client)  # must not raise
+        client.pause.assert_not_called()
+
+    def test_checkpoint_invalid_state_when_running_check_fails(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_checkpoint
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.side_effect = RuntimeError("connection lost")
+
+        r = sandbox_checkpoint(sandbox_id="aa11", name="snap", regions=[])
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.INVALID_STATE
+        assert "Cannot determine running state" in r["error"]
+
+    def test_checkpoint_invalid_state_when_pause_times_out(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_checkpoint
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = True
+        sb.client.pause.return_value = False
+
+        r = sandbox_checkpoint(sandbox_id="aa11", name="snap", regions=[])
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.INVALID_STATE
+        assert "did not stop" in r["error"]
+
+    def test_checkpoint_capture_warnings_surfaced_on_partial_register_failure(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_checkpoint
+        from types import SimpleNamespace
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+
+        call_count = 0
+
+        def flaky_get_reg(reg):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 2:
+                raise RuntimeError("register unavailable")
+            return 0x1
+
+        sb.client.get_reg.side_effect = flaky_get_reg
+        sb.client.get_threads.return_value = []
+        sb.client.get_modules.return_value = []
+        sb.client.get_breakpoints.return_value = []
+        sb.client.get_peb.return_value = SimpleNamespace(
+            being_debugged=False, nt_global_flag=0, heap_flags=2, heap_force_flags=0
+        )
+
+        r = sandbox_checkpoint(sandbox_id="aa11", name="partial", regions=[])
+        assert r["success"]
+        assert "capture_warnings" in r
+        assert any("Partial register capture" in w for w in r["capture_warnings"])
+
+    def test_checkpoint_capture_warnings_surfaced_on_all_register_failure(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_checkpoint
+        from types import SimpleNamespace
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.get_reg.side_effect = RuntimeError("all registers failed")
+        sb.client.get_threads.return_value = []
+        sb.client.get_modules.return_value = []
+        sb.client.get_breakpoints.return_value = []
+        sb.client.get_peb.return_value = SimpleNamespace(
+            being_debugged=False, nt_global_flag=0, heap_flags=2, heap_force_flags=0
+        )
+
+        r = sandbox_checkpoint(sandbox_id="aa11", name="zeroregs", regions=[])
+        assert r["success"]
+        assert "capture_warnings" in r
+        assert any("CAPTURE FAILURE" in w for w in r["capture_warnings"])

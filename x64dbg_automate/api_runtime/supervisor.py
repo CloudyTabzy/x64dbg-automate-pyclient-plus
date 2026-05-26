@@ -369,12 +369,35 @@ class SandboxManager:
         client = self.get_client(sandbox_id)
         self._ensure_stopped(client)
 
+        cp_warnings: list[str] = [
+            "Restore writes GP registers + memory only; threads/modules/PEB are not restored."
+        ]
+
+        reg_names = self._reg_names(sandbox)
         registers: dict[str, int] = {}
-        for reg in self._reg_names(sandbox):
+        reg_failures: list[str] = []
+        for reg in reg_names:
             try:
                 registers[reg] = client.get_reg(reg)
-            except Exception:
-                pass  # subregister unavailable for this arch — skip
+            except Exception as exc:
+                reg_failures.append(f"{reg}: {exc}")
+
+        if reg_failures:
+            read_count = len(registers)
+            total_count = len(reg_names)
+            first_err = reg_failures[0]
+            if read_count == 0:
+                cp_warnings.append(
+                    f"CAPTURE FAILURE: 0/{total_count} registers read — all reads failed. "
+                    f"First error: {first_err}. "
+                    "Likely cause: process was running during capture (ensure_stopped race) "
+                    "or the RPC connection was lost."
+                )
+            else:
+                cp_warnings.append(
+                    f"Partial register capture: {read_count}/{total_count} registers read. "
+                    f"First failure: {first_err}"
+                )
 
         # None → auto-capture stack + instruction window; [] → no memory
         if regions is None:
@@ -384,8 +407,8 @@ class SandboxManager:
         for addr, size in regions:
             try:
                 memory[addr] = client.read_memory(addr, size)
-            except Exception:
-                pass  # unreadable region — skip silently
+            except Exception as exc:
+                cp_warnings.append(f"Memory read failed at 0x{addr:X} ({size} B): {exc}")
 
         threads_snapshot = _capture_threads(client)
         modules_snapshot = _capture_modules(client)
@@ -402,7 +425,7 @@ class SandboxManager:
             memory=memory,
             thread_count=thread_count,
             debuggee_pid=sandbox.debuggee_pid,
-            warnings=["Restore writes GP registers + memory only; threads/modules/PEB are not restored."],
+            warnings=cp_warnings,
             threads_snapshot=threads_snapshot,
             modules_snapshot=modules_snapshot,
             breakpoints_snapshot=breakpoints_snapshot,
@@ -454,12 +477,40 @@ class SandboxManager:
 
     @staticmethod
     def ensure_stopped(client: "X64DbgClient") -> None:
-        """Pause the debuggee if it is currently running. Safe to call when already stopped."""
+        """Pause the debuggee if it is currently running.
+
+        Raises:
+            SandboxError: if the running state cannot be determined, or if the
+                pause command fails to stop the process. All callers have an
+                outer ``except (KeyError, SandboxError)`` or
+                ``except Exception`` guard, so the error surfaces as a
+                structured ``INVALID_STATE`` response rather than propagating.
+        """
         try:
-            if client.is_running():
-                client.pause()
-        except Exception:
-            pass
+            running = client.is_running()
+        except Exception as exc:
+            raise SandboxError(
+                f"Cannot determine running state before capture: {exc}. "
+                "Check sandbox_info() and retry."
+            ) from exc
+
+        if not running:
+            return
+
+        try:
+            paused = client.pause()
+        except Exception as exc:
+            raise SandboxError(
+                f"Pause command raised an error: {exc}. "
+                "Call sandbox_pause() manually and retry."
+            ) from exc
+
+        if not paused:
+            raise SandboxError(
+                "Debuggee did not stop after pause command — it may be in a "
+                "transitional or undebuggable state. "
+                "Call sandbox_pause() explicitly and retry sandbox_checkpoint()."
+            )
 
     # Backward-compatibility alias — external callers should use ensure_stopped().
     _ensure_stopped = ensure_stopped
