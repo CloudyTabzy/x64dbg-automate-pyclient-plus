@@ -626,3 +626,315 @@ class TestSemanticMemory:
 
         if os.path.exists(tmp):
             os.remove(tmp)
+
+    def test_delete_key(self, monkeypatch):
+        from x64dbg_automate.api_runtime.semantic_memory import (
+            memory_delete_key, memory_list_keys, memory_record_finding,
+        )
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_semantic_delete.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        memory_record_finding(
+            category="function_identification",
+            key="sub_DELETE",
+            value={"role": "test"},
+        )
+        assert "sub_DELETE" in memory_list_keys()["keys"]
+
+        r = memory_delete_key("sub_DELETE")
+        assert r["success"]
+        assert r["removed"] == 1
+        assert "sub_DELETE" not in memory_list_keys()["keys"]
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_delete_key_not_found(self, monkeypatch):
+        from x64dbg_automate.api_runtime.semantic_memory import memory_delete_key
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        tmp = os.path.join(os.getcwd(), "test_semantic_delete2.jsonl")
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", tmp)
+        monkeypatch.setattr(sem, "_store", None)
+
+        r = memory_delete_key("nonexistent_key")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    def test_delete_key_empty_rejected(self, monkeypatch):
+        from x64dbg_automate.api_runtime.semantic_memory import memory_delete_key
+        import x64dbg_automate.api_runtime.semantic_memory as sem
+
+        monkeypatch.setattr(sem, "_DEFAULT_MEMORY_PATH", "unused.jsonl")
+        monkeypatch.setattr(sem, "_store", None)
+
+        r = memory_delete_key("")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+
+# ---------------------------------------------------------------------------
+# read_memory_range (chunked large reads)
+# ---------------------------------------------------------------------------
+
+class TestReadMemoryRange:
+    def test_basic_read(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import read_memory_range
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.return_value = b"\xde\xad\xbe\xef" * 4
+        r = read_memory_range(sandbox_id="aa11", address="0x401000", size=16)
+        assert r["success"]
+        assert r["address"] == "0x401000"
+        assert r["requested"] == 16
+        assert r["read"] == 16
+        assert r["hex"] == "deadbeef" * 4
+
+    def test_size_zero_rejected(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import read_memory_range
+
+        _mock_sandbox(manager)
+        r = read_memory_range(sandbox_id="aa11", address="0x401000", size=0)
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_size_exceeds_cap(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import read_memory_range
+
+        _mock_sandbox(manager)
+        r = read_memory_range(sandbox_id="aa11", address="0x401000", size=64 * 1024 * 1024 + 1)
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+        assert "hint" in r
+
+    def test_offset_slices_result(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import read_memory_range
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.return_value = b"\xaa\xbb\xcc\xdd"
+        r = read_memory_range(sandbox_id="aa11", address="0x401000", size=4, offset=2)
+        assert r["success"]
+        assert r["returned"] == 2
+        assert r["hex"] == "ccdd"
+
+    def test_unreadable_chunk_fills_zeros(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import read_memory_range
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.side_effect = OSError("access denied")
+        r = read_memory_range(sandbox_id="aa11", address="0x401000", size=4)
+        assert r["success"]
+        assert r["hex"] == "00000000"
+        assert "unreadable_chunks" in r
+
+    def test_sandbox_not_found(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import read_memory_range
+
+        r = read_memory_range(sandbox_id="ghost", address="0x401000", size=16)
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+
+# ---------------------------------------------------------------------------
+# Patch management (C5)
+# ---------------------------------------------------------------------------
+
+class TestPatchManagement:
+    def test_patch_apply_hex(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import patch_apply, patch_list
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.return_value = b"\x55\x89\xEC"
+        sb.client.write_memory.return_value = True
+        r = patch_apply(sandbox_id="aa11", address="0x401000", hex_bytes="90 90 90",
+                        description="NOP prologue")
+        assert r["success"]
+        assert r["original_bytes"] == "5589ec"
+        assert r["patched_bytes"] == "909090"
+        assert len(r["patch_id"]) == 8
+        # Verify stored in sandbox
+        pl = patch_list(sandbox_id="aa11")
+        assert pl["total"] == 1
+        assert pl["patches"][0]["description"] == "NOP prologue"
+
+    def test_patch_apply_asm(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import patch_apply
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.side_effect = [b"\x90" * 15, b"\x90"]  # original_buf, readback
+        sb.client.assemble_at.return_value = 1
+        r = patch_apply(sandbox_id="aa11", address="0x401000", asm="nop")
+        assert r["success"]
+        assert r["patched_bytes"] == "90"
+
+    def test_patch_apply_both_rejected(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import patch_apply
+
+        _mock_sandbox(manager)
+        r = patch_apply(sandbox_id="aa11", address="0x401000",
+                        hex_bytes="90", asm="nop")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_patch_apply_neither_rejected(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import patch_apply
+
+        _mock_sandbox(manager)
+        r = patch_apply(sandbox_id="aa11", address="0x401000")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_patch_apply_invalid_hex(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import patch_apply
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        r = patch_apply(sandbox_id="aa11", address="0x401000", hex_bytes="ZZ ZZ")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_patch_rollback(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import patch_apply, patch_rollback, patch_list
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.return_value = b"\x55\x89\xEC"
+        sb.client.write_memory.return_value = True
+        pr = patch_apply(sandbox_id="aa11", address="0x401000", hex_bytes="909090")
+        pid = pr["patch_id"]
+
+        # Rollback
+        r = patch_rollback(sandbox_id="aa11", patch_id=pid)
+        assert r["success"]
+        assert r["original_bytes_restored"] == "5589ec"
+        # Patch list should now be empty
+        assert patch_list(sandbox_id="aa11")["total"] == 0
+
+    def test_patch_rollback_not_found(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import patch_rollback
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        r = patch_rollback(sandbox_id="aa11", patch_id="deadbeef")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_patch_rollback_all(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import patch_apply, patch_rollback_all, patch_list
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.return_value = b"\x90"
+        sb.client.write_memory.return_value = True
+        patch_apply(sandbox_id="aa11", address="0x401000", hex_bytes="90")
+        patch_apply(sandbox_id="aa11", address="0x401001", hex_bytes="90")
+        r = patch_rollback_all(sandbox_id="aa11")
+        assert r["success"]
+        assert r["restored"] == 2
+        assert patch_list(sandbox_id="aa11")["total"] == 0
+
+    def test_patch_export(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import patch_apply, patch_export
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.return_value = b"\x55"
+        sb.client.write_memory.return_value = True
+        patch_apply(sandbox_id="aa11", address="0x401000", hex_bytes="90", description="test")
+        r = patch_export(sandbox_id="aa11")
+        assert r["success"]
+        assert r["total"] == 1
+        assert r["patches"][0]["description"] == "test"
+
+
+# ---------------------------------------------------------------------------
+# Symbol and type information (C8)
+# ---------------------------------------------------------------------------
+
+class TestSymbolTools:
+    def test_resolve_ordinal_found(self, tmp_path):
+        from unittest.mock import patch as mpatch
+        from x64dbg_automate.api_runtime.api_symbols import resolve_ordinal
+
+        with mpatch("x64dbg_automate.external.pe_analyzer.get_exports") as mock_exp:
+            mock_exp.return_value = [
+                {"name": "CreateFileA", "ordinal": 1, "virtual_address": 0x1000},
+                {"name": "CloseHandle", "ordinal": 2, "virtual_address": 0x2000},
+            ]
+            r = resolve_ordinal("kernel32.dll", 2)
+        assert r["success"]
+        assert r["name"] == "CloseHandle"
+        assert r["ordinal"] == 2
+
+    def test_resolve_ordinal_not_found(self, tmp_path):
+        from unittest.mock import patch as mpatch
+        from x64dbg_automate.api_runtime.api_symbols import resolve_ordinal
+
+        with mpatch("x64dbg_automate.external.pe_analyzer.get_exports") as mock_exp:
+            mock_exp.return_value = [{"name": "Foo", "ordinal": 1, "virtual_address": 0x1000}]
+            r = resolve_ordinal("test.dll", 99)
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_get_type_layout_unicode_string_x64(self):
+        from x64dbg_automate.api_runtime.api_symbols import get_type_layout
+
+        r = get_type_layout("UNICODE_STRING", arch="x64")
+        assert r["success"]
+        assert r["type_name"] == "UNICODE_STRING"
+        assert r["pointer_size"] == 8
+        names = [f["name"] for f in r["fields"]]
+        assert "Length" in names
+        assert "Buffer" in names
+
+    def test_get_type_layout_unknown_type(self):
+        from x64dbg_automate.api_runtime.api_symbols import get_type_layout
+
+        r = get_type_layout("BOGUS_STRUCT")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_get_type_layout_bad_arch(self):
+        from x64dbg_automate.api_runtime.api_symbols import get_type_layout
+
+        r = get_type_layout("PEB", arch="arm64")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_get_type_info_unicode_string(self, manager):
+        from x64dbg_automate.api_runtime.api_symbols import get_type_info
+
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.client.is_running.return_value = False
+        # UNICODE_STRING x64: Length(u16)=10, MaxLen(u16)=20, pad(4), Buffer(ptr)=0xDEAD0000
+        import struct
+        raw = struct.pack("<HH", 10, 20) + b"\x00" * 4 + struct.pack("<Q", 0xDEAD0000)
+        # Extra bytes so read_memory returns enough
+        raw += b"\x00" * 32
+        sb.client.read_memory.return_value = raw
+        sb.client.get_symbol_at.return_value = None
+        r = get_type_info(sandbox_id="aa11", address="0x500000", type_name="UNICODE_STRING")
+        assert r["success"]
+        assert r["type_name"] == "UNICODE_STRING"
+        fields = {f["name"]: f["value"] for f in r["fields"]}
+        assert fields["Length"] == "0xA"
+        assert fields["Buffer"] == "0xDEAD0000"
+
+    def test_get_type_info_unknown_type(self, manager):
+        from x64dbg_automate.api_runtime.api_symbols import get_type_info
+
+        _mock_sandbox(manager)
+        r = get_type_info(sandbox_id="aa11", address="0x401000", type_name="BOGUS")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND

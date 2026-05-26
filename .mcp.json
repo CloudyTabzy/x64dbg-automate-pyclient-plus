@@ -1,11 +1,11 @@
 {
   "mcpServers": {
     "x64dbg": {
-      "command": "poetry",
-      "args": ["run", "x64dbg-automate-mcp"],
+      "command": "python",
+      "args": ["-m", "x64dbg_automate.mcp_server"],
       "cwd": ".",
       "env": {
-        "X64DBG_PATH": "C:\\re\\x64dbg_dev\\release\\x96dbg.exe"
+        "X64DBG_PATH": "C:\\Dev\\RE_Tools\\snapshot_2025-08-19_19-40\\release\\x96dbg.exe"
       }
     }
   }

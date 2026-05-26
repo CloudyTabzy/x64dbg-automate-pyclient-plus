@@ -9,8 +9,8 @@ from __future__ import annotations
 import struct
 
 from x64dbg_automate.api_runtime.registry import tool
-from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, lookup_error, ok, to_hex
-from x64dbg_automate.api_runtime.runtime_helpers import resolve_addr
+from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, is_bug, lookup_error, ok, to_hex
+from x64dbg_automate.api_runtime.runtime_helpers import disasm_instructions, resolve_addr
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 from x64dbg_automate.api_runtime.utils import parse_region
 from x64dbg_automate.external.entropy import shannon_entropy
@@ -105,6 +105,8 @@ def read_struct(*, sandbox_id: str | None = None, schema: str, address: str = ""
                 sbox=to_hex(data),
             )
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
 
     return err(f"Unknown schema '{schema}'.", ErrorType.BAD_ARGUMENT,
@@ -136,9 +138,11 @@ def find_initialized_data(
         return lookup_error(exc)
 
     try:
-        mgr._ensure_stopped(client)
+        mgr.ensure_stopped(client)
         pages = client.memmap()
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
 
     candidates: list[dict] = []
@@ -218,6 +222,8 @@ def resolve_iat_slot(*, sandbox_id: str | None = None, address: str) -> dict:
         if page is not None:
             module = page.info
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
 
     return ok(
@@ -252,6 +258,8 @@ def memory_search_pattern(*, sandbox_id: str | None = None, address: str, size: 
         data = client.read_memory(base, size)
         offsets = scan_pattern(data, pattern)
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     matches = [f"0x{base + off:X}" for off in offsets[:200]]
     return ok(
@@ -263,6 +271,90 @@ def memory_search_pattern(*, sandbox_id: str | None = None, address: str, size: 
         total=len(offsets),
         truncated=len(offsets) > len(matches),
     )
+
+
+@tool
+def read_memory_range(
+    *,
+    sandbox_id: str | None = None,
+    address: str,
+    size: int,
+    chunk_size: int = 65536,
+    offset: int = 0,
+) -> dict:
+    """Read a large memory region in one call, returning hex-encoded chunks.
+
+    Designed for reading multi-MB regions (SecuROM Stext section is ~10 MB) without
+    the 4096-byte cap of the legacy ``read_memory`` tool. Reads are done in
+    ``chunk_size``-byte pieces and reassembled.
+
+    Args:
+        sandbox_id: Sandbox to read from.
+        address: Region start (address, symbol, or expression).
+        size: Total bytes to read (max 64 MiB).
+        chunk_size: Internal read chunk (default 64 KiB; reduce if hitting RPC timeouts).
+        offset: Skip this many bytes from the start before returning data (for pagination).
+    """
+    _MAX_READ = 64 * 1024 * 1024  # 64 MiB hard cap
+
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    try:
+        base = resolve_addr(client, address)
+    except ValueError as exc:
+        return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+
+    if size <= 0:
+        return err("size must be > 0.", ErrorType.BAD_ARGUMENT)
+    if size > _MAX_READ:
+        return err(f"size exceeds 64 MiB limit ({size} bytes requested).", ErrorType.BAD_ARGUMENT,
+                   hint="Use paginated reads with offset to read sections incrementally.")
+
+    chunk_size = max(256, min(chunk_size, 4 * 1024 * 1024))
+
+    try:
+        mgr.ensure_stopped(client)
+        buf = bytearray()
+        pos = 0
+        failed_chunks: list[str] = []
+        while pos < size:
+            this = min(chunk_size, size - pos)
+            try:
+                data = client.read_memory(base + pos, this)
+                buf.extend(data)
+                pos += len(data)
+                if len(data) < this:
+                    break  # short read — likely hit unmapped page
+            except Exception:
+                # Unreadable sub-region — fill with zeros and continue.
+                buf.extend(b"\x00" * this)
+                failed_chunks.append(f"0x{base + pos:X}+{this:#x}")
+                pos += this
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    payload = bytes(buf)
+    if offset:
+        payload = payload[offset:]
+
+    result = ok(
+        sandbox_id=sandbox_id,
+        address=f"0x{base:X}",
+        requested=size,
+        read=len(buf),
+        offset=offset,
+        returned=len(payload),
+        hex=payload.hex(),
+    )
+    if failed_chunks:
+        result["unreadable_chunks"] = failed_chunks
+    return result
 
 
 @tool
@@ -354,23 +446,11 @@ def disassemble_range(*,
         return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
 
     count = max(1, min(count, 128))
-    instructions: list[dict] = []
-    cur = base
     try:
-        for _ in range(count):
-            ins = client.disassemble_at(cur)
-            if ins is None:
-                break
-            instructions.append({
-                "address": f"0x{cur:X}",
-                "bytes": to_hex(client.read_memory(cur, ins.instr_size)),
-                "mnemonic": ins.instruction,
-                "size": ins.instr_size,
-            })
-            cur += ins.instr_size
-            if ins.instruction.strip().lower().startswith("ret"):
-                break
+        instructions = disasm_instructions(client, base, count)
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
 
     return ok(sandbox_id=sandbox_id, start=f"0x{base:X}", instructions=instructions, total=len(instructions))
@@ -392,6 +472,8 @@ def get_call_stack(sandbox_id: str | None = None) -> dict:
     try:
         frames = client.get_call_stack()
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
 
     stack = []

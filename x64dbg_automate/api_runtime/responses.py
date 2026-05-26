@@ -101,3 +101,14 @@ def classify_exception(exc: BaseException) -> str:
     if "not connected" in msg or "no active" in msg:
         return ErrorType.NOT_CONNECTED
     return ErrorType.UNKNOWN
+
+
+def is_bug(exc: BaseException) -> bool:
+    """Return True if this exception signals a programming error that should propagate.
+
+    Bare ``except Exception`` clauses in tools catch everything, including
+    ``AttributeError`` from a misspelled method name.  By re-raising those we
+    keep real bugs visible during development while still returning structured
+    errors for genuine runtime failures.
+    """
+    return isinstance(exc, (AttributeError, NameError, NotImplementedError))

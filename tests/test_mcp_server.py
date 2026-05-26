@@ -289,7 +289,8 @@ class TestListSessions:
         mock_cls.list_sessions.return_value = []
         result = mcp_mod.list_sessions()
         assert result["success"] is True
-        assert result["total_legacy"] == 0
+        assert result["total"] == 0
+        assert "sessions" in result
 
     @patch.object(mcp_mod, "X64DbgClient")
     def test_with_sessions(self, mock_cls):
@@ -302,7 +303,9 @@ class TestListSessions:
         mock_cls.list_sessions.return_value = [session]
         result = mcp_mod.list_sessions()
         assert result["success"] is True
-        assert result["total_legacy"] == 1
+        # Unregistered instances appear in available_unconnected, not sessions.
+        assert len(result["available_unconnected"]) == 1
+        assert result["available_unconnected"][0]["debugger_pid"] == 1234
 
     @patch.object(mcp_mod, "X64DbgClient")
     def test_with_sessions_empty_cmdline(self, mock_cls):
@@ -315,7 +318,7 @@ class TestListSessions:
         mock_cls.list_sessions.return_value = [session]
         result = mcp_mod.list_sessions()
         assert result["success"] is True
-        assert result["total_legacy"] == 1
+        assert len(result["available_unconnected"]) == 1
 
     @patch.object(mcp_mod, "X64DbgClient")
     def test_with_sessions_whitespace_cmdline(self, mock_cls):
@@ -328,14 +331,16 @@ class TestListSessions:
         mock_cls.list_sessions.return_value = [session]
         result = mcp_mod.list_sessions()
         assert result["success"] is True
-        assert result["total_legacy"] == 1
+        assert len(result["available_unconnected"]) == 1
 
     @patch.object(mcp_mod, "X64DbgClient")
     def test_exception_returns_error(self, mock_cls):
+        # list_sessions() swallows X64DbgClient.list_sessions() errors gracefully;
+        # the tool still succeeds with zero available_unconnected entries.
         mock_cls.list_sessions.side_effect = NotImplementedError("Windows only")
         result = mcp_mod.list_sessions()
-        assert result["success"] is False
-        assert "Windows only" in result["error"]
+        assert result["success"] is True
+        assert result["available_unconnected"] == []
 
 
 class TestStartSession:
@@ -618,24 +623,39 @@ class TestSetBreakpoint:
     def test_software_bp(self, mock_client):
         mock_client.set_breakpoint.return_value = True
         result = mcp_mod.set_breakpoint("0x401000")
-        assert "set" in result.lower()
+        assert result["success"] is True
+        assert result["type"] == "software"
 
     def test_hardware_bp(self, mock_client):
         mock_client.set_hardware_breakpoint.return_value = True
         result = mcp_mod.set_breakpoint("0x401000", bp_type="hardware", hardware_mode="x")
         mock_client.set_hardware_breakpoint.assert_called_once()
-        assert "set" in result.lower()
+        assert result["success"] is True
 
     def test_memory_bp(self, mock_client):
         mock_client.set_memory_breakpoint.return_value = True
         result = mcp_mod.set_breakpoint("0x401000", bp_type="memory")
         mock_client.set_memory_breakpoint.assert_called_once()
-        assert "set" in result.lower()
+        assert result["success"] is True
 
     def test_symbol_name(self, mock_client):
         mock_client.set_breakpoint.return_value = True
         result = mcp_mod.set_breakpoint("kernel32:CreateFileA")
-        assert "set" in result.lower()
+        assert result["success"] is True
+
+    def test_failure_returns_hint(self, mock_client):
+        mock_client.set_breakpoint.return_value = False
+        mock_client.virt_query.return_value = None
+        result = mcp_mod.set_breakpoint("0x401000")
+        assert result["success"] is False
+        assert "hint" in result
+
+    def test_condition_applied(self, mock_client):
+        mock_client.set_breakpoint.return_value = True
+        mock_client.cmd_sync.return_value = True
+        result = mcp_mod.set_breakpoint("0x401000", condition="eax == 1")
+        assert result["success"] is True
+        mock_client.cmd_sync.assert_called_once()
 
 
 class TestClearBreakpoint:
@@ -863,6 +883,63 @@ class TestGui:
 # ---------------------------------------------------------------------------
 # Error path tests
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# PE exports tool tests
+# ---------------------------------------------------------------------------
+
+class TestGetPeExports:
+    @patch("x64dbg_automate.mcp_server.get_exports")
+    def test_lists_exports(self, mock_get_exports):
+        mock_get_exports.return_value = [
+            {"name": "CreateFileA", "ordinal": 1, "virtual_address": 0x1000},
+            {"name": "CloseHandle", "ordinal": 2, "virtual_address": 0x2000},
+        ]
+        result = mcp_mod.get_pe_exports("C:\\Windows\\System32\\kernel32.dll")
+        assert "CreateFileA" in result
+        assert "CloseHandle" in result
+        assert "kernel32.dll" in result
+        assert "2 entries" in result
+
+    @patch("x64dbg_automate.mcp_server.get_exports")
+    def test_filter_name(self, mock_get_exports):
+        mock_get_exports.return_value = [
+            {"name": "CreateFileA", "ordinal": 1, "virtual_address": 0x1000},
+            {"name": "CloseHandle", "ordinal": 2, "virtual_address": 0x2000},
+        ]
+        result = mcp_mod.get_pe_exports("kernel32.dll", filter_name="create")
+        assert "CreateFileA" in result
+        assert "CloseHandle" not in result
+
+    @patch("x64dbg_automate.mcp_server.get_exports")
+    def test_no_exports_message(self, mock_get_exports):
+        mock_get_exports.return_value = []
+        result = mcp_mod.get_pe_exports("nodll.exe")
+        assert "No exports" in result
+
+    @patch("x64dbg_automate.mcp_server.get_exports")
+    def test_filter_yields_empty(self, mock_get_exports):
+        mock_get_exports.return_value = [
+            {"name": "CreateFileA", "ordinal": 1, "virtual_address": 0x1000},
+        ]
+        result = mcp_mod.get_pe_exports("kernel32.dll", filter_name="zzz_nomatch")
+        assert "No exports" in result
+
+    @patch("x64dbg_automate.mcp_server.get_exports")
+    def test_truncates_at_200(self, mock_get_exports):
+        mock_get_exports.return_value = [
+            {"name": f"Func{i}", "ordinal": i, "virtual_address": 0x1000 + i}
+            for i in range(250)
+        ]
+        result = mcp_mod.get_pe_exports("big.dll")
+        assert "50 more" in result
+
+    @patch("x64dbg_automate.mcp_server.get_exports")
+    def test_exception_returns_error(self, mock_get_exports):
+        mock_get_exports.side_effect = FileNotFoundError("file not found")
+        result = mcp_mod.get_pe_exports("missing.dll")
+        assert "Error" in result
+
 
 class TestErrorPaths:
     def test_no_connection_raises(self):

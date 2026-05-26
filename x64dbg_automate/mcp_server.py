@@ -124,32 +124,45 @@ def _format_memory(data: bytes, base: int) -> str:
 
 @mcp.tool()
 def list_sessions() -> dict:
-    """List all active x64dbg debugger instances and unified sessions. Does not require an active connection."""
-    try:
-        # Legacy lockfile sessions
-        raw_sessions = X64DbgClient.list_sessions()
-        legacy = []
-        for s in raw_sessions:
-            exe_path = s.cmdline[0].strip() if s.cmdline and s.cmdline[0].strip() else "unknown"
-            legacy.append({
-                "pid": s.pid,
-                "path": exe_path,
-                "window_title": s.window_title,
-                "req_rep_port": s.sess_req_rep_port,
-                "pub_sub_port": s.sess_pub_sub_port,
-            })
+    """List all managed debugger sessions.
 
-        # Unified sessions (legacy + sandbox)
+    Returns the unified sessions known to the session manager. Use the
+    ``session_id`` from these entries as ``sandbox_id`` for runtime tools.
+    Also includes any running x64dbg instances not yet connected (``available``).
+    """
+    try:
         mgr = _get_unified_manager()
-        unified = [s.to_info() for s in mgr.list_sandboxes()]
+        # Collect sandbox IDs (PIDs) already tracked so we can deduplicate.
+        tracked_pids = {s.debugger_pid for s in mgr.list_sandboxes()}
+
+        # Discover unregistered running x64dbg instances from lock files.
+        available = []
+        try:
+            for s in X64DbgClient.list_sessions():
+                if s.pid not in tracked_pids:
+                    exe_path = s.cmdline[0].strip() if s.cmdline and s.cmdline[0].strip() else "unknown"
+                    available.append({
+                        "debugger_pid": s.pid,
+                        "path": exe_path,
+                        "window_title": s.window_title,
+                        "req_rep_port": s.sess_req_rep_port,
+                        "pub_sub_port": s.sess_pub_sub_port,
+                        "hint": "Use connect_to_session(session_pid=...) to attach.",
+                    })
+        except Exception:
+            pass
+
+        sessions = []
+        for sb in mgr.list_sandboxes():
+            mgr.refresh_state(sb)
+            sessions.append(sb.to_info())
 
         return {
             "success": True,
-            "legacy_sessions": legacy,
-            "unified_sessions": unified,
+            "sessions": sessions,
             "active_session_id": mgr.get_active_session_id(),
-            "total_legacy": len(legacy),
-            "total_unified": len(unified),
+            "total": len(sessions),
+            "available_unconnected": available,
         }
     except Exception as e:
         return {"success": False, "error": str(e), "error_type": "LIST_FAILED"}
@@ -272,17 +285,18 @@ def disconnect() -> dict:
 def terminate_session() -> dict:
     """Terminate the connected x64dbg debugger process."""
     global _client
+    if _client is None:
+        return {"success": False, "error": "No active session.", "error_type": "NOT_CONNECTED",
+                "hint": "Call start_session or connect_to_session first."}
     try:
-        client = _require_client()
-        # Remove from unified manager
         mgr = _get_unified_manager()
         active = mgr.get_active_session_id()
         if active:
-            try:
-                mgr.destroy_sandbox(active)
-            except Exception:
-                pass
-        client.terminate_session()
+            # destroy_sandbox terminates the debugger via _safe_terminate — don't call again.
+            mgr.destroy_sandbox(active)
+        else:
+            # No sandbox registered; fall back to the raw client terminate.
+            _client.terminate_session()
         _client = None
         return {"success": True, "message": "Session terminated."}
     except Exception as e:
@@ -700,20 +714,22 @@ def set_breakpoint(
     hardware_mode: str = "x",
     memory_mode: str = "a",
     singleshot: bool = False,
-) -> str:
+    condition: str = "",
+) -> dict:
     """Set a breakpoint (software, hardware, or memory).
 
     Args:
-        address_or_symbol: Hex address or symbol name
-        bp_type: 'software', 'hardware', or 'memory'
-        name: Optional breakpoint name (software only)
-        hardware_mode: Hardware BP mode: 'r' (read), 'w' (write), 'x' (execute)
-        memory_mode: Memory BP mode: 'r', 'w', 'x', 'a' (access)
-        singleshot: Single-shot breakpoint
+        address_or_symbol: Hex address or symbol name.
+        bp_type: 'software', 'hardware', or 'memory'.
+        name: Optional label for the breakpoint (software only).
+        hardware_mode: Hardware BP type: 'r' (read), 'w' (write), 'x' (execute).
+        memory_mode: Memory BP type: 'r', 'w', 'x', 'a' (access).
+        singleshot: Remove after the first hit.
+        condition: x64dbg expression; breakpoint only fires when this evaluates non-zero.
+                   Example: 'eax == 0' or 'poi(rsp+8) == 1'.
     """
     try:
         client = _require_client()
-        # Parse address; if it fails, treat as symbol name
         try:
             addr: int | str = _parse_address_or_expression(address_or_symbol)
         except (ValueError, TypeError):
@@ -728,9 +744,56 @@ def set_breakpoint(
         else:
             result = client.set_breakpoint(addr, name=name, singleshoot=singleshot)
 
-        return f"Breakpoint set at {address_or_symbol}." if result else "Failed to set breakpoint."
+        if not result:
+            hint = _diagnose_bp_failure(client, addr)
+            return {
+                "success": False,
+                "error": f"Failed to set {bp_type} breakpoint at {address_or_symbol}.",
+                "address": address_or_symbol,
+                "hint": hint,
+            }
+
+        # Apply condition expression if requested (software breakpoints only).
+        condition_applied = False
+        if condition and bp_type == "software" and isinstance(addr, int):
+            try:
+                client.cmd_sync(f'SetBreakpointCondition {addr:#x}, "{condition}"')
+                condition_applied = True
+            except Exception:
+                pass  # BP is set; condition is best-effort
+
+        return {
+            "success": True,
+            "address": address_or_symbol,
+            "type": bp_type,
+            "singleshot": singleshot,
+            "condition": condition if condition_applied else None,
+        }
     except Exception as e:
-        return f"Error: {e}"
+        return {"success": False, "error": str(e), "error_type": "UNKNOWN"}
+
+
+def _diagnose_bp_failure(client, addr) -> str:
+    """Query memory at addr and return a human-readable explanation of why a BP failed."""
+    if not isinstance(addr, int):
+        return "Could not resolve address — check the symbol or expression."
+    try:
+        page = client.virt_query(addr)
+        if page is None:
+            return f"0x{addr:X} is not mapped in the process address space."
+        state = page.state
+        protect = page.protect & 0xFF
+        if state != 0x1000:  # not MEM_COMMIT
+            return f"Memory at 0x{addr:X} is not committed (state=0x{state:X}). Wrong address?"
+        if protect in (0x00, 0x01):  # PAGE_NOACCESS
+            return f"Memory at 0x{addr:X} has PAGE_NOACCESS (protect=0x{protect:X}). Cannot set SW breakpoint."
+        if protect in (0x02, 0x04):  # READONLY / READWRITE (data, not code)
+            return (f"Memory at 0x{addr:X} is data (protect=0x{protect:X}), not executable. "
+                    "Use a hardware breakpoint (bp_type='hardware', hardware_mode='x') instead.")
+        return (f"Memory at 0x{addr:X} looks valid (protect=0x{protect:X}, state=0x{state:X}). "
+                "x64dbg may need analysis — try running 'anal' first via execute_command.")
+    except Exception:
+        return "Could not query memory region for diagnostic info."
 
 
 @mcp.tool()
@@ -1524,6 +1587,36 @@ def get_pe_imports(pe_path: str, dll_filter: str = "") -> str:
 
 
 @mcp.tool()
+def get_pe_exports(pe_path: str, filter_name: str = "") -> str:
+    """List exported functions from a PE file (DLL or EXE with exports).
+
+    Useful for resolving DLL exports that SecuROM or the target binary calls by
+    ordinal, and for building a symbol map before attaching the debugger.
+
+    Args:
+        pe_path: Path to the PE file on disk.
+        filter_name: Optional substring filter on the export name.
+    """
+    try:
+        exports = get_exports(pe_path)
+        if filter_name:
+            exports = [e for e in exports if filter_name.lower() in (e.get("name") or "").lower()]
+        if not exports:
+            return f"No exports found in {os.path.basename(pe_path)}."
+        lines = [f"=== Exports ({os.path.basename(pe_path)}) — {len(exports)} entries ==="]
+        for exp in exports[:200]:
+            name = exp.get("name") or "<unnamed>"
+            ordinal = exp.get("ordinal", "?")
+            va = exp.get("virtual_address", 0)
+            lines.append(f"  [{ordinal:>5}]  {_format_address(va)}  {name}")
+        if len(exports) > 200:
+            lines.append(f"  ... and {len(exports) - 200} more (use filter_name to narrow results)")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
 def check_pe_security(pe_path: str) -> str:
     """Check PE security mitigations: NX, ASLR, CFG, Integrity Check."""
     try:
@@ -2019,6 +2112,208 @@ except Exception as _runtime_reg_err:  # pragma: no cover - defensive
         file=sys.stderr,
     )
     _RUNTIME_TOOLS_REGISTERED = 0
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure tools (C16) — health, version, orientation
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def health_check(sandbox_id: str = "") -> dict:
+    """Check debugger connection health and round-trip latency.
+
+    Returns server liveness, plugin responsiveness, version compatibility,
+    and the RPC round-trip time in milliseconds. Safe to call at any time —
+    always returns ``success: true``; failures appear as inline fields.
+
+    Args:
+        sandbox_id: Optional sandbox to ping; omit to use the active session or
+                    the legacy ``_client`` connection.
+    """
+    import time as _time
+    from x64dbg_automate import COMPAT_VERSION
+
+    result: dict = {"success": True, "server_alive": True, "debugger_connected": False,
+                    "client_version": COMPAT_VERSION}
+
+    mgr = _get_unified_manager()
+    client = None
+    try:
+        if sandbox_id:
+            client = mgr.get_client(sandbox_id)
+        elif _client is not None:
+            client = _client
+        else:
+            active = mgr.get_active_session_id()
+            if active:
+                client = mgr.get_client(active)
+    except Exception:
+        pass
+
+    if client is None:
+        result["hint"] = "No active session. Call start_session() or sandbox_create() first."
+        return result
+
+    try:
+        t0 = _time.perf_counter()
+        plugin_version = client._get_xauto_compat_version()
+        debugger_version = client.get_debugger_version()
+        rtt_ms = round((_time.perf_counter() - t0) * 1000, 2)
+        compatible = plugin_version == COMPAT_VERSION
+        result.update({
+            "debugger_connected": True,
+            "plugin_version": plugin_version,
+            "debugger_version": debugger_version,
+            "compatible": compatible,
+            "rtt_ms": rtt_ms,
+        })
+        if not compatible:
+            result["hint"] = (
+                f"Version mismatch: plugin={plugin_version}, client={COMPAT_VERSION}. "
+                "Rebuild and redeploy the x64dbg plugin."
+            )
+    except Exception as exc:
+        result.update({
+            "debugger_connected": False,
+            "error": str(exc),
+            "hint": "x64dbg may have crashed or the Axon_MCP plugin is not loaded.",
+        })
+
+    return result
+
+
+@mcp.tool()
+def get_plugin_version() -> dict:
+    """Return version compatibility strings for the plugin and Python client.
+
+    ``compatible: true`` means the plugin and client share the same
+    ``COMPAT_VERSION`` string (``Axon_MCP``). A mismatch means the plugin
+    binary is stale and needs to be rebuilt and redeployed.
+    """
+    from x64dbg_automate import COMPAT_VERSION
+
+    result: dict = {"success": True, "client_version": COMPAT_VERSION, "compatible": False}
+
+    mgr = _get_unified_manager()
+    client = None
+    try:
+        client = _client
+        if client is None:
+            active = mgr.get_active_session_id()
+            if active:
+                client = mgr.get_client(active)
+    except Exception:
+        pass
+
+    if client is None:
+        result["hint"] = "No active session — cannot query plugin version."
+        return result
+
+    try:
+        plugin_version = client._get_xauto_compat_version()
+        debugger_version = client.get_debugger_version()
+        result.update({
+            "plugin_version": plugin_version,
+            "debugger_version": debugger_version,
+            "compatible": plugin_version == COMPAT_VERSION,
+        })
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
+
+
+@mcp.tool()
+def session_summary(sandbox_id: str = "") -> dict:
+    """Generate a concise status snapshot for agent orientation.
+
+    Aggregates: active sandbox metadata, debugger state, current instruction
+    pointer and symbol, loaded-module count, active breakpoints, applied patch
+    count, checkpoint count, and semantic-memory statistics. Each section is
+    collected independently so a failure in one does not prevent the others.
+
+    Args:
+        sandbox_id: Sandbox to summarise; omit for the active session.
+    """
+    from x64dbg_automate.api_runtime.semantic_memory import _get_store
+
+    summary: dict = {"success": True}
+    mgr = _get_unified_manager()
+
+    # --- sandbox / client ---
+    client = None
+    try:
+        if sandbox_id:
+            sandbox = mgr.get_sandbox(sandbox_id)
+        else:
+            try:
+                sandbox = mgr.get_sandbox()
+            except KeyError:
+                sandbox = None
+        if sandbox is not None:
+            summary["sandbox"] = sandbox.to_info()
+            client = sandbox.client
+            summary["patches"] = {"total": len(sandbox.patches)}
+            summary["checkpoints"] = {"total": len(sandbox.checkpoints)}
+    except Exception as exc:
+        summary["sandbox_error"] = str(exc)
+
+    if client is None:
+        client = _client
+
+    # --- debugger state ---
+    dbg: dict = {}
+    if client is not None:
+        try:
+            dbg["is_debugging"] = client.is_debugging()
+            dbg["is_running"] = client.is_running()
+            try:
+                dbg["debuggee_pid"] = client.debugee_pid()
+            except Exception:
+                pass
+        except Exception as exc:
+            dbg["error"] = str(exc)
+
+        if dbg.get("is_debugging") and not dbg.get("is_running"):
+            try:
+                cip = client.get_reg("cip")
+                dbg["cip"] = f"0x{cip:X}"
+                sym = client.get_symbol_at(cip)
+                if sym and sym.undecoratedSymbol:
+                    dbg["cip_symbol"] = sym.undecoratedSymbol
+            except Exception:
+                pass
+    else:
+        dbg["error"] = "No active client. Call start_session() or connect_to_session() first."
+    summary["debugger"] = dbg
+
+    # --- modules ---
+    if client is not None:
+        try:
+            mods = client.get_modules()
+            summary["modules"] = {"total": len(mods)}
+        except Exception:
+            pass
+
+    # --- breakpoints ---
+    if client is not None:
+        try:
+            bps = client.get_breakpoints()
+            summary["breakpoints"] = {
+                "total": len(bps),
+                "enabled": sum(1 for bp in bps if bp.enabled),
+            }
+        except Exception:
+            pass
+
+    # --- semantic memory ---
+    try:
+        stats = _get_store().stats()
+        summary["semantic_memory"] = stats
+    except Exception as exc:
+        summary["semantic_memory"] = {"error": str(exc)}
+
+    return summary
 
 
 # ---------------------------------------------------------------------------

@@ -85,6 +85,7 @@ class ProcessSandbox:
     anti_debug_applied: bool = False
     last_error: str | None = None
     checkpoints: dict[str, Checkpoint] = field(default_factory=dict)
+    patches: list[dict] = field(default_factory=list)   # in-memory patch records
     client: "X64DbgClient | None" = None
 
     def to_info(self) -> dict:
@@ -100,6 +101,7 @@ class ProcessSandbox:
             "anti_debug_applied": self.anti_debug_applied,
             "created_at": self.created_at.isoformat(timespec="seconds"),
             "checkpoints": [cp.to_info() for cp in self.checkpoints.values()],
+            "patch_count": len(self.patches),
             "last_error": self.last_error,
         }
 
@@ -220,8 +222,8 @@ class SandboxManager:
             created_at=datetime.now(),
             target_exe=None,
             attach_pid=None,
-            debuggee_pid=None,
-            state="stopped",
+            debuggee_pid=self._safe_debuggee_pid(client),
+            state="stopped" if self._safe_is_debugging(client) else "created",
             client=client,
         )
         with self._lock:
@@ -343,12 +345,16 @@ class SandboxManager:
         return _GP_REGS_64 if sandbox.debugger_arch == "x64" else _GP_REGS_32
 
     @staticmethod
-    def _ensure_stopped(client: "X64DbgClient") -> None:
+    def ensure_stopped(client: "X64DbgClient") -> None:
+        """Pause the debuggee if it is currently running. Safe to call when already stopped."""
         try:
             if client.is_running():
                 client.pause()
         except Exception:
             pass
+
+    # Backward-compatibility alias — external callers should use ensure_stopped().
+    _ensure_stopped = ensure_stopped
 
     @staticmethod
     def _detect_arch(client: "X64DbgClient", bitness_exe: str) -> str:

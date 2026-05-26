@@ -56,6 +56,35 @@ def read_pointer(client: Any, arch: str, addr: int) -> int:
     return client.read_qword(addr) if arch == "x64" else client.read_dword(addr)
 
 
+def disasm_instructions(client: Any, addr: int, count: int) -> list[dict]:
+    """Disassemble ``count`` instructions starting at ``addr``, stopping at RET.
+
+    Returns a list of ``{address, bytes, mnemonic, size}`` dicts (bytes hex-encoded).
+    This is the shared core used by both :func:`api_memory.disassemble_range` and
+    the inline disassembly path in :func:`api_composite.capture_function_context`.
+    """
+    instructions: list[dict] = []
+    cur = addr
+    for _ in range(max(1, min(count, 512))):
+        ins = client.disassemble_at(cur)
+        if ins is None:
+            break
+        try:
+            raw = client.read_memory(cur, ins.instr_size)
+        except Exception:
+            raw = b""
+        instructions.append({
+            "address": f"0x{cur:X}",
+            "bytes": raw.hex(),
+            "mnemonic": ins.instruction,
+            "size": ins.instr_size,
+        })
+        cur += ins.instr_size
+        if ins.instruction.strip().lower().startswith("ret"):
+            break
+    return instructions
+
+
 def diff_bytes(before: bytes, after: bytes, max_runs: int = 64) -> list[dict]:
     """Group differing bytes into contiguous runs ``{offset, before, after}`` (hex strings)."""
     runs: list[dict] = []

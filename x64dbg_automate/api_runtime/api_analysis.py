@@ -9,7 +9,7 @@ with 3 basic blocks", "0x401000 is called from 5 locations").
 from __future__ import annotations
 
 from x64dbg_automate.api_runtime.registry import tool
-from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, lookup_error, ok, to_hex
+from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, is_bug, lookup_error, ok, to_hex
 from x64dbg_automate.api_runtime.runtime_helpers import resolve_addr
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 
@@ -31,6 +31,8 @@ def get_threads(sandbox_id: str | None = None) -> dict:
     try:
         threads = client.get_threads()
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     return ok(
         sandbox_id=sandbox_id,
@@ -60,6 +62,8 @@ def get_xrefs(*, sandbox_id: str | None = None, address: str) -> dict:
     try:
         xrefs = client.get_xrefs(addr)
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     return ok(
         sandbox_id=sandbox_id,
@@ -89,6 +93,8 @@ def get_function_boundaries(*, sandbox_id: str | None = None, address: str) -> d
     try:
         fb = client.get_function(addr)
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     if fb is None:
         return err(f"No function found at or near 0x{addr:X}.", ErrorType.NOT_FOUND,
@@ -128,6 +134,8 @@ def analyze_function_cfg(*, sandbox_id: str | None = None, address: str) -> dict
     try:
         cfg = client.analyze_function(entry)
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     if cfg is None:
         return err(f"Failed to analyze function at 0x{entry:X}.", ErrorType.INVALID_STATE,
@@ -177,6 +185,8 @@ def get_string_at(*, sandbox_id: str | None = None, address: str) -> dict:
     try:
         text = client.get_string_at(addr)
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     if not text:
         return err(f"No auto-detected string at 0x{addr:X}.", ErrorType.NOT_FOUND, sandbox_id=sandbox_id)
@@ -194,6 +204,8 @@ def get_patches(sandbox_id: str | None = None) -> dict:
     try:
         patches = client.get_patches()
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     return ok(
         sandbox_id=sandbox_id,
@@ -213,6 +225,8 @@ def get_modules(sandbox_id: str | None = None) -> dict:
     try:
         modules = client.get_modules()
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     return ok(
         sandbox_id=sandbox_id,
@@ -237,6 +251,8 @@ def get_seh_chain(sandbox_id: str | None = None) -> dict:
     try:
         records = client.get_seh_chain()
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     return ok(
         sandbox_id=sandbox_id,
@@ -260,6 +276,8 @@ def get_handles(sandbox_id: str | None = None) -> dict:
     try:
         handles = client.get_handles()
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
     return ok(
         sandbox_id=sandbox_id,

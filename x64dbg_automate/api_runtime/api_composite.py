@@ -9,9 +9,9 @@ from __future__ import annotations
 import time
 
 from x64dbg_automate.api_runtime.registry import tool
-from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, lookup_error, ok, to_hex
+from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, is_bug, lookup_error, ok, to_hex
 from x64dbg_automate.api_runtime.runtime_helpers import (
-    capture_registers, diff_bytes, read_pointer, resolve_addr,
+    capture_registers, diff_bytes, disasm_instructions, read_pointer, resolve_addr,
 )
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 from x64dbg_automate.api_runtime.utils import detect_crypto_constants, parse_region
@@ -111,7 +111,7 @@ def capture_function_context(*,
             result["memory_before"] = memory_before
 
         if include_disassembly:
-            result["disassembly"] = _disasm(client, target, 24)
+            result["disassembly"] = disasm_instructions(client, target, 24)
 
         # Return breakpoint: return address sits at the top of the stack on entry.
         sp = client.get_reg("rsp" if arch == "x64" else "esp")
@@ -144,23 +144,12 @@ def capture_function_context(*,
                 if crypto:
                     result["crypto_detected"] = crypto
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), **result)
 
     return ok(**result)
 
-
-def _disasm(client, addr: int, count: int) -> list[str]:
-    lines: list[str] = []
-    cur = addr
-    for _ in range(count):
-        ins = client.disassemble_at(cur)
-        if ins is None:
-            break
-        lines.append(f"0x{cur:X}  {ins.instruction}")
-        cur += ins.instr_size
-        if ins.instruction.strip().lower().startswith("ret"):
-            break
-    return lines
 
 
 @tool
@@ -195,7 +184,7 @@ def trace_until_memory_change(*,
         return err("size must be between 1 and 4 MiB.", ErrorType.BAD_ARGUMENT)
 
     try:
-        mgr._ensure_stopped(client)
+        mgr.ensure_stopped(client)
         before = client.read_memory(base, size)
         client.set_memory_breakpoint(base, bp_type=MemoryBreakpointType.w)
         deadline = time.time() + timeout_sec
@@ -216,6 +205,8 @@ def trace_until_memory_change(*,
                 break
         client.clear_memory_breakpoint(base)
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
 
     if not changed:
@@ -273,12 +264,14 @@ def find_crypto_material(
     findings: list[dict] = []
     bytes_scanned = 0
     try:
-        mgr._ensure_stopped(client)
+        mgr.ensure_stopped(client)
         for base, size in scan_regions:
             region_findings, scanned = _scan_region(client, base, size, scan_mode)
             findings.extend(region_findings)
             bytes_scanned += scanned
     except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
 
     findings.sort(key=lambda f: int(f["address"], 16))
@@ -327,7 +320,7 @@ def trace_execution(
     trace_log: list[dict] = []
 
     try:
-        mgr._ensure_stopped(client)
+        mgr.ensure_stopped(client)
         for step in range(max_steps):
             if time.time() > deadline:
                 return err("Trace exceeded timeout.", ErrorType.TIMEOUT,
@@ -355,7 +348,7 @@ def trace_execution(
                 if success and val:
                     break
 
-            client.step_into()
+            client.stepi()
             if not client.wait_until_stopped(5):
                 return err("Step did not complete (target may be running or dead).",
                            ErrorType.TIMEOUT, sandbox_id=sandbox_id,

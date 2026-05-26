@@ -137,6 +137,43 @@ class _SemanticMemoryStore:
                 return None
             return self._entries[indices[-1]]
 
+    def delete_by_key(self, key: str) -> int:
+        """Remove all entries for ``key`` from the in-memory index and rewrite the store.
+
+        Returns the number of entries removed. The underlying JSONL is rewritten without
+        the deleted entries so they don't reappear on the next server start.
+        """
+        with self._lock:
+            indices = set(self._index.pop(key, []))
+            if not indices:
+                return 0
+            # Rebuild tag/category index entries, removing references to deleted indices.
+            new_index: dict[str, list[int]] = {}
+            new_entries: list[dict] = []
+            remap: dict[int, int] = {}
+            for old_idx, entry in enumerate(self._entries):
+                if old_idx in indices:
+                    continue
+                new_idx = len(new_entries)
+                remap[old_idx] = new_idx
+                new_entries.append(entry)
+
+            for idx_key, idx_list in self._index.items():
+                new_index[idx_key] = [remap[i] for i in idx_list if i in remap]
+
+            self._entries = new_entries
+            self._index = new_index
+            # Persist updated store.
+            try:
+                os.makedirs(os.path.dirname(self._path), exist_ok=True)
+                with open(self._path, "w", encoding="utf-8") as f:
+                    for entry in self._entries:
+                        f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
+                        f.write("\n")
+            except Exception:
+                pass
+            return len(indices)
+
     def keys(self) -> list[str]:
         with self._lock:
             return sorted(
@@ -248,3 +285,25 @@ def memory_list_keys() -> dict:
 def memory_stats() -> dict:
     """Return statistics about the semantic memory store."""
     return ok(**_get_store().stats())
+
+
+@tool
+def memory_delete_key(key: str) -> dict:
+    """Delete all findings stored under a specific key.
+
+    Rewrites the on-disk JSONL so the deleted entries do not reappear on restart.
+    Use this to correct a wrongly recorded finding.
+
+    Args:
+        key: The exact key whose entries should be removed (e.g. 'sub_2ADEB7').
+    """
+    if not key or not key.strip():
+        return err("key must not be empty.", ErrorType.BAD_ARGUMENT)
+    try:
+        removed = _get_store().delete_by_key(key.strip())
+    except Exception as exc:  # noqa: BLE001
+        return err(str(exc), ErrorType.UNKNOWN)
+    if removed == 0:
+        return err(f"No entries found for key '{key}'.", ErrorType.NOT_FOUND,
+                   hint="Use memory_list_keys to see available keys.")
+    return ok(key=key, removed=removed)
