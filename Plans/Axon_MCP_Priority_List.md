@@ -103,10 +103,10 @@ These fill missing RE capabilities that are well-defined and implementable witho
 | 2.7a | **`checkpoint_diff`** — structured semantic diff between two checkpoints (registers, memory, threads, modules, breakpoints, patches, PEB) | C13 Visualization | Medium | High | Same-sandbox checkpoint comparison with human-readable summary. | ✅ Done |
 | 2.7b | **`sandbox_cross_diff`** — live cross-sandbox diff (registers, modules, threads, optional memory) | C13 Visualization | Medium | High | Compare two running sandboxes side-by-side. | ✅ Done |
 | 2.7c | **Concurrent sandbox inspection** — `sandbox_fleet_health`, `sandbox_batch_inspect`, `sandbox_sync_execution`, `sandbox_correlate_memory` | C16 Infrastructure | Medium | High | Parallel fleet-wide ops with divergence detection and rebase hints. | ✅ Done |
-| 2.8 | **`graph_memory_layout`** — structured memory map with anomaly highlights | C13 Visualization | Medium | Medium | Groups adjacent regions, flags high-entropy / RWX / non-module regions. | ⏳ Pending |
+| 2.8 | **`graph_memory_layout`** — structured memory map with anomaly highlights | C13 Visualization | Medium | Medium | Groups adjacent regions, flags high-entropy / RWX / non-module regions. | ✅ Done |
 | 2.9 | **`workflow_template_list` / `workflow_template_apply`** | C12 Collaboration | Medium | Medium | Reusable macro templates tagged with metadata (e.g., "capture_func_entry"). | ⏳ Pending |
-| 2.10 | **`tool_usage_stats`** — per-tool call counts, success rates, latency | C15 Orchestration | Low | Medium | Telemetry counter in MCP server. Helps optimize agent behavior. | ⏳ Pending |
-| 2.11 | **`workflow_batch_cold_dump` as importable function** | Phase 5 Debt | Low | Low | Currently inline in `mcp_server.py`; should live in `workflows/protected_extract.py`. | ⏳ Pending |
+| 2.10 | **`tool_usage_stats`** — per-tool call counts, success rates, latency | C15 Orchestration | Low | Medium | Telemetry counter in MCP server. Helps optimize agent behavior. | ✅ Done |
+| 2.11 | **`workflow_batch_cold_dump` as importable function** | Phase 5 Debt | Low | Low | Removed from MCP server — launches external subprocesses that can hang indefinitely on protected targets, blocking the entire tool suite. Remains available as standalone CLI: `python -m x64dbg_automate.workflows.protected_extract`. | ❌ Removed |
 
 ---
 
@@ -197,10 +197,11 @@ Week 3+ (P3/P4 — architectural):
 | Total unique tools | 166 (82 legacy + 84 runtime) |
 | P0 resolved in 2026-05-26 batch | 6 / 6 |
 | P1 items resolved | 8 / 8 |
-| P2 items resolved | 8 / 15 |
-| P2 items pending | 7 |
+| P2 items resolved | 11 / 15 |
+| P2 items pending | 3 |
+| P2 items removed | 1 |
 | P3 items pending | 7 |
 | P4 items pending | 5 |
-| **Current score with P1+P2a done** | **8.7 / 10** |
-| **Target score with all P2 done** | **8.9 / 10** |
+| **Current score with P1+P2a done** | **8.9 / 10** |
+| **Target score with all P2 done** | **9.0 / 10** |
 | **Target score with P2+P3 done** | **9.2 / 10** |
