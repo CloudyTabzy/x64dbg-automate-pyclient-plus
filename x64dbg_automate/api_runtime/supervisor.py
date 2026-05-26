@@ -55,6 +55,12 @@ class Checkpoint:
     thread_count: int = 0
     debuggee_pid: int | None = None
     warnings: list[str] = field(default_factory=list)
+    # Semantic diff fields — always captured; not used by restore.
+    threads_snapshot: list[dict] = field(default_factory=list)
+    modules_snapshot: list[dict] = field(default_factory=list)
+    breakpoints_snapshot: list[dict] = field(default_factory=list)
+    patches_snapshot: list[dict] = field(default_factory=list)
+    peb_snapshot: dict | None = None
 
     def to_info(self) -> dict:
         """JSON-safe summary (no raw bytes)."""
@@ -66,8 +72,67 @@ class Checkpoint:
             "region_count": len(self.memory),
             "total_bytes": sum(len(b) for b in self.memory.values()),
             "thread_count": self.thread_count,
+            "module_count": len(self.modules_snapshot),
+            "breakpoint_count": len(self.breakpoints_snapshot),
+            "patch_count": len(self.patches_snapshot),
+            "peb": self.peb_snapshot,
             "warnings": self.warnings,
         }
+
+
+def _auto_regions(registers: dict[str, int], arch: str) -> list[tuple[int, int]]:
+    """Return auto-capture regions: stack (256 B from SP) + instruction window (96 B around IP)."""
+    sp_key = "rsp" if arch == "x64" else "esp"
+    ip_key = "rip" if arch == "x64" else "eip"
+    regions: list[tuple[int, int]] = []
+    sp = registers.get(sp_key, 0)
+    ip = registers.get(ip_key, 0)
+    if sp:
+        regions.append((sp, 256))
+    if ip:
+        regions.append((max(0, ip - 16), 96))
+    return regions
+
+
+def _capture_threads(client) -> list[dict]:
+    try:
+        return [
+            {"thread_id": t.thread_id, "cip": t.cip, "suspend_count": t.suspend_count,
+             "priority": t.priority, "name": t.name}
+            for t in (client.get_threads() or [])
+        ]
+    except Exception:
+        return []
+
+
+def _capture_modules(client) -> list[dict]:
+    try:
+        return [{"base": m.base, "name": m.name, "size": m.size}
+                for m in (client.get_modules() or [])]
+    except Exception:
+        return []
+
+
+def _capture_breakpoints(client) -> list[dict]:
+    try:
+        from x64dbg_automate.models import BreakpointType
+        bps: list[dict] = []
+        for bt in (BreakpointType.BpNormal, BreakpointType.BpHardware, BreakpointType.BpMemory):
+            for bp in (client.get_breakpoints(bt) or []):
+                bps.append({"addr": bp.addr, "type": bt.value, "enabled": bp.enabled,
+                             "hit_count": bp.hitCount, "name": bp.name})
+        return bps
+    except Exception:
+        return []
+
+
+def _capture_peb(client) -> dict | None:
+    try:
+        peb = client.get_peb()
+        return {"being_debugged": peb.being_debugged, "nt_global_flag": peb.nt_global_flag,
+                "heap_flags": peb.heap_flags, "heap_force_flags": peb.heap_force_flags}
+    except Exception:
+        return None
 
 
 @dataclass
@@ -292,7 +357,14 @@ class SandboxManager:
         name: str,
         regions: list[tuple[int, int]] | None = None,
     ) -> Checkpoint:
-        """Capture a best-effort userland snapshot (registers + chosen regions)."""
+        """Capture a best-effort userland snapshot.
+
+        Captures GP registers, semantic state (threads, modules, breakpoints, patches,
+        PEB), and memory regions. When *regions* is ``None``, the current stack window
+        (SP to SP+256) and instruction window (IP-16 to IP+80) are auto-captured so
+        zero-configuration checkpoints are useful for diffing. Pass *regions=[]* to
+        skip memory capture entirely.
+        """
         sandbox = self.get_sandbox(sandbox_id)
         client = self.get_client(sandbox_id)
         self._ensure_stopped(client)
@@ -304,11 +376,23 @@ class SandboxManager:
             except Exception:
                 pass  # subregister unavailable for this arch — skip
 
-        memory: dict[int, bytes] = {}
-        for addr, size in (regions or []):
-            memory[addr] = client.read_memory(addr, size)
+        # None → auto-capture stack + instruction window; [] → no memory
+        if regions is None:
+            regions = _auto_regions(registers, sandbox.debugger_arch)
 
-        thread_count = self._count_threads(sandbox.debuggee_pid)
+        memory: dict[int, bytes] = {}
+        for addr, size in regions:
+            try:
+                memory[addr] = client.read_memory(addr, size)
+            except Exception:
+                pass  # unreadable region — skip silently
+
+        threads_snapshot = _capture_threads(client)
+        modules_snapshot = _capture_modules(client)
+        breakpoints_snapshot = _capture_breakpoints(client)
+        patches_snapshot = list(sandbox.patches)
+        peb_snapshot = _capture_peb(client)
+        thread_count = len(threads_snapshot) if threads_snapshot else self._count_threads(sandbox.debuggee_pid)
 
         cp = Checkpoint(
             name=name,
@@ -318,10 +402,12 @@ class SandboxManager:
             memory=memory,
             thread_count=thread_count,
             debuggee_pid=sandbox.debuggee_pid,
-            warnings=[
-                "Checkpoint captures only active-thread registers + chosen memory.",
-                "Kernel handles, new threads, and mapped file state are NOT restored.",
-            ],
+            warnings=["Restore writes GP registers + memory only; threads/modules/PEB are not restored."],
+            threads_snapshot=threads_snapshot,
+            modules_snapshot=modules_snapshot,
+            breakpoints_snapshot=breakpoints_snapshot,
+            patches_snapshot=patches_snapshot,
+            peb_snapshot=peb_snapshot,
         )
         sandbox.checkpoints[name] = cp
         return cp

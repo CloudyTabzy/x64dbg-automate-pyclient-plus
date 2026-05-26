@@ -187,23 +187,35 @@ def sandbox_pause(sandbox_id: str | None = None) -> dict:
 
 @tool
 def sandbox_checkpoint(*, sandbox_id: str | None = None, name: str, regions: list[str] | None = None) -> dict:
-    """Save a best-effort userland checkpoint: active-thread registers + chosen memory regions.
+    """Save a best-effort userland checkpoint: registers + semantic state + memory.
+
+    Always captures: GP registers, thread list, module list, breakpoints, applied
+    patches, and PEB fields. When *regions* is omitted, also auto-captures the
+    current stack window (SP to SP+256) and instruction window (IP-16 to IP+80) —
+    making zero-configuration checkpoints useful for ``checkpoint_diff``. Pass
+    ``regions=[]`` to skip memory entirely.
 
     This is NOT a kernel-level process fork — handles, new threads, and kernel object
-    state are not captured. It is ideal for "retry this trace from a known point".
+    state are NOT restored. Use ``sandbox_restore`` to write back registers + memory.
 
     Args:
         sandbox_id: Sandbox to snapshot.
-        name: Checkpoint label (re-using a name overwrites it).
-        regions: Memory regions to capture as 'addr:size' strings (e.g. ['0x7FF6A0001000:4096']).
+        name: Checkpoint label (re-using a name overwrites the previous one).
+        regions: Memory regions as 'addr:size' strings (e.g. ['0x401000:4096']).
+                 Omit to auto-capture stack + instruction window. Pass [] to skip memory.
     """
     mgr = get_manager()
-    parsed: list[tuple[int, int]] = []
-    for spec in (regions or []):
-        try:
-            parsed.append(parse_region(spec))
-        except ValueError as exc:
-            return err(str(exc), ErrorType.BAD_ARGUMENT)
+    # None → pass None so the manager auto-captures stack + instruction window.
+    # Empty list → pass [] to skip memory entirely.
+    if regions is None:
+        parsed = None
+    else:
+        parsed = []
+        for spec in regions:
+            try:
+                parsed.append(parse_region(spec))
+            except ValueError as exc:
+                return err(str(exc), ErrorType.BAD_ARGUMENT)
     try:
         cp = mgr.checkpoint(sandbox_id, name, parsed)
     except (KeyError, SandboxError) as exc:

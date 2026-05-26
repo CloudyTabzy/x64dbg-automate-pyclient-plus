@@ -1870,3 +1870,881 @@ class TestInfrastructureTools:
 
         r = get_execution_log(sandbox_id="aa11", n=5)
         assert not r["success"]
+
+
+# ---------------------------------------------------------------------------
+# Call Graph Construction
+# ---------------------------------------------------------------------------
+
+class TestCallGraphBuilder:
+    def _make_builder(self, client, arch="x64", **kwargs):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+        return _CallGraphBuilder(client=client, arch=arch, **kwargs)
+
+    def _mock_insn(self, addr, mnemonic, insn_id, operands, size=5):
+        from types import SimpleNamespace
+        from x64dbg_automate.external.decompiler import X86_INS_CALL, X86_INS_JMP
+        return SimpleNamespace(
+            address=addr, mnemonic=mnemonic, id=insn_id,
+            operands=operands, size=size,
+            is_call=(insn_id == X86_INS_CALL),
+            is_jump=(insn_id == X86_INS_JMP),
+        )
+
+    def _mock_op(self, op_type, value):
+        from types import SimpleNamespace
+        return SimpleNamespace(type=op_type, value=value)
+
+    def _call_id(self):
+        from x64dbg_automate.external.decompiler import X86_INS_CALL
+        return X86_INS_CALL
+
+    def _jmp_id(self):
+        from x64dbg_automate.external.decompiler import X86_INS_JMP
+        return X86_INS_JMP
+
+    def test_direct_call(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+
+        client = MagicMock()
+        client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe")
+        ]
+
+        def fake_get_function(addr):
+            if addr == 0x401000:
+                return MagicMock(start=0x401000, end=0x401020)
+            if addr == 0x401010:
+                return MagicMock(start=0x401010, end=0x401030)
+            return None
+
+        client.get_function.side_effect = fake_get_function
+        client.read_memory.return_value = b"\x90" * 0x40
+        client.get_symbol_at.return_value = None
+
+        call_count = [0]
+
+        def fake_disasm(data, base, arch):
+            call_count[0] += 1
+            if base == 0x401000:
+                return [
+                    self._mock_insn(0x401005, "call", self._call_id(), [
+                        self._mock_op("imm", 0x401010)
+                    ]),
+                ]
+            if base == 0x401010:
+                return []  # leaf function
+            return []
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        builder = self._make_builder(client)
+        result = builder.build(0x401000)
+
+        assert result["total_nodes"] == 2
+        assert result["total_edges"] == 1
+        assert result["edges"][0]["type"] == "direct_call"
+        assert result["edges"][0]["source"] == "0x401000"
+        assert result["edges"][0]["target"] == "0x401010"
+
+    def test_import_call_via_rip_relative(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+
+        client = MagicMock()
+        client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe"),
+            MagicMock(base=0x7FF800000000, size=0x200000, name="kernel32.dll"),
+        ]
+
+        def fake_get_function(addr):
+            if addr == 0x401000:
+                return MagicMock(start=0x401000, end=0x401020)
+            if addr == 0x7FF800001000:
+                return MagicMock(start=0x7FF800001000, end=0x7FF800001020)
+            return None
+
+        client.get_function.side_effect = fake_get_function
+        client.read_memory.return_value = b"\x90" * 0x40
+        client.read_qword.return_value = 0x7FF800001000
+        client.get_symbol_at.side_effect = lambda addr: (
+            MagicMock(undecoratedSymbol="kernel32.CreateFileA") if addr == 0x7FF800001000 else None
+        )
+
+        def fake_disasm(data, base, arch):
+            if base == 0x401000:
+                return [
+                    self._mock_insn(0x401005, "call", self._call_id(), [
+                        self._mock_op("mem", {"base": "rip", "index": "", "scale": 1, "disp": 0x10})
+                    ]),
+                ]
+            return []
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        builder = self._make_builder(client)
+        result = builder.build(0x401000)
+
+        assert result["total_edges"] == 1
+        assert result["edges"][0]["type"] == "import_call"
+        assert result["nodes"][1]["name"] == "kernel32.CreateFileA"
+        assert result["nodes"][1]["type"] == "import"
+
+    def test_tail_call_followed(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+
+        client = MagicMock()
+        client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe")
+        ]
+
+        def fake_get_function(addr):
+            if addr == 0x401000:
+                return MagicMock(start=0x401000, end=0x401020)
+            if addr == 0x401030:
+                return MagicMock(start=0x401030, end=0x401050)
+            return None
+
+        client.get_function.side_effect = fake_get_function
+        client.read_memory.return_value = b"\x90" * 0x40
+        client.get_symbol_at.return_value = None
+
+        def fake_disasm(data, base, arch):
+            if base == 0x401000:
+                return [
+                    self._mock_insn(0x401005, "jmp", self._jmp_id(), [
+                        self._mock_op("imm", 0x401030)
+                    ]),
+                ]
+            return []
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        builder = self._make_builder(client, follow_tail_calls=True)
+        result = builder.build(0x401000)
+
+        assert result["total_edges"] == 1
+        assert result["edges"][0]["type"] == "tail_call"
+
+    def test_tail_call_not_followed(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+
+        client = MagicMock()
+        client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe")
+        ]
+        client.get_function.return_value = MagicMock(start=0x401000, end=0x401020)
+        client.read_memory.return_value = b"\x90" * 0x20
+        client.get_symbol_at.return_value = None
+
+        def fake_disasm(data, base, arch):
+            return [
+                self._mock_insn(0x401005, "jmp", self._jmp_id(), [
+                    self._mock_op("imm", 0x401030)
+                ]),
+            ]
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        builder = self._make_builder(client, follow_tail_calls=False)
+        result = builder.build(0x401000)
+
+        assert result["total_edges"] == 0
+
+    def test_internal_jump_ignored(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+
+        client = MagicMock()
+        client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe")
+        ]
+        client.get_function.return_value = MagicMock(start=0x401000, end=0x401020)
+        client.read_memory.return_value = b"\x90" * 0x20
+        client.get_symbol_at.return_value = None
+
+        def fake_disasm(data, base, arch):
+            return [
+                self._mock_insn(0x401005, "jmp", self._jmp_id(), [
+                    self._mock_op("imm", 0x401010)  # inside same function
+                ]),
+            ]
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        builder = self._make_builder(client)
+        result = builder.build(0x401000)
+
+        assert result["total_edges"] == 0
+        assert result["total_nodes"] == 1
+
+    def test_cycle_detection(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+
+        client = MagicMock()
+        client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe")
+        ]
+
+        def fake_get_function(addr):
+            if addr == 0x401000:
+                return MagicMock(start=0x401000, end=0x401020)
+            if addr == 0x401020:
+                return MagicMock(start=0x401020, end=0x401040)
+            return None
+
+        client.get_function.side_effect = fake_get_function
+        client.read_memory.return_value = b"\x90" * 0x40
+        client.get_symbol_at.return_value = None
+
+        call_count = [0]
+
+        def fake_disasm(data, base, arch):
+            call_count[0] += 1
+            if base == 0x401000:
+                return [
+                    self._mock_insn(0x401005, "call", self._call_id(), [
+                        self._mock_op("imm", 0x401020)
+                    ]),
+                ]
+            if base == 0x401020:
+                return [
+                    self._mock_insn(0x401025, "call", self._call_id(), [
+                        self._mock_op("imm", 0x401000)
+                    ]),
+                ]
+            return []
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        builder = self._make_builder(client)
+        result = builder.build(0x401000)
+
+        assert result["total_nodes"] == 2
+        assert result["total_edges"] == 2
+        # Should not have recursed infinitely
+        assert call_count[0] == 2
+
+    def test_max_depth_respected(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+
+        client = MagicMock()
+        client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe")
+        ]
+
+        def fake_get_function(addr):
+            return MagicMock(start=addr, end=addr + 0x20)
+
+        client.get_function.side_effect = fake_get_function
+        client.read_memory.return_value = b"\x90" * 0x20
+        client.get_symbol_at.return_value = None
+
+        # A -> B -> C -> D
+        def fake_disasm(data, base, arch):
+            targets = {0x401000: 0x401020, 0x401020: 0x401040, 0x401040: 0x401060}
+            target = targets.get(base)
+            if target:
+                return [self._mock_insn(base + 5, "call", self._call_id(), [self._mock_op("imm", target)])]
+            return []
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        builder = self._make_builder(client, max_depth=1)
+        result = builder.build(0x401000)
+
+        assert result["total_nodes"] == 2  # A and B
+        assert result["max_depth_reached"] == 1
+
+    def test_max_nodes_respected(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+
+        client = MagicMock()
+        client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe")
+        ]
+
+        def fake_get_function(addr):
+            return MagicMock(start=addr, end=addr + 0x20)
+
+        client.get_function.side_effect = fake_get_function
+        client.read_memory.return_value = b"\x90" * 0x20
+        client.get_symbol_at.return_value = None
+
+        # A calls B, C, D, E
+        def fake_disasm(data, base, arch):
+            if base == 0x401000:
+                return [
+                    self._mock_insn(0x401005, "call", self._call_id(), [self._mock_op("imm", 0x401020)]),
+                    self._mock_insn(0x40100A, "call", self._call_id(), [self._mock_op("imm", 0x401040)]),
+                    self._mock_insn(0x40100F, "call", self._call_id(), [self._mock_op("imm", 0x401060)]),
+                    self._mock_insn(0x401014, "call", self._call_id(), [self._mock_op("imm", 0x401080)]),
+                ]
+            return []
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        builder = self._make_builder(client, max_nodes=3)
+        result = builder.build(0x401000)
+
+        assert result["total_nodes"] == 3
+        assert result["total_edges"] == 2  # only first 2 calls fit within node limit
+
+    def test_indirect_call_unresolved(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import _CallGraphBuilder
+
+        client = MagicMock()
+        client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe")
+        ]
+        client.get_function.return_value = MagicMock(start=0x401000, end=0x401020)
+        client.read_memory.return_value = b"\x90" * 0x20
+        client.get_symbol_at.return_value = None
+
+        def fake_disasm(data, base, arch):
+            return [
+                self._mock_insn(0x401005, "call", self._call_id(), [
+                    self._mock_op("reg", "rax")
+                ]),
+            ]
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        builder = self._make_builder(client)
+        result = builder.build(0x401000)
+
+        assert result["unresolved_indirect_calls"] == 1
+        assert result["total_edges"] == 1
+        assert result["edges"][0]["type"] == "unresolved"
+        assert result["nodes"][1]["type"] == "unresolved"
+
+    def test_tool_entry_default_entry_point(self, manager, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import graph_call_graph
+
+        sb = _mock_sandbox(manager)
+        sb.client.get_modules.return_value = [
+            MagicMock(base=0x400000, size=0x10000, name="target.exe")
+        ]
+        sb.client.get_process_info.return_value = MagicMock(
+            image_base=0x400000, entry_point=0x1000
+        )
+
+        def fake_get_function(addr):
+            if addr == 0x401000:
+                return MagicMock(start=0x401000, end=0x401020)
+            if addr == 0x401020:
+                return MagicMock(start=0x401020, end=0x401040)
+            return None
+
+        sb.client.get_function.side_effect = fake_get_function
+        sb.client.read_memory.return_value = b"\x90" * 0x40
+        sb.client.get_symbol_at.return_value = None
+
+        def fake_disasm(data, base, arch):
+            if base == 0x401000:
+                return [
+                    self._mock_insn(0x401005, "call", self._call_id(), [
+                        self._mock_op("imm", 0x401020)
+                    ]),
+                ]
+            return []
+
+        monkeypatch.setattr(
+            "x64dbg_automate.external.decompiler.disassemble_bytes", fake_disasm
+        )
+
+        r = graph_call_graph(sandbox_id="aa11")
+        assert r["success"]
+        assert r["start_node"] == "0x401000"
+        assert r["total_nodes"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint semantic diff (C3 extension)
+# ---------------------------------------------------------------------------
+
+class TestAutoRegions:
+    def test_x64_stack_and_ip(self):
+        from x64dbg_automate.api_runtime.supervisor import _auto_regions
+
+        regs = {"rsp": 0x500000, "rip": 0x401010}
+        regions = _auto_regions(regs, "x64")
+        assert len(regions) == 2
+        assert (0x500000, 256) in regions
+        assert (0x401000, 96) in regions  # ip - 16 = 0x401000
+
+    def test_x32_stack_and_ip(self):
+        from x64dbg_automate.api_runtime.supervisor import _auto_regions
+
+        regs = {"esp": 0x18FF00, "eip": 0x401010}
+        regions = _auto_regions(regs, "x32")
+        assert len(regions) == 2
+        assert (0x18FF00, 256) in regions
+        assert (0x401000, 96) in regions
+
+    def test_zero_sp_skipped(self):
+        from x64dbg_automate.api_runtime.supervisor import _auto_regions
+
+        regs = {"rsp": 0, "rip": 0x401010}
+        regions = _auto_regions(regs, "x64")
+        assert len(regions) == 1
+        assert regions[0][0] == 0x401000
+
+    def test_zero_ip_skipped(self):
+        from x64dbg_automate.api_runtime.supervisor import _auto_regions
+
+        regs = {"rsp": 0x500000, "rip": 0}
+        regions = _auto_regions(regs, "x64")
+        assert len(regions) == 1
+        assert regions[0] == (0x500000, 256)
+
+    def test_both_zero_returns_empty(self):
+        from x64dbg_automate.api_runtime.supervisor import _auto_regions
+
+        regions = _auto_regions({"rsp": 0, "rip": 0}, "x64")
+        assert regions == []
+
+    def test_ip_near_zero_clamps(self):
+        from x64dbg_automate.api_runtime.supervisor import _auto_regions
+
+        regs = {"rsp": 0, "rip": 4}  # ip - 16 would go negative → clamped to 0
+        regions = _auto_regions(regs, "x64")
+        assert any(r[0] == 0 for r in regions)
+
+
+class TestCheckpointSemanticCapture:
+    """Verify that mgr.checkpoint() populates all semantic diff fields."""
+
+    def _thread(self, tid, cip=0x401000):
+        t = MagicMock()
+        t.thread_id = tid
+        t.cip = cip
+        t.suspend_count = 0
+        t.priority = 8
+        t.name = ""
+        return t
+
+    def _module(self, base, name, size=0x10000):
+        m = MagicMock()
+        m.base = base
+        m.name = name
+        m.size = size
+        return m
+
+    def _bp(self, addr, hit_count=0):
+        bp = MagicMock()
+        bp.addr = addr
+        bp.hitCount = hit_count
+        bp.enabled = True
+        bp.name = ""
+        return bp
+
+    def test_semantic_fields_populated(self, manager):
+        sb = _mock_sandbox(manager)
+        c = sb.client
+        c.is_running.return_value = False
+        c.get_reg.return_value = 0
+        c.get_threads.return_value = [self._thread(1001, cip=0x401010)]
+        c.get_modules.return_value = [self._module(0x400000, "target.exe")]
+        c.get_breakpoints.return_value = [self._bp(0x401000, hit_count=2)]
+        c.get_peb.return_value = SimpleNamespace(
+            being_debugged=True, nt_global_flag=0x70,
+            heap_flags=0x40000060, heap_force_flags=0,
+        )
+
+        cp = manager.checkpoint("aa11", "snap1", regions=[])
+        assert cp.threads_snapshot == [
+            {"thread_id": 1001, "cip": 0x401010, "suspend_count": 0, "priority": 8, "name": ""}
+        ]
+        assert cp.modules_snapshot == [{"base": 0x400000, "name": "target.exe", "size": 0x10000}]
+        assert len(cp.breakpoints_snapshot) == 3  # one per BP type
+        assert cp.peb_snapshot == {
+            "being_debugged": True, "nt_global_flag": 0x70,
+            "heap_flags": 0x40000060, "heap_force_flags": 0,
+        }
+
+    def test_auto_capture_reads_stack_and_ip(self, manager):
+        sb = _mock_sandbox(manager)
+        c = sb.client
+        c.is_running.return_value = False
+        c.get_reg.side_effect = lambda r: {"rsp": 0x500000, "rip": 0x401010}.get(r, 0)
+        c.read_memory.return_value = b"\xbb" * 256
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_breakpoints.return_value = []
+        c.get_peb.side_effect = Exception("no peb")
+
+        cp = manager.checkpoint("aa11", "auto")  # regions=None → auto-capture
+        assert 0x500000 in cp.memory
+        assert any(a <= 0x401010 for a in cp.memory)  # ip window captured
+        assert cp.peb_snapshot is None
+
+    def test_explicit_empty_regions_skips_memory(self, manager):
+        sb = _mock_sandbox(manager)
+        c = sb.client
+        c.is_running.return_value = False
+        c.get_reg.return_value = 0
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_breakpoints.return_value = []
+        c.get_peb.return_value = SimpleNamespace(
+            being_debugged=False, nt_global_flag=0, heap_flags=2, heap_force_flags=0
+        )
+
+        cp = manager.checkpoint("aa11", "nomem", regions=[])
+        assert cp.memory == {}
+
+    def test_to_info_exposes_semantic_counts(self, manager):
+        sb = _mock_sandbox(manager)
+        c = sb.client
+        c.is_running.return_value = False
+        c.get_reg.return_value = 0
+        c.get_threads.return_value = [self._thread(1), self._thread(2)]
+        c.get_modules.return_value = [self._module(0x400000, "a.dll"),
+                                       self._module(0x700000, "b.dll")]
+        c.get_breakpoints.return_value = [self._bp(0x401000)]
+        c.get_peb.return_value = SimpleNamespace(
+            being_debugged=False, nt_global_flag=0, heap_flags=2, heap_force_flags=0
+        )
+        sb.patches = [{"address": 0x401000, "original": "55", "patched": "90"}]
+
+        cp = manager.checkpoint("aa11", "info_test", regions=[])
+        info = cp.to_info()
+        assert info["thread_count"] == 2
+        assert info["module_count"] == 2
+        assert info["breakpoint_count"] == 3  # one per BP type
+        assert info["patch_count"] == 1
+        assert info["peb"] == {"being_debugged": False, "nt_global_flag": 0,
+                                "heap_flags": 2, "heap_force_flags": 0}
+
+
+class TestCheckpointDiff:
+    """End-to-end tests for checkpoint_diff() tool."""
+
+    def _setup(self, manager):
+        sb = _mock_sandbox(manager)
+        c = sb.client
+        c.is_running.return_value = False
+        c.get_breakpoints.return_value = []
+        c.get_peb.return_value = SimpleNamespace(
+            being_debugged=False, nt_global_flag=0, heap_flags=2, heap_force_flags=0
+        )
+        return sb
+
+    def _thread(self, tid, cip=0x401000):
+        t = MagicMock()
+        t.thread_id = tid
+        t.cip = cip
+        t.suspend_count = 0
+        t.priority = 8
+        t.name = ""
+        return t
+
+    def _module(self, base, name, size=0x10000):
+        m = MagicMock()
+        m.base = base
+        m.name = name
+        m.size = size
+        return m
+
+    def test_not_found_sandbox(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        r = checkpoint_diff(sandbox_id="ghost", checkpoint_a="a", checkpoint_b="b")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_missing_checkpoint(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_reg.return_value = 0
+
+        manager.checkpoint("aa11", "only_a", regions=[])
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="only_a", checkpoint_b="missing")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_no_changes(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = [self._thread(1001)]
+        c.get_modules.return_value = [self._module(0x400000, "test.exe")]
+        c.get_reg.return_value = 0x10
+
+        manager.checkpoint("aa11", "before", regions=[])
+        manager.checkpoint("aa11", "after", regions=[])
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="before", checkpoint_b="after")
+        assert r["success"]
+        assert r["registers"]["changed"] == []
+        assert r["threads"]["added"] == []
+        assert r["threads"]["removed"] == []
+        assert r["modules"]["loaded"] == []
+        assert r["summary"] == "No changes detected"
+
+    def test_register_changes(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+
+        c.get_reg.side_effect = lambda r: 0
+        manager.checkpoint("aa11", "reg_before", regions=[])
+
+        c.get_reg.side_effect = lambda r: {"rax": 0x42, "rcx": 0x100}.get(r, 0)
+        manager.checkpoint("aa11", "reg_after", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="reg_before", checkpoint_b="reg_after")
+        assert r["success"]
+        changed_names = {rc["name"] for rc in r["registers"]["changed"]}
+        assert "rax" in changed_names
+        assert "rcx" in changed_names
+        rax = next(rc for rc in r["registers"]["changed"] if rc["name"] == "rax")
+        assert rax["before"] == "0x0"
+        assert rax["after"] == "0x42"
+        assert "register" in r["summary"]
+
+    def test_thread_added(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_modules.return_value = []
+        c.get_reg.return_value = 0
+
+        c.get_threads.return_value = [self._thread(1001)]
+        manager.checkpoint("aa11", "t_before", regions=[])
+
+        c.get_threads.return_value = [self._thread(1001), self._thread(1002, cip=0x402000)]
+        manager.checkpoint("aa11", "t_after", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="t_before", checkpoint_b="t_after")
+        assert r["success"]
+        assert len(r["threads"]["added"]) == 1
+        assert r["threads"]["added"][0]["thread_id"] == 1002
+        assert r["threads"]["removed"] == []
+        assert "thread" in r["summary"]
+
+    def test_thread_removed(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_modules.return_value = []
+        c.get_reg.return_value = 0
+
+        c.get_threads.return_value = [self._thread(1001), self._thread(1002)]
+        manager.checkpoint("aa11", "rm_before", regions=[])
+
+        c.get_threads.return_value = [self._thread(1001)]
+        manager.checkpoint("aa11", "rm_after", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="rm_before", checkpoint_b="rm_after")
+        assert r["success"]
+        assert len(r["threads"]["removed"]) == 1
+        assert r["threads"]["removed"][0]["thread_id"] == 1002
+        assert "removed" in r["summary"]
+
+    def test_module_loaded(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_reg.return_value = 0
+
+        c.get_modules.return_value = [self._module(0x400000, "target.exe")]
+        manager.checkpoint("aa11", "mod_before", regions=[])
+
+        c.get_modules.return_value = [self._module(0x400000, "target.exe"),
+                                       self._module(0x7FFF00000000, "ntdll.dll")]
+        manager.checkpoint("aa11", "mod_after", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="mod_before", checkpoint_b="mod_after")
+        assert r["success"]
+        assert len(r["modules"]["loaded"]) == 1
+        assert r["modules"]["loaded"][0]["name"] == "ntdll.dll"
+        assert "ntdll.dll" in r["summary"] or "module" in r["summary"]
+
+    def test_breakpoint_hit_count_changed(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_reg.return_value = 0
+
+        def _bp(hit):
+            bp = MagicMock()
+            bp.addr = 0x401000
+            bp.hitCount = hit
+            bp.enabled = True
+            bp.name = "entry"
+            return bp
+
+        c.get_breakpoints.return_value = [_bp(0)]
+        manager.checkpoint("aa11", "bp_before", regions=[])
+
+        c.get_breakpoints.return_value = [_bp(3)]
+        manager.checkpoint("aa11", "bp_after", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="bp_before", checkpoint_b="bp_after")
+        assert r["success"]
+        assert len(r["breakpoints"]["hit_count_changed"]) == 3  # one per BP type
+        hc = r["breakpoints"]["hit_count_changed"][0]
+        assert hc["hit_count_before"] == 0
+        assert hc["hit_count_after"] == 3
+        assert "breakpoint" in r["summary"]
+
+    def test_peb_change(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_reg.return_value = 0
+
+        c.get_peb.return_value = SimpleNamespace(
+            being_debugged=False, nt_global_flag=0, heap_flags=2, heap_force_flags=0
+        )
+        manager.checkpoint("aa11", "peb_before", regions=[])
+
+        c.get_peb.return_value = SimpleNamespace(
+            being_debugged=True, nt_global_flag=0x70, heap_flags=0x40000060, heap_force_flags=0
+        )
+        manager.checkpoint("aa11", "peb_after", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="peb_before", checkpoint_b="peb_after")
+        assert r["success"]
+        assert r["peb"] is not None
+        changed_fields = {ch["field"] for ch in r["peb"]["changed"]}
+        assert "being_debugged" in changed_fields
+        assert "nt_global_flag" in changed_fields
+        assert "PEB" in r["summary"]
+
+    def test_peb_absent_in_a_returns_note(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_reg.return_value = 0
+
+        c.get_peb.side_effect = Exception("unavailable")
+        manager.checkpoint("aa11", "nopeb_before", regions=[])
+
+        c.get_peb.side_effect = None
+        c.get_peb.return_value = SimpleNamespace(
+            being_debugged=False, nt_global_flag=0, heap_flags=2, heap_force_flags=0
+        )
+        manager.checkpoint("aa11", "nopeb_after", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="nopeb_before", checkpoint_b="nopeb_after")
+        assert r["success"]
+        assert r["peb"] is not None
+        assert "note" in r["peb"]
+
+    def test_memory_changed_with_labels(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_reg.side_effect = lambda r: {"rsp": 0x500000, "rip": 0x401010}.get(r, 0)
+
+        c.read_memory.return_value = b"\x00" * 256
+        manager.checkpoint("aa11", "mem_before")  # regions=None → auto-capture
+
+        c.read_memory.return_value = b"\xff" * 256
+        manager.checkpoint("aa11", "mem_after")
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="mem_before", checkpoint_b="mem_after")
+        assert r["success"]
+        assert r["memory"]["total_changed_bytes"] > 0
+        stack_region = next(
+            (rd for rd in r["memory"]["regions"] if rd["label"] == "stack"), None
+        )
+        assert stack_region is not None
+        assert stack_region["changed_bytes"] == 256
+        assert "memory" in r["summary"] or "byte" in r["summary"]
+
+    def test_patch_added(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_reg.return_value = 0
+
+        sb.patches = []
+        manager.checkpoint("aa11", "patch_before", regions=[])
+
+        sb.patches = [{"address": 0x401000, "original": "55", "patched": "90", "patch_id": "aabb"}]
+        manager.checkpoint("aa11", "patch_after", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="patch_before", checkpoint_b="patch_after")
+        assert r["success"]
+        assert len(r["patches"]["added"]) == 1
+        assert "patch" in r["summary"]
+
+    def test_elapsed_time(self, manager):
+        from datetime import datetime, timedelta
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_reg.return_value = 0
+
+        manager.checkpoint("aa11", "elapsed_before", regions=[])
+        sb.checkpoints["elapsed_before"].created_at = datetime.now() - timedelta(seconds=2.5)
+        manager.checkpoint("aa11", "elapsed_after", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="elapsed_before", checkpoint_b="elapsed_after")
+        assert r["success"]
+        assert r["elapsed_sec"] >= 2.0
+
+    def test_no_changes_summary(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import checkpoint_diff
+
+        sb = self._setup(manager)
+        c = sb.client
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_reg.return_value = 0x55
+
+        manager.checkpoint("aa11", "clean_a", regions=[])
+        manager.checkpoint("aa11", "clean_b", regions=[])
+
+        r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="clean_a", checkpoint_b="clean_b")
+        assert r["success"]
+        assert r["summary"] == "No changes detected"

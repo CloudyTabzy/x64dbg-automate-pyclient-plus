@@ -422,6 +422,211 @@ def memory_diff(*, sandbox_id: str | None = None, checkpoint_a: str, checkpoint_
 
 
 @tool
+def checkpoint_diff(
+    *,
+    sandbox_id: str | None = None,
+    checkpoint_a: str,
+    checkpoint_b: str,
+) -> dict:
+    """Produce a full structured semantic diff between two checkpoints.
+
+    Compares every observable dimension captured by ``sandbox_checkpoint``:
+    GP registers, auto-captured memory (stack + instruction window), thread
+    lifecycle, module loads/unloads, breakpoint hit counts, applied patches,
+    and PEB anti-debug flags.
+
+    The ``summary`` field gives a one-line human-readable synopsis suitable for
+    agent reasoning ("2 registers changed (rax, rcx); 48 stack bytes differ;
+    1 thread added; ntdll.dll loaded").
+
+    Args:
+        sandbox_id: Sandbox holding both checkpoints.
+        checkpoint_a: Name of the 'before' checkpoint.
+        checkpoint_b: Name of the 'after' checkpoint.
+    """
+    from x64dbg_automate.api_runtime.runtime_helpers import diff_bytes
+
+    mgr = get_manager()
+    try:
+        sandbox = mgr.get_sandbox(sandbox_id)
+    except KeyError as exc:
+        return lookup_error(exc)
+
+    cp_a = sandbox.checkpoints.get(checkpoint_a)
+    cp_b = sandbox.checkpoints.get(checkpoint_b)
+    if cp_a is None or cp_b is None:
+        missing = checkpoint_a if cp_a is None else checkpoint_b
+        return err(f"No checkpoint '{missing}'.", ErrorType.NOT_FOUND,
+                   hint="Use sandbox_info to list checkpoints.", sandbox_id=sandbox_id)
+
+    arch = cp_a.arch
+    sp_key = "rsp" if arch == "x64" else "esp"
+    ip_key = "rip" if arch == "x64" else "eip"
+
+    # --- Registers ---
+    reg_changed = []
+    for name in sorted(set(cp_a.registers) | set(cp_b.registers)):
+        va = cp_a.registers.get(name, 0)
+        vb = cp_b.registers.get(name, 0)
+        if va != vb:
+            delta = vb - va
+            sign = "+" if delta >= 0 else "-"
+            reg_changed.append({
+                "name": name,
+                "before": f"0x{va:X}",
+                "after": f"0x{vb:X}",
+                "delta": f"{sign}0x{abs(delta):X}",
+            })
+    reg_unchanged = max(0, len(cp_a.registers) - len(reg_changed))
+
+    # --- Memory (label auto-captured regions by their source) ---
+    sp_a = cp_a.registers.get(sp_key, 0)
+    ip_a = cp_a.registers.get(ip_key, 0)
+
+    def _region_label(addr: int) -> str:
+        if sp_a and addr == sp_a:
+            return "stack"
+        if ip_a and abs(addr - max(0, ip_a - 16)) <= 4:
+            return "instruction_window"
+        return f"0x{addr:X}"
+
+    region_diffs = []
+    total_changed_bytes = 0
+    for addr in sorted(set(cp_a.memory) & set(cp_b.memory)):
+        before, after = cp_a.memory[addr], cp_b.memory[addr]
+        runs = diff_bytes(before, after)
+        changed = sum(len(bytes.fromhex(r["before"])) for r in runs)
+        total_changed_bytes += changed
+        region_diffs.append({
+            "address": f"0x{addr:X}",
+            "label": _region_label(addr),
+            "size": min(len(before), len(after)),
+            "changed_bytes": changed,
+            "diffs": runs,
+        })
+
+    # --- Threads ---
+    tids_a = {t["thread_id"] for t in cp_a.threads_snapshot}
+    tids_b = {t["thread_id"] for t in cp_b.threads_snapshot}
+    by_id_a = {t["thread_id"]: t for t in cp_a.threads_snapshot}
+    by_id_b = {t["thread_id"]: t for t in cp_b.threads_snapshot}
+
+    threads_added = [by_id_b[tid] for tid in sorted(tids_b - tids_a)]
+    threads_removed = [by_id_a[tid] for tid in sorted(tids_a - tids_b)]
+    cip_changed = [
+        {"thread_id": tid,
+         "cip_before": f"0x{by_id_a[tid]['cip']:X}",
+         "cip_after": f"0x{by_id_b[tid]['cip']:X}"}
+        for tid in sorted(tids_a & tids_b)
+        if by_id_a[tid]["cip"] != by_id_b[tid]["cip"]
+    ]
+
+    # --- Modules ---
+    bases_a = {m["base"] for m in cp_a.modules_snapshot}
+    bases_b = {m["base"] for m in cp_b.modules_snapshot}
+    by_base_b = {m["base"]: m for m in cp_b.modules_snapshot}
+    by_base_a = {m["base"]: m for m in cp_a.modules_snapshot}
+    modules_loaded = [by_base_b[b] for b in sorted(bases_b - bases_a)]
+    modules_unloaded = [by_base_a[b] for b in sorted(bases_a - bases_b)]
+
+    # --- Breakpoints ---
+    def _bp_key(bp: dict) -> tuple:
+        return (bp["addr"], bp["type"])
+
+    bps_a = {_bp_key(bp): bp for bp in cp_a.breakpoints_snapshot}
+    bps_b = {_bp_key(bp): bp for bp in cp_b.breakpoints_snapshot}
+    bps_added = [bps_b[k] for k in sorted(bps_b.keys() - bps_a.keys())]
+    bps_removed = [bps_a[k] for k in sorted(bps_a.keys() - bps_b.keys())]
+    hit_count_changed = [
+        {"addr": f"0x{bps_a[k]['addr']:X}", "name": bps_a[k]["name"], "type": bps_a[k]["type"],
+         "hit_count_before": bps_a[k]["hit_count"], "hit_count_after": bps_b[k]["hit_count"]}
+        for k in sorted(bps_a.keys() & bps_b.keys())
+        if bps_a[k]["hit_count"] != bps_b[k]["hit_count"]
+    ]
+
+    # --- Patches ---
+    addrs_a = {p.get("address", p.get("addr")) for p in cp_a.patches_snapshot}
+    patches_added = [
+        p for p in cp_b.patches_snapshot
+        if p.get("address", p.get("addr")) not in addrs_a
+    ]
+
+    # --- PEB ---
+    peb_section = None
+    if cp_a.peb_snapshot is not None and cp_b.peb_snapshot is not None:
+        peb_changes = [
+            {"field": f, "before": cp_a.peb_snapshot.get(f), "after": cp_b.peb_snapshot.get(f)}
+            for f in ("being_debugged", "nt_global_flag", "heap_flags", "heap_force_flags")
+            if cp_a.peb_snapshot.get(f) != cp_b.peb_snapshot.get(f)
+        ]
+        peb_section = {"changed": peb_changes}
+    elif cp_b.peb_snapshot is not None:
+        peb_section = {"note": "PEB was not captured in checkpoint_a; cannot diff.", "snapshot_b": cp_b.peb_snapshot}
+
+    # --- Summary ---
+    parts = []
+    if reg_changed:
+        names = ", ".join(r["name"] for r in reg_changed[:4])
+        suffix = f" +{len(reg_changed) - 4} more" if len(reg_changed) > 4 else ""
+        parts.append(f"{len(reg_changed)} register(s) changed ({names}{suffix})")
+    if total_changed_bytes:
+        parts.append(f"{total_changed_bytes} memory byte(s) differ")
+    if threads_added:
+        parts.append(f"{len(threads_added)} thread(s) added")
+    if threads_removed:
+        parts.append(f"{len(threads_removed)} thread(s) removed")
+    if cip_changed:
+        parts.append(f"{len(cip_changed)} thread CIP(s) changed")
+    if modules_loaded:
+        names = ", ".join(m["name"] for m in modules_loaded[:3])
+        parts.append(f"{len(modules_loaded)} module(s) loaded ({names})")
+    if modules_unloaded:
+        parts.append(f"{len(modules_unloaded)} module(s) unloaded")
+    if hit_count_changed:
+        parts.append(f"{len(hit_count_changed)} breakpoint(s) hit")
+    if bps_added:
+        parts.append(f"{len(bps_added)} breakpoint(s) added")
+    if patches_added:
+        parts.append(f"{len(patches_added)} patch(es) applied")
+    if peb_section and peb_section.get("changed"):
+        fields = ", ".join(c["field"] for c in peb_section["changed"])
+        parts.append(f"PEB changed ({fields})")
+    summary = "; ".join(parts) if parts else "No changes detected"
+
+    elapsed = (cp_b.created_at - cp_a.created_at).total_seconds()
+
+    return ok(
+        sandbox_id=sandbox_id,
+        checkpoint_a=checkpoint_a,
+        checkpoint_b=checkpoint_b,
+        elapsed_sec=round(elapsed, 3),
+        registers={"changed": reg_changed, "unchanged_count": reg_unchanged},
+        memory={"regions": region_diffs, "total_changed_bytes": total_changed_bytes},
+        threads={
+            "added": threads_added,
+            "removed": threads_removed,
+            "cip_changed": cip_changed,
+            "total_before": len(cp_a.threads_snapshot),
+            "total_after": len(cp_b.threads_snapshot),
+        },
+        modules={
+            "loaded": modules_loaded,
+            "unloaded": modules_unloaded,
+            "total_before": len(cp_a.modules_snapshot),
+            "total_after": len(cp_b.modules_snapshot),
+        },
+        breakpoints={
+            "added": bps_added,
+            "removed": bps_removed,
+            "hit_count_changed": hit_count_changed,
+        },
+        patches={"added": patches_added},
+        peb=peb_section,
+        summary=summary,
+    )
+
+
+@tool
 def disassemble_range(*, 
     sandbox_id: str | None = None,
     address: str,
