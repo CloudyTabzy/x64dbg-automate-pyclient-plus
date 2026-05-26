@@ -61,15 +61,20 @@ class Checkpoint:
     breakpoints_snapshot: list[dict] = field(default_factory=list)
     patches_snapshot: list[dict] = field(default_factory=list)
     peb_snapshot: dict | None = None
+    # Regions that were requested but failed to read (addr, size pairs).
+    failed_regions: list[tuple[int, int]] = field(default_factory=list)
 
     def to_info(self) -> dict:
         """JSON-safe summary (no raw bytes)."""
-        return {
+        region_count = len(self.memory)
+        failed_count = len(self.failed_regions)
+        info: dict = {
             "name": self.name,
             "created_at": self.created_at.isoformat(timespec="seconds"),
             "arch": self.arch,
             "register_count": len(self.registers),
-            "region_count": len(self.memory),
+            "region_count": region_count,
+            "region_attempts": region_count + failed_count,
             "total_bytes": sum(len(b) for b in self.memory.values()),
             "thread_count": self.thread_count,
             "module_count": len(self.modules_snapshot),
@@ -78,6 +83,12 @@ class Checkpoint:
             "peb": self.peb_snapshot,
             "warnings": self.warnings,
         }
+        if failed_count:
+            info["region_read_failures"] = [
+                {"address": f"0x{addr:X}", "size": size}
+                for addr, size in self.failed_regions
+            ]
+        return info
 
 
 def _auto_regions(registers: dict[str, int], arch: str) -> list[tuple[int, int]]:
@@ -404,10 +415,12 @@ class SandboxManager:
             regions = _auto_regions(registers, sandbox.debugger_arch)
 
         memory: dict[int, bytes] = {}
+        failed_regions: list[tuple[int, int]] = []
         for addr, size in regions:
             try:
                 memory[addr] = client.read_memory(addr, size)
             except Exception as exc:
+                failed_regions.append((addr, size))
                 cp_warnings.append(f"Memory read failed at 0x{addr:X} ({size} B): {exc}")
 
         threads_snapshot = _capture_threads(client)
@@ -431,6 +444,7 @@ class SandboxManager:
             breakpoints_snapshot=breakpoints_snapshot,
             patches_snapshot=patches_snapshot,
             peb_snapshot=peb_snapshot,
+            failed_regions=failed_regions,
         )
         sandbox.checkpoints[name] = cp
         return cp

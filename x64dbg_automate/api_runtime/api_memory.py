@@ -7,10 +7,11 @@ can reason about.
 from __future__ import annotations
 
 import struct
+import time
 
 from x64dbg_automate.api_runtime.registry import tool
 from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, is_bug, lookup_error, ok, to_hex
-from x64dbg_automate.api_runtime.runtime_helpers import disasm_instructions, resolve_addr
+from x64dbg_automate.api_runtime.runtime_helpers import diff_bytes, disasm_instructions, resolve_addr
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 from x64dbg_automate.api_runtime.utils import parse_region
 from x64dbg_automate.external.entropy import shannon_entropy
@@ -370,8 +371,6 @@ def memory_diff(*, sandbox_id: str | None = None, checkpoint_a: str, checkpoint_
         checkpoint_b: Second checkpoint name.
         region: Optional 'addr:size' to restrict the comparison.
     """
-    from x64dbg_automate.api_runtime.runtime_helpers import diff_bytes
-
     mgr = get_manager()
     try:
         sandbox = mgr.get_sandbox(sandbox_id)
@@ -444,7 +443,7 @@ def checkpoint_diff(
         checkpoint_a: Name of the 'before' checkpoint.
         checkpoint_b: Name of the 'after' checkpoint.
     """
-    from x64dbg_automate.api_runtime.runtime_helpers import diff_bytes
+    _t0 = time.perf_counter()
 
     mgr = get_manager()
     try:
@@ -495,7 +494,7 @@ def checkpoint_diff(
     for addr in sorted(set(cp_a.memory) & set(cp_b.memory)):
         before, after = cp_a.memory[addr], cp_b.memory[addr]
         runs = diff_bytes(before, after)
-        changed = sum(len(bytes.fromhex(r["before"])) for r in runs)
+        changed = sum(len(r["before"]) // 2 for r in runs)
         total_changed_bytes += changed
         region_diffs.append({
             "address": f"0x{addr:X}",
@@ -594,12 +593,14 @@ def checkpoint_diff(
     summary = "; ".join(parts) if parts else "No changes detected"
 
     elapsed = (cp_b.created_at - cp_a.created_at).total_seconds()
+    computation_ms = round((time.perf_counter() - _t0) * 1000, 2)
 
     return ok(
         sandbox_id=sandbox_id,
         checkpoint_a=checkpoint_a,
         checkpoint_b=checkpoint_b,
         elapsed_sec=round(elapsed, 3),
+        computation_ms=computation_ms,
         registers={"changed": reg_changed, "unchanged_count": reg_unchanged},
         memory={"regions": region_diffs, "total_changed_bytes": total_changed_bytes},
         threads={

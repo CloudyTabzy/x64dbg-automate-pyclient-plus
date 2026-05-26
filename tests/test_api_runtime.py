@@ -2432,6 +2432,29 @@ class TestCheckpointSemanticCapture:
         assert info["patch_count"] == 1
         assert info["peb"] == {"being_debugged": False, "nt_global_flag": 0,
                                 "heap_flags": 2, "heap_force_flags": 0}
+        assert info["region_count"] == 0
+        assert info["region_attempts"] == 0
+        assert "region_read_failures" not in info  # no failures → key absent
+
+    def test_to_info_exposes_region_attempts_on_failure(self, manager):
+        sb = _mock_sandbox(manager)
+        c = sb.client
+        c.is_running.return_value = False
+        c.get_reg.side_effect = lambda r: {"rsp": 0x500000, "rip": 0x401010}.get(r, 0)
+        c.read_memory.side_effect = OSError("invalid address")
+        c.get_threads.return_value = []
+        c.get_modules.return_value = []
+        c.get_breakpoints.return_value = []
+        c.get_peb.return_value = SimpleNamespace(
+            being_debugged=False, nt_global_flag=0, heap_flags=2, heap_force_flags=0
+        )
+
+        cp = manager.checkpoint("aa11", "failmem")  # regions=None → auto-capture 2 regions
+        info = cp.to_info()
+        assert info["region_count"] == 0
+        assert info["region_attempts"] == 2       # both were requested
+        assert len(info["region_read_failures"]) == 2
+        assert all("address" in f and "size" in f for f in info["region_read_failures"])
 
 
 class TestCheckpointDiff:
@@ -2748,6 +2771,8 @@ class TestCheckpointDiff:
         r = checkpoint_diff(sandbox_id="aa11", checkpoint_a="clean_a", checkpoint_b="clean_b")
         assert r["success"]
         assert r["summary"] == "No changes detected"
+        assert "computation_ms" in r
+        assert isinstance(r["computation_ms"], float)
 
 
 # ---------------------------------------------------------------------------
