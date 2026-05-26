@@ -2891,3 +2891,372 @@ class TestEnsureStopped:
         assert r["success"]
         assert "capture_warnings" in r
         assert any("CAPTURE FAILURE" in w for w in r["capture_warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Fleet / Concurrent sandbox inspection
+# ---------------------------------------------------------------------------
+
+class TestFleetTools:
+    # -- fleet health --
+
+    def test_fleet_health_empty(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_fleet_health
+
+        r = sandbox_fleet_health()
+        assert r["success"]
+        assert r["total"] == 0
+        assert "No sandboxes" in r["summary"]
+
+    def test_fleet_health_single(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_fleet_health
+
+        sb = _mock_sandbox(manager)
+        sb.client._axon_state_machine = None
+        sb.client.is_debugging.return_value = True
+        sb.client.is_running.return_value = False
+        r = sandbox_fleet_health()
+        assert r["success"]
+        assert r["total"] == 1
+        assert r["healthy"] == 1
+        assert r["sandboxes"][0]["sandbox_id"] == "aa11"
+        assert r["sandboxes"][0]["state"] == "stopped"
+
+    def test_fleet_health_multi(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_fleet_health
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client._axon_state_machine = None
+        sb1.client.is_debugging.return_value = True
+        sb1.client.is_running.return_value = True
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client._axon_state_machine = None
+        sb2.client.is_debugging.return_value = False
+
+        r = sandbox_fleet_health()
+        assert r["success"]
+        assert r["total"] == 2
+        assert r["healthy"] == 1
+        assert r["detached"] == 1
+        assert r["crashed"] == 0
+        states = {s["sandbox_id"]: s["state"] for s in r["sandboxes"]}
+        assert states["sb01"] == "running"
+        assert states["sb02"] == "detached"
+
+    def test_fleet_health_explicit_ids(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_fleet_health
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client._axon_state_machine = None
+        sb1.client.is_debugging.return_value = True
+        sb1.client.is_running.return_value = False
+        _mock_sandbox(manager, sid="sb02")
+
+        r = sandbox_fleet_health(sandbox_ids=["sb01"])
+        assert r["success"]
+        assert r["total"] == 1
+        assert r["sandboxes"][0]["sandbox_id"] == "sb01"
+
+    # -- batch inspect --
+
+    def test_batch_inspect_empty(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_batch_inspect
+
+        r = sandbox_batch_inspect()
+        assert r["success"]
+        assert r["total"] == 0
+
+    def test_batch_inspect_single(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_batch_inspect
+
+        sb = _mock_sandbox(manager)
+        sb.client.get_reg.return_value = 0x7FF00000
+        sb.client.read_memory.return_value = b"\x90" * 64
+        sb.client.get_modules.return_value = []
+        sb.client.get_threads.return_value = []
+        sb.client.get_breakpoints.return_value = []
+
+        r = sandbox_batch_inspect(capture_stack=64)
+        assert r["success"]
+        assert r["total"] == 1
+        assert r["successful"] == 1
+        entry = r["sandboxes"][0]
+        assert entry["sandbox_id"] == "aa11"
+        assert entry["registers"]["rax"] == "0x7FF00000"
+        assert entry["stack_top"] == "90" * 64
+        assert "divergence" in r
+
+    def test_batch_inspect_divergence(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_batch_inspect
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client.get_reg.return_value = 0x1000
+        sb1.client.read_memory.return_value = b"\x00" * 64
+        sb1.client.get_modules.return_value = []
+        sb1.client.get_threads.return_value = []
+        sb1.client.get_breakpoints.return_value = []
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client.get_reg.return_value = 0x2000
+        sb2.client.read_memory.return_value = b"\x00" * 64
+        sb2.client.get_modules.return_value = []
+        sb2.client.get_threads.return_value = []
+        sb2.client.get_breakpoints.return_value = []
+
+        r = sandbox_batch_inspect(capture_stack=64)
+        assert r["success"]
+        assert r["total"] == 2
+        div = r["divergence"]
+        assert div is not None
+        assert "registers" in div
+        assert "rax" in div["registers"]
+
+    def test_batch_inspect_partial_failure(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_batch_inspect
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client.get_reg.return_value = 0x1000
+        sb1.client.read_memory.return_value = b"\x00" * 64
+        sb1.client.get_modules.return_value = []
+        sb1.client.get_threads.return_value = []
+        sb1.client.get_breakpoints.return_value = []
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client = None  # force get_client to fail
+
+        r = sandbox_batch_inspect(capture_stack=64)
+        assert r["success"]
+        assert r["successful"] == 1
+        assert r["failed"] == 1
+
+    # -- sync execution --
+
+    def test_sync_pause_all(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_sync_execution
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client._axon_state_machine = None
+        sb1.client.pause.return_value = True
+        sb1.client.is_debugging.return_value = True
+        sb1.client.is_running.return_value = False
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client._axon_state_machine = None
+        sb2.client.pause.return_value = True
+        sb2.client.is_debugging.return_value = True
+        sb2.client.is_running.return_value = False
+
+        r = sandbox_sync_execution(action="pause")
+        assert r["success"]
+        assert r["applied"] == 2
+        assert r["action"] == "pause"
+        sb1.client.pause.assert_called_once()
+        sb2.client.pause.assert_called_once()
+
+    def test_sync_continue_all(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_sync_execution
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client._axon_state_machine = None
+        sb1.client.go.return_value = True
+        sb1.client.is_debugging.return_value = True
+        sb1.client.is_running.return_value = True
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client._axon_state_machine = None
+        sb2.client.go.return_value = True
+        sb2.client.is_debugging.return_value = True
+        sb2.client.is_running.return_value = True
+
+        r = sandbox_sync_execution(action="continue")
+        assert r["success"]
+        assert r["applied"] == 2
+
+    def test_sync_invalid_action(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_sync_execution
+
+        r = sandbox_sync_execution(action="fly")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_sync_empty(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_sync_execution
+
+        r = sandbox_sync_execution(action="pause")
+        assert r["success"]
+        assert r["total"] == 0
+
+    # -- correlate memory --
+
+    def test_correlate_memory_identical(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_correlate_memory
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client.read_memory.return_value = b"\x90" * 16
+        sb1.client.get_modules.return_value = []
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client.read_memory.return_value = b"\x90" * 16
+        sb2.client.get_modules.return_value = []
+
+        r = sandbox_correlate_memory(
+            sandbox_a_id="sb01",
+            sandbox_b_id="sb02",
+            address_a="0x401000",
+            address_b="0x401000",
+            size=16,
+        )
+        assert r["success"]
+        assert r["identical"] is True
+        assert r["changed_bytes"] == 0
+        assert r["diff_runs"] == []
+
+    def test_correlate_memory_differs(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_correlate_memory
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client.read_memory.return_value = b"\x90" * 8 + b"\x00" * 8
+        sb1.client.get_modules.return_value = []
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client.read_memory.return_value = b"\x90" * 8 + b"\xCC" * 8
+        sb2.client.get_modules.return_value = []
+
+        r = sandbox_correlate_memory(
+            sandbox_a_id="sb01",
+            sandbox_b_id="sb02",
+            address_a="0x401000",
+            address_b="0x401000",
+            size=16,
+        )
+        assert r["success"]
+        assert r["identical"] is False
+        assert r["changed_bytes"] == 8
+        assert len(r["diff_runs"]) == 1
+        assert r["diff_runs"][0]["offset"] == 8
+
+    def test_correlate_memory_rebase_hint(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_correlate_memory
+
+        Mod = type("Mod", (), {})
+        m1 = Mod()
+        m1.base = 0x140000000
+        m1.size = 0x10000
+        m1.name = "target.exe"
+        m2 = Mod()
+        m2.base = 0x7FF600000000
+        m2.size = 0x10000
+        m2.name = "target.exe"
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client.read_memory.return_value = b"\x90" * 16
+        sb1.client.get_modules.return_value = [m1]
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client.read_memory.return_value = b"\x90" * 16
+        sb2.client.get_modules.return_value = [m2]
+
+        r = sandbox_correlate_memory(
+            sandbox_a_id="sb01",
+            sandbox_b_id="sb02",
+            address_a="0x401000",
+            address_b="0x401000",
+            size=16,
+        )
+        assert r["success"]
+        assert r["rebase_hint"] is not None
+        assert r["rebase_hint"]["module"] == "target.exe"
+
+    def test_correlate_memory_bad_size(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_correlate_memory
+
+        r = sandbox_correlate_memory(
+            sandbox_a_id="sb01", sandbox_b_id="sb02",
+            address_a="0x401000", address_b="0x401000",
+            size=0,
+        )
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_correlate_memory_missing_sandbox(self, manager):
+        from x64dbg_automate.api_runtime.api_fleet import sandbox_correlate_memory
+
+        r = sandbox_correlate_memory(
+            sandbox_a_id="ghost", sandbox_b_id="sb02",
+            address_a="0x401000", address_b="0x401000",
+            size=16,
+        )
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    # -- cross diff (in api_memory) --
+
+    def test_cross_diff_registers_only(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import sandbox_cross_diff
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client.get_reg.return_value = 0x1000
+        sb1.client.get_modules.return_value = []
+        sb1.client.get_threads.return_value = []
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client.get_reg.return_value = 0x2000
+        sb2.client.get_modules.return_value = []
+        sb2.client.get_threads.return_value = []
+
+        r = sandbox_cross_diff(sandbox_a_id="sb01", sandbox_b_id="sb02")
+        assert r["success"]
+        assert r["registers"]["total_checked"] > 0
+        changed = r["registers"]["changed"]
+        assert any(c["name"] == "rax" for c in changed)
+        assert r["threads"]["count_a"] == 0
+        assert r["threads"]["count_b"] == 0
+        assert "differ" in r["summary"]
+
+    def test_cross_diff_with_memory(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import sandbox_cross_diff
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb1.client.get_reg.return_value = 0x1000
+        sb1.client.get_modules.return_value = []
+        sb1.client.get_threads.return_value = []
+        sb1.client.read_memory.return_value = b"\x90" * 16
+
+        sb2 = _mock_sandbox(manager, sid="sb02")
+        sb2.client.get_reg.return_value = 0x1000
+        sb2.client.get_modules.return_value = []
+        sb2.client.get_threads.return_value = []
+        sb2.client.read_memory.return_value = b"\xCC" * 16
+
+        r = sandbox_cross_diff(
+            sandbox_a_id="sb01", sandbox_b_id="sb02",
+            compare_memory=True,
+            memory_address_a="0x401000",
+            memory_address_b="0x401000",
+            memory_size=16,
+        )
+        assert r["success"]
+        assert r["memory"] is not None
+        assert r["memory"]["identical"] is False
+        assert r["memory"]["changed_bytes"] == 16
+
+    def test_cross_diff_missing_sandbox(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import sandbox_cross_diff
+
+        r = sandbox_cross_diff(sandbox_a_id="ghost", sandbox_b_id="sb02")
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_cross_diff_memory_requires_addresses(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import sandbox_cross_diff
+
+        sb1 = _mock_sandbox(manager, sid="sb01")
+        sb2 = _mock_sandbox(manager, sid="sb02")
+
+        r = sandbox_cross_diff(
+            sandbox_a_id="sb01", sandbox_b_id="sb02",
+            compare_memory=True,
+        )
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT

@@ -6,12 +6,11 @@ can reason about.
 
 from __future__ import annotations
 
-import struct
 import time
 
 from x64dbg_automate.api_runtime.registry import tool
 from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, is_bug, lookup_error, ok, to_hex
-from x64dbg_automate.api_runtime.runtime_helpers import diff_bytes, disasm_instructions, resolve_addr
+from x64dbg_automate.api_runtime.runtime_helpers import capture_registers, diff_bytes, disasm_instructions, resolve_addr
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 from x64dbg_automate.api_runtime.utils import parse_region
 from x64dbg_automate.external.entropy import shannon_entropy
@@ -700,3 +699,163 @@ def get_call_stack(sandbox_id: str | None = None) -> dict:
         })
 
     return ok(sandbox_id=sandbox_id, frames=stack, depth=len(stack))
+
+
+@tool
+def sandbox_cross_diff(
+    sandbox_a_id: str,
+    sandbox_b_id: str,
+    compare_memory: bool = False,
+    memory_address_a: str = "",
+    memory_address_b: str = "",
+    memory_size: int = 4096,
+) -> dict:
+    """Compare live state between two different sandboxes.
+
+    This is the cross-sandbox counterpart to ``checkpoint_diff`` (which compares
+    two checkpoints within the *same* sandbox). Use it to compare a clean run
+    versus a patched run, or two different execution paths.
+
+    Args:
+        sandbox_a_id: First sandbox to compare.
+        sandbox_b_id: Second sandbox to compare.
+        compare_memory: Also read and diff a memory region.
+        memory_address_a: Region start in sandbox A (required if compare_memory=True).
+        memory_address_b: Region start in sandbox B (required if compare_memory=True).
+        memory_size: Bytes to read from each (default 4 KiB, max 1 MiB).
+    """
+    _MAX_SIZE = 1024 * 1024
+    if compare_memory:
+        if memory_size <= 0:
+            return err("memory_size must be > 0.", ErrorType.BAD_ARGUMENT)
+        if memory_size > _MAX_SIZE:
+            return err("memory_size exceeds 1 MiB limit.", ErrorType.BAD_ARGUMENT)
+        if not memory_address_a.strip() or not memory_address_b.strip():
+            return err("memory_address_a and memory_address_b are required when compare_memory=True.",
+                       ErrorType.BAD_ARGUMENT)
+
+    mgr = get_manager()
+    try:
+        client_a = mgr.get_client(sandbox_a_id)
+        client_b = mgr.get_client(sandbox_b_id)
+        sandbox_a = mgr.get_sandbox(sandbox_a_id)
+        sandbox_b = mgr.get_sandbox(sandbox_b_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    arch_a = sandbox_a.debugger_arch
+    arch_b = sandbox_b.debugger_arch
+
+    # --- Registers ---
+    regs_a = capture_registers(client_a, arch_a)
+    regs_b = capture_registers(client_b, arch_b)
+    reg_changed = []
+    all_reg_names = sorted(set(regs_a) | set(regs_b))
+    for reg in all_reg_names:
+        va_str = regs_a.get(reg, "0x0")
+        vb_str = regs_b.get(reg, "0x0")
+        # Parse hex strings back to int for comparison
+        try:
+            va = int(va_str, 16) if isinstance(va_str, str) else va_str
+        except (ValueError, TypeError):
+            va = 0
+        try:
+            vb = int(vb_str, 16) if isinstance(vb_str, str) else vb_str
+        except (ValueError, TypeError):
+            vb = 0
+        if va != vb:
+            delta = vb - va
+            sign = "+" if delta >= 0 else "-"
+            reg_changed.append({
+                "name": reg,
+                "sandbox_a": f"0x{va:X}",
+                "sandbox_b": f"0x{vb:X}",
+                "delta": f"{sign}0x{abs(delta):X}",
+            })
+
+    # --- Modules ---
+    modules_a: list[dict] = []
+    modules_b: list[dict] = []
+    try:
+        for m in client_a.get_modules():
+            modules_a.append({"base": m.base, "size": m.size, "name": m.name})
+    except Exception:
+        pass
+    try:
+        for m in client_b.get_modules():
+            modules_b.append({"base": m.base, "size": m.size, "name": m.name})
+    except Exception:
+        pass
+
+    names_a = {m["name"] for m in modules_a}
+    names_b = {m["name"] for m in modules_b}
+    modules_only_a = sorted(names_a - names_b)
+    modules_only_b = sorted(names_b - names_a)
+
+    # --- Threads ---
+    threads_a = 0
+    threads_b = 0
+    try:
+        threads_a = len(client_a.get_threads())
+    except Exception:
+        pass
+    try:
+        threads_b = len(client_b.get_threads())
+    except Exception:
+        pass
+
+    # --- Memory diff (optional) ---
+    memory_diff = None
+    if compare_memory:
+        try:
+            base_a = resolve_addr(client_a, memory_address_a)
+            base_b = resolve_addr(client_b, memory_address_b)
+        except ValueError as exc:
+            return err(str(exc), ErrorType.BAD_ARGUMENT)
+
+        try:
+            data_a = client_a.read_memory(base_a, memory_size)
+            data_b = client_b.read_memory(base_b, memory_size)
+            runs = diff_bytes(data_a, data_b)
+            changed_bytes = sum(len(r["before"]) // 2 for r in runs)
+            memory_diff = {
+                "address_a": f"0x{base_a:X}",
+                "address_b": f"0x{base_b:X}",
+                "size": memory_size,
+                "identical": changed_bytes == 0,
+                "changed_bytes": changed_bytes,
+                "diff_runs": runs,
+            }
+        except Exception as exc:
+            if is_bug(exc):
+                raise
+            return err(f"Memory read failed: {exc}", classify_exception(exc))
+
+    # --- Summary ---
+    parts = []
+    if reg_changed:
+        parts.append(f"{len(reg_changed)} register(s) differ")
+    if modules_only_a or modules_only_b:
+        parts.append(f"{len(modules_only_a)} module(s) only in A, {len(modules_only_b)} only in B")
+    if threads_a != threads_b:
+        parts.append(f"Thread count differs ({threads_a} vs {threads_b})")
+    if memory_diff and not memory_diff["identical"]:
+        parts.append(f"{memory_diff['changed_bytes']} memory byte(s) differ")
+    summary = "; ".join(parts) if parts else "No differences detected"
+
+    return ok(
+        sandbox_a_id=sandbox_a_id,
+        sandbox_b_id=sandbox_b_id,
+        arch_a=arch_a,
+        arch_b=arch_b,
+        registers={"changed": reg_changed, "total_checked": len(all_reg_names)},
+        modules={
+            "count_a": len(modules_a),
+            "count_b": len(modules_b),
+            "only_in_a": modules_only_a,
+            "only_in_b": modules_only_b,
+        },
+        threads={"count_a": threads_a, "count_b": threads_b},
+        memory=memory_diff,
+        summary=summary,
+    )
