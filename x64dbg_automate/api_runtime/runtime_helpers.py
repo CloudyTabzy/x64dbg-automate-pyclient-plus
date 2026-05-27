@@ -5,6 +5,7 @@ These operate directly on an ``X64DbgClient`` and contain no MCP/response concer
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 _GP_REGS_64 = [
@@ -12,6 +13,110 @@ _GP_REGS_64 = [
     "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags",
 ]
 _GP_REGS_32 = ["eax", "ebx", "ecx", "edx", "ebp", "esp", "esi", "edi", "eip", "eflags"]
+
+# Common function prologues, used by the heuristic boundary scanner when
+# x64dbg's own analysis hasn't run on the target yet.
+_PROLOGUE_PATTERNS = (
+    b"\x55\x8B\xEC",      # push ebp; mov ebp, esp           (x86 frame)
+    b"\x55\x89\xE5",      # push ebp; mov ebp, esp           (AT&T encoding)
+    b"\x48\x89\x5C\x24",  # mov [rsp+x], rbx                 (x64 reg save)
+    b"\x48\x8B\xC4",      # mov rax, rsp                     (MSVC x64 home)
+    b"\x40\x55",          # push rbp                         (x64 REX prefix)
+    b"\x48\x83\xEC",      # sub rsp, imm8                    (x64 stack alloc)
+    b"\x48\x81\xEC",      # sub rsp, imm32                   (x64 big frame)
+)
+_RET_BYTES = (b"\xC3", b"\xC2")  # ret / ret imm16
+
+
+@dataclass
+class FunctionBounds:
+    """Result of :func:`detect_function_bounds`.
+
+    ``method`` records how the bounds were found and ``confidence`` reflects how
+    much an agent should trust them — agents need this to decide whether to act
+    on the disassembly or fall back to manual inspection.
+    """
+    start: int
+    end: int
+    method: str          # "x64dbg" | "prologue_scan" | "ret_scan" | "fallback"
+    confidence: str      # "high" | "medium" | "low"
+    note: str = ""
+
+    @property
+    def size(self) -> int:
+        return max(0, self.end - self.start)
+
+
+def detect_function_bounds(
+    client: Any,
+    addr: int,
+    *,
+    max_back: int = 0x2000,
+    max_forward: int = 0x8000,
+) -> FunctionBounds:
+    """Find the (start, end) of the function containing ``addr``.
+
+    Layered strategy, most-trusted first:
+
+    1. **x64dbg analysis** (``get_function``) — authoritative when auto-analysis
+       has run. ``confidence="high"``.
+    2. **Prologue + RET scan** — walk backward for a known prologue, then forward
+       for a RET. Works on un-analyzed images. ``confidence="medium"``.
+    3. **RET-only scan** — no prologue found; bound forward to the next RET from
+       ``addr``. ``confidence="low"``.
+    4. **Fixed window** — last resort 4 KiB span so callers always get *some*
+       range to disassemble rather than nothing. ``confidence="low"``.
+
+    Never raises and never returns ``None`` — a usable range is always produced.
+    """
+    # 1. x64dbg's own analysis — authoritative.
+    try:
+        fb = client.get_function(addr)
+        if fb:
+            return FunctionBounds(fb.start, fb.end, "x64dbg", "high")
+    except Exception:
+        pass
+
+    # 2. Backward prologue scan, then forward RET scan.
+    scan_start = max(0, addr - max_back)
+    for off in range(addr, scan_start, -1):
+        try:
+            data = client.read_memory(off, 8)
+        except Exception:
+            continue
+        if not data:
+            continue
+        if any(data.startswith(p) for p in _PROLOGUE_PATTERNS):
+            func_start = off
+            for foff in range(addr, min(addr + max_forward, off + 0x20000)):
+                try:
+                    b = client.read_memory(foff, 1)
+                except Exception:
+                    break
+                if b in _RET_BYTES:
+                    return FunctionBounds(func_start, foff + 1, "prologue_scan", "medium")
+            return FunctionBounds(
+                func_start, addr + 0x1000, "prologue_scan", "low",
+                note="Prologue found but no RET within scan window; end is approximate.",
+            )
+
+    # 3. RET-only scan forward from addr.
+    for foff in range(addr, addr + (max_forward // 2)):
+        try:
+            b = client.read_memory(foff, 1)
+        except Exception:
+            break
+        if b in _RET_BYTES:
+            return FunctionBounds(
+                addr, foff + 1, "ret_scan", "low",
+                note="No prologue found; start assumed at the queried address.",
+            )
+
+    # 4. Absolute fallback — fixed window so callers never get nothing.
+    return FunctionBounds(
+        addr, addr + 0x1000, "fallback", "low",
+        note="Could not determine bounds; using a fixed 4 KiB window.",
+    )
 
 
 def resolve_addr(client: Any, value: Any) -> int:

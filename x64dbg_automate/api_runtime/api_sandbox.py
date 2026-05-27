@@ -86,15 +86,78 @@ def sandbox_list() -> dict:
 
 
 @tool
-def sandbox_info(sandbox_id: str | None = None) -> dict:
-    """Get a sandbox's metadata and refreshed live debugger state."""
+def sandbox_info(sandbox_id: str | None = None, *, probe_connection: bool = True) -> dict:
+    """Get a sandbox's metadata and refreshed live debugger state.
+
+    Includes a ``connection_alive`` field from a cheap PING probe so an agent
+    can distinguish "debugger process is alive but the RPC link is dead" (the
+    classic silent-disconnect trap) from a genuinely healthy session. When the
+    link is dead, call ``sandbox_reconnect``.
+
+    Args:
+        sandbox_id: Sandbox to inspect (omit for active session).
+        probe_connection: Set False to skip the PING probe (saves one round-trip).
+    """
     mgr = get_manager()
     try:
         sandbox = mgr.get_sandbox(sandbox_id)
     except KeyError as exc:
         return lookup_error(exc)
     mgr.refresh_state(sandbox)
-    return ok(**sandbox.to_info())
+    info = sandbox.to_info()
+    if probe_connection:
+        alive = None
+        client = sandbox.client
+        probe = getattr(client, "is_connection_alive", None) if client else None
+        if callable(probe):
+            try:
+                alive = bool(probe())
+            except Exception:
+                alive = False
+        info["connection_alive"] = alive
+        if alive is False:
+            info["reconnect_hint"] = (
+                "RPC link is down but the sandbox is registered — call "
+                "sandbox_reconnect to re-establish it."
+            )
+    return ok(**info)
+
+
+@tool
+def sandbox_reconnect(sandbox_id: str | None = None) -> dict:
+    """Re-establish a dropped or poisoned debugger RPC connection.
+
+    Use when ``sandbox_info`` reports ``connection_alive: false``, or after any
+    tool returns a connection-reset error. Rediscovers the x64dbg session by its
+    debugger PID and rebuilds the ZMQ sockets — the original debuggee is
+    untouched. Fails only if the x64dbg process itself is gone (recreate the
+    sandbox in that case).
+    """
+    mgr = get_manager()
+    try:
+        sandbox = mgr.get_sandbox(sandbox_id)
+    except KeyError as exc:
+        return lookup_error(exc)
+
+    try:
+        reconnected = mgr.reconnect_sandbox(sandbox.sandbox_id)
+    except SandboxError as exc:
+        return err(str(exc), ErrorType.INVALID_STATE, sandbox_id=sandbox.sandbox_id)
+    except Exception as exc:  # noqa: BLE001
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox.sandbox_id)
+
+    if not reconnected:
+        return err(
+            "Reconnect failed — the x64dbg session may be hung or terminated.",
+            ErrorType.NOT_CONNECTED,
+            hint="Verify the debugger process is alive; otherwise sandbox_destroy "
+                 "and sandbox_create a fresh session.",
+            sandbox_id=sandbox.sandbox_id,
+            last_error=sandbox.last_error,
+        )
+
+    mgr.refresh_state(sandbox)
+    return ok(reconnected=True, **sandbox.to_info())
 
 
 @tool

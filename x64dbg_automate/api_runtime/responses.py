@@ -98,13 +98,14 @@ def classify_exception(exc: BaseException) -> str:
         return ErrorType.PERMISSION_DENIED
     if name == "RuntimeError" and "xerror_" in msg:
         return ErrorType.RPC_ERROR
-    if "not connected" in msg or "no active" in msg:
+    if name == "ClientConnectionFailedError" or "not connected" in msg or "no active" in msg \
+            or "connection was reset" in msg:
         return ErrorType.NOT_CONNECTED
     return ErrorType.UNKNOWN
 
 
 _ERROR_HINTS: dict[str, str] = {
-    ErrorType.NOT_CONNECTED:       "Call start_session or connect_to_session first.",
+    ErrorType.NOT_CONNECTED:       "If a session exists, call sandbox_reconnect; otherwise start_session / connect_to_session first.",
     ErrorType.TIMEOUT:             "Increase wait_timeout or reduce the size of the operation.",
     ErrorType.INVALID_STATE:       "Check get_debugger_status — the process may not be in the expected run/paused state.",
     ErrorType.BAD_ARGUMENT:        "Check address/expression format: use '0x401000', a register name like 'RIP', or a symbol like 'kernel32:CreateFileA'.",

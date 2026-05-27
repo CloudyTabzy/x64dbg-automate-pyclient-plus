@@ -115,20 +115,49 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
                 logger.exception("Unhandled ZMQError, retrying")
 
     
+    def _build_req_socket(self) -> "zmq.SyncSocket":
+        """Create and connect a fresh REQ socket with the standard timeouts.
+
+        Extracted so it can be reused by ``_init_connection`` and by
+        ``_reset_req_socket`` (the self-healing path). ``LINGER=0`` ensures a
+        poisoned socket can be discarded immediately without blocking close().
+        """
+        sock = self.context.socket(zmq.REQ)
+        sock.setsockopt(zmq.CONNECT_TIMEOUT, 6000)
+        sock.setsockopt(zmq.SNDTIMEO, 6000)
+        sock.setsockopt(zmq.RCVTIMEO, 10000)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(f"tcp://{self.remote_host}:{self.sess_req_rep_port}")
+        return sock
+
+    def _reset_req_socket(self) -> None:
+        """Discard a poisoned/timed-out REQ socket and connect a fresh one.
+
+        A ZMQ REQ socket enforces a strict send→recv lockstep; once a recv times
+        out the socket refuses further sends (EFSM) and every later request fails
+        forever. Rebuilding the socket clears that dead state so the *next* call
+        succeeds, while any late reply to the abandoned request is dropped with
+        the old socket (no risk of being mismatched onto a future request).
+        """
+        if self.req_socket is not None:
+            try:
+                self.req_socket.close(linger=0)
+            except Exception:
+                pass
+        self.req_socket = None
+        if self.sess_req_rep_port:
+            self.req_socket = self._build_req_socket()
+
     def _init_connection(self) -> None:
         from x64dbg_automate.api_runtime.debugger_state import DebuggerState
         if self.req_socket is not None:
             self._close_connection()
 
-        self.req_socket = self.context.socket(zmq.REQ)
-        self.req_socket.setsockopt(zmq.CONNECT_TIMEOUT, 6000)
-        self.req_socket.setsockopt(zmq.SNDTIMEO, 6000)
-        self.req_socket.setsockopt(zmq.RCVTIMEO, 10000)
-        self.req_socket.connect(f"tcp://{self.remote_host}:{self.sess_req_rep_port}")
+        self.req_socket = self._build_req_socket()
         self.req_socket.send(msgpack.packb("PING"))
         if msgpack.unpackb(self.req_socket.recv()) != "PONG":
             raise ClientConnectionFailedError(f"Connection to x64dbg failed on port {self.sess_req_rep_port}")
-        
+
         self.sub_socket = self.context.socket(zmq.SUB)
         self.sub_socket.setsockopt(zmq.CONNECT_TIMEOUT, 6000)
         self.sub_socket.setsockopt(zmq.SNDTIMEO, 6000)
@@ -158,8 +187,27 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
 
     def _send_request(self, request_type: str, *args) -> tuple:
         with self._req_lock:
-            self.req_socket.send(msgpack.packb((request_type, *args)))
-            msg = msgpack.unpackb(self.req_socket.recv(), use_list=False)
+            if self.req_socket is None:
+                raise ClientConnectionFailedError(
+                    f"Not connected to x64dbg (request '{request_type}'). "
+                    "Call reconnect() / sandbox_reconnect first."
+                )
+            try:
+                self.req_socket.send(msgpack.packb((request_type, *args)))
+                msg = msgpack.unpackb(self.req_socket.recv(), use_list=False)
+            except zmq.error.ZMQError as exc:
+                # Timeout (EAGAIN) or poisoned lockstep (EFSM): rebuild the REQ
+                # socket so the connection self-heals for the next call instead
+                # of staying dead forever. We do NOT auto-retry this request —
+                # it may have been a state-changing command that already ran on
+                # the debugger side; replaying it could corrupt debuggee state.
+                self._reset_req_socket()
+                raise ClientConnectionFailedError(
+                    f"x64dbg RPC '{request_type}' failed: {exc}. "
+                    "The connection was reset automatically — retry the operation. "
+                    "If it keeps failing, the x64dbg session may be hung "
+                    "(use sandbox_reconnect or recreate the sandbox)."
+                ) from exc
         if msg is None:
             raise RuntimeError("Empty response from x64dbg")
         if isinstance(msg, tuple) and len(msg) == 2 and isinstance(msg[0], str) and msg[0].startswith("XERROR_"):
@@ -264,6 +312,67 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
         self._assert_connection_compat()
         from x64dbg_automate.api_runtime.debugger_state import DebuggerState
         self._axon_state_machine.transition(DebuggerState.STOPPED, reason="Attached to existing session")
+
+    def is_connection_alive(self, timeout_ms: int = 2000) -> bool:
+        """Cheap liveness probe — PING the plugin over a throwaway REQ socket.
+
+        Uses a dedicated short-lived socket so it can never poison the main
+        ``req_socket`` lockstep (a failed probe just closes its own socket).
+        Returns False on any error (dead plugin, wrong port, timeout) and never
+        raises, so it is safe to call before every sensitive operation.
+        """
+        if not self.sess_req_rep_port or self.context is None:
+            return False
+        probe = None
+        try:
+            probe = self.context.socket(zmq.REQ)
+            probe.setsockopt(zmq.LINGER, 0)
+            probe.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            probe.setsockopt(zmq.SNDTIMEO, timeout_ms)
+            probe.connect(f"tcp://{self.remote_host}:{self.sess_req_rep_port}")
+            probe.send(msgpack.packb("PING"))
+            return msgpack.unpackb(probe.recv()) == "PONG"
+        except Exception:
+            return False
+        finally:
+            if probe is not None:
+                try:
+                    probe.close(linger=0)
+                except Exception:
+                    pass
+
+    def reconnect(self, session_pid: int | None = None) -> bool:
+        """Re-establish a dropped or poisoned connection to a live x64dbg session.
+
+        Tears down the existing sockets and re-discovers the session by its
+        debugger PID (the x64dbg process must still be alive — its session
+        lockfile is how the ZMQ ports are rediscovered). This recovers from
+        both a poisoned REQ socket and a fully torn-down connection, including
+        the case where x64dbg's plugin rebound to new ports.
+
+        Args:
+            session_pid: Debugger PID to reconnect to. Falls back to the PID this
+                client last knew (``self.session_pid``).
+
+        Returns:
+            True once the connection is verified live (PING/PONG succeeds).
+
+        Raises:
+            RuntimeError: if no session PID is known.
+            TimeoutError: if the session lockfile cannot be found (x64dbg gone).
+        """
+        pid = session_pid or self.session_pid
+        if not pid:
+            raise RuntimeError(
+                "Cannot reconnect: no known session PID. Pass the debugger PID explicitly."
+            )
+        try:
+            self._close_connection()
+        except Exception:
+            pass
+        self.session_pid = pid
+        self.attach_session(pid)
+        return self.is_connection_alive()
     
     def detach_session(self) -> None:
         """

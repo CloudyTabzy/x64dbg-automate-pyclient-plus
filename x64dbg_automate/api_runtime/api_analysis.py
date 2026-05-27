@@ -10,14 +10,98 @@ from __future__ import annotations
 
 from x64dbg_automate.api_runtime.registry import tool
 from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, is_bug, lookup_error, ok, to_hex
-from x64dbg_automate.api_runtime.runtime_helpers import resolve_addr
+from x64dbg_automate.api_runtime.runtime_helpers import (
+    detect_function_bounds, disasm_instructions, resolve_addr,
+)
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 
 _XREF_TYPE_NAMES = {0: "NONE", 1: "DATA", 2: "JMP", 3: "CALL"}
 
+# Memory constants for the scan-based xref fallback.
+_MEM_COMMIT = 0x1000
+_PAGE_EXECUTE_ANY = 0x10 | 0x20 | 0x40 | 0x80  # EXECUTE | _READ | _READWRITE | _WRITECOPY
+_XREF_SCAN_DEFAULT_MAX = 64 * 1024 * 1024  # 64 MiB scan ceiling
+
 
 def _xref_name(t: int) -> str:
     return _XREF_TYPE_NAMES.get(t, f"UNKNOWN({t})")
+
+
+def _scan_xrefs_to(client, target: int, arch: str, max_bytes: int = _XREF_SCAN_DEFAULT_MAX) -> tuple[list[dict], bool]:
+    """Scan executable memory for direct rel32 CALL/JMP sites that target ``target``.
+
+    This is the fallback the reviewer performed by hand (``memory_search_pattern``
+    for ``E8 ?? ?? ?? ??`` + manual offset math). It finds only *direct* near
+    call/jmp (E8/E9 rel32) references — indirect/register/memory-indirect targets
+    can't be resolved statically. Each byte-level candidate is verified with the
+    real disassembler so data bytes that merely look like E8/E9 are rejected.
+
+    Returns ``(refs, truncated)`` where ``truncated`` is True if the scan ceiling
+    was hit before all executable memory was covered.
+    """
+    mask = 0xFFFFFFFFFFFFFFFF if arch == "x64" else 0xFFFFFFFF
+    try:
+        pages = client.memmap()
+    except Exception:
+        return [], False
+
+    refs: list[dict] = []
+    scanned = 0
+    truncated = False
+    seen: set[int] = set()
+
+    for page in pages:
+        if (page.state & _MEM_COMMIT) == 0:
+            continue
+        if (page.protect & _PAGE_EXECUTE_ANY) == 0:
+            continue
+        size = page.region_size
+        if scanned + size > max_bytes:
+            truncated = True
+            break
+        try:
+            data = client.read_memory(page.base_address, size)
+        except Exception:
+            continue
+        if not data:
+            continue
+        scanned += len(data)
+
+        base = page.base_address
+        # Locate candidate opcodes, then verify each with the disassembler.
+        start = 0
+        n = len(data)
+        while start < n - 4:
+            # find next E8 or E9
+            i_call = data.find(0xE8, start)
+            i_jmp = data.find(0xE9, start)
+            candidates = [c for c in (i_call, i_jmp) if c != -1 and c <= n - 5]
+            if not candidates:
+                break
+            i = min(candidates)
+            rel = int.from_bytes(data[i + 1:i + 5], "little", signed=True)
+            site = base + i
+            computed = (site + 5 + rel) & mask
+            if computed == target and site not in seen:
+                kind = "CALL" if data[i] == 0xE8 else "JMP"
+                # Verify with the real disassembler to reject false positives.
+                try:
+                    ins = client.disassemble_at(site)
+                except Exception:
+                    ins = None
+                if ins is not None:
+                    mnem = ins.instruction.strip().lower()
+                    if mnem.startswith(("call", "jmp")):
+                        seen.add(site)
+                        refs.append({
+                            "address": f"0x{site:X}",
+                            "type": kind,
+                            "instruction": ins.instruction,
+                            "source": "scan",
+                        })
+            start = i + 1
+
+    return refs, truncated
 
 
 @tool
@@ -43,12 +127,33 @@ def get_threads(sandbox_id: str | None = None) -> dict:
 
 
 @tool
-def get_xrefs(*, sandbox_id: str | None = None, address: str) -> dict:
-    """Get cross-references (calls, jumps, data refs) to/from an address.
+def get_xrefs(
+    *,
+    sandbox_id: str | None = None,
+    address: str,
+    analyze: bool = True,
+    scan_fallback: bool = True,
+) -> dict:
+    """Get cross-references (calls, jumps, data refs) to an address — reliably.
+
+    x64dbg's native xref database is empty until the target module has been
+    analyzed, so a raw query on a freshly-loaded image fails with
+    ``XERROR_XREF_FAILED``. This tool makes xrefs dependable for autonomous use:
+
+    1. Try the native xref database.
+    2. If it fails or is empty and ``analyze`` is set, run x64dbg analysis on the
+       containing module (``analr``) and retry — this populates the database.
+    3. If still empty and ``scan_fallback`` is set, scan executable memory for
+       direct rel32 CALL/JMP sites and verify each with the disassembler.
+
+    The response ``source`` field reports which path produced the results
+    (``native`` | ``scan``), and ``scan_truncated`` flags an incomplete scan.
 
     Args:
         sandbox_id: Sandbox to query.
         address: Address, symbol, or expression to look up xrefs for.
+        analyze: Run module analysis and retry if the native DB is empty (default True).
+        scan_fallback: Fall back to a memory scan for direct callers (default True).
     """
     mgr = get_manager()
     try:
@@ -59,17 +164,73 @@ def get_xrefs(*, sandbox_id: str | None = None, address: str) -> dict:
         addr = resolve_addr(client, address)
     except ValueError as exc:
         return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
-    try:
-        xrefs = client.get_xrefs(addr)
-    except Exception as exc:  # noqa: BLE001
-        if is_bug(exc):
-            raise
-        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    def _native() -> list | None:
+        try:
+            return client.get_xrefs(addr)
+        except Exception as exc:  # noqa: BLE001
+            if is_bug(exc):
+                raise
+            return None  # XERROR_XREF_FAILED or RPC error → treat as "no DB"
+
+    notes: list[str] = []
+    xrefs = _native()
+
+    # Native DB empty/failed → optionally analyze the module and retry.
+    if (not xrefs) and analyze:
+        try:
+            if client.cmd_sync(f"analr 0x{addr:X}"):
+                notes.append("Ran module analysis (analr) to populate the xref database.")
+                xrefs = _native()
+        except Exception:
+            pass
+
+    if xrefs:
+        return ok(
+            sandbox_id=sandbox_id,
+            address=f"0x{addr:X}",
+            source="native",
+            xrefs=[{"address": f"0x{x.address:X}", "type": _xref_name(x.xref_type)} for x in xrefs],
+            total=len(xrefs),
+            notes=notes or None,
+        )
+
+    # Still nothing → scan-based fallback for direct callers.
+    if scan_fallback:
+        arch = "x64"
+        try:
+            sb = mgr.get_sandbox(sandbox_id)
+            arch = sb.debugger_arch or "x64"
+        except Exception:
+            pass
+        try:
+            refs, truncated = _scan_xrefs_to(client, addr, arch)
+        except Exception as exc:  # noqa: BLE001
+            if is_bug(exc):
+                raise
+            return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+        notes.append(
+            "Native xref DB was empty; results are direct rel32 CALL/JMP callers "
+            "found by scanning executable memory. Indirect references are not included."
+        )
+        return ok(
+            sandbox_id=sandbox_id,
+            address=f"0x{addr:X}",
+            source="scan",
+            xrefs=refs,
+            total=len(refs),
+            scan_truncated=truncated,
+            notes=notes,
+        )
+
     return ok(
         sandbox_id=sandbox_id,
         address=f"0x{addr:X}",
-        xrefs=[{"address": f"0x{x.address:X}", "type": _xref_name(x.xref_type)} for x in xrefs],
-        total=len(xrefs),
+        source="native",
+        xrefs=[],
+        total=0,
+        notes=["No xrefs found. The module may be unanalyzed — retry with analyze=True "
+               "or scan_fallback=True."],
     )
 
 
@@ -108,6 +269,251 @@ def get_function_boundaries(*, sandbox_id: str | None = None, address: str) -> d
         instruction_count=fb.instruction_count,
         manual=fb.manual,
     )
+
+
+_PAGE_PROTECT_NAMES = {
+    0x01: "NOACCESS", 0x02: "READONLY", 0x04: "READWRITE", 0x08: "WRITECOPY",
+    0x10: "EXECUTE", 0x20: "EXECUTE_READ", 0x40: "EXECUTE_READWRITE", 0x80: "EXECUTE_WRITECOPY",
+}
+
+
+def _protect_name(protect: int) -> str:
+    # PAGE_GUARD (0x100) and PAGE_NOCACHE (0x200) are modifier flags on the base.
+    base_only = protect & 0xFF
+    name = _PAGE_PROTECT_NAMES.get(base_only, f"0x{protect:X}")
+    flags = []
+    if protect & 0x100:
+        flags.append("GUARD")
+    if protect & 0x200:
+        flags.append("NOCACHE")
+    return name + ("|" + "|".join(flags) if flags else "")
+
+
+@tool
+def resolve_address(*, sandbox_id: str | None = None, address: str) -> dict:
+    """Normalize any address into the full picture an RE agent needs.
+
+    Accepts an absolute address, RVA-looking value, symbol, or x64dbg expression
+    and returns every representation at once so the agent never has to do manual
+    base arithmetic (the documented "#1 agent trap"):
+
+    - ``absolute`` — the live virtual address
+    - ``module`` / ``module_base`` / ``module_path`` — containing module
+    - ``module_rva`` — offset from the containing module's base
+    - ``image_rva`` — offset from the *main* image base (matches RVAs hardcoded
+      in source/IDA that assume the default image base)
+    - ``section`` / ``protection`` / ``executable`` — region metadata
+    - ``symbol`` / ``label`` — nearest symbol and any user label
+
+    Args:
+        sandbox_id: Sandbox to query (omit for active session).
+        address: Absolute address, symbol, or expression (e.g. ``0x88729D``,
+                 ``kernel32:CreateFileA``, ``rip``, ``mod.base()+0x48729D``).
+    """
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+    try:
+        addr = resolve_addr(client, address)
+    except ValueError as exc:
+        return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+
+    result: dict = {"query": address, "absolute": f"0x{addr:X}"}
+
+    # ── Containing module + module-relative RVA ────────────────────────────
+    containing = None
+    try:
+        for m in client.get_modules():
+            if m.base <= addr < m.base + m.size:
+                containing = m
+                break
+    except Exception:
+        pass
+    if containing is not None:
+        result.update({
+            "module": containing.name,
+            "module_base": f"0x{containing.base:X}",
+            "module_path": containing.path,
+            "module_rva": f"0x{addr - containing.base:X}",
+        })
+    else:
+        result["module"] = None
+
+    # ── Main-image RVA (the "0x88729D → 0x48729D" case) ────────────────────
+    try:
+        pinfo = client.get_process_info()
+        if pinfo and pinfo.image_base:
+            result["image_base"] = f"0x{pinfo.image_base:X}"
+            if pinfo.image_base <= addr < pinfo.image_base + (pinfo.image_size or (1 << 31)):
+                result["image_rva"] = f"0x{addr - pinfo.image_base:X}"
+    except Exception:
+        pass
+
+    # ── Section / protection from the live memory map ──────────────────────
+    try:
+        for p in client.memmap():
+            if p.base_address <= addr < p.base_address + p.region_size:
+                result["section"] = p.info or None
+                result["protection"] = _protect_name(p.protect)
+                result["executable"] = bool(p.protect & _PAGE_EXECUTE_ANY)
+                result["region_base"] = f"0x{p.base_address:X}"
+                result["region_size"] = p.region_size
+                break
+    except Exception:
+        pass
+
+    # ── Nearest symbol + user label ────────────────────────────────────────
+    try:
+        sym = client.get_symbol_at(addr)
+        if sym and (sym.undecoratedSymbol or sym.decoratedSymbol):
+            result["symbol"] = sym.undecoratedSymbol or sym.decoratedSymbol
+            result["symbol_address"] = f"0x{sym.addr:X}"
+    except Exception:
+        pass
+    try:
+        label = client.get_label_at(addr)
+        if label:
+            result["label"] = label
+    except Exception:
+        pass
+
+    return ok(sandbox_id=sandbox_id, **result)
+
+
+@tool
+def find_function_start(*, sandbox_id: str | None = None, address: str) -> dict:
+    """Find the start of the function containing an address (even without analysis).
+
+    Where ``get_function_boundaries`` returns NOT_FOUND on un-analyzed images,
+    this always resolves *something* via a layered heuristic (x64dbg analysis →
+    backward prologue scan → RET scan → fixed window) and reports how it was
+    found so the agent can gauge trust.
+
+    Args:
+        sandbox_id: Sandbox to query.
+        address: Any address inside the function (address, symbol, or expression).
+
+    Returns ``start``, ``end``, ``size``, ``method`` (x64dbg | prologue_scan |
+    ret_scan | fallback), and ``confidence`` (high | medium | low).
+    """
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+    try:
+        addr = resolve_addr(client, address)
+    except ValueError as exc:
+        return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+
+    try:
+        bounds = detect_function_bounds(client, addr)
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    result = ok(
+        sandbox_id=sandbox_id,
+        query=f"0x{addr:X}",
+        start=f"0x{bounds.start:X}",
+        end=f"0x{bounds.end:X}",
+        size=bounds.size,
+        contains_query=bounds.start <= addr < bounds.end,
+        method=bounds.method,
+        confidence=bounds.confidence,
+    )
+    if bounds.note:
+        result["note"] = bounds.note
+    return result
+
+
+@tool
+def disassemble_function(
+    *,
+    sandbox_id: str | None = None,
+    address: str,
+    max_instructions: int = 512,
+) -> dict:
+    """Disassemble the entire function containing an address.
+
+    Unlike ``disassemble_range`` (linear from an exact address — which yields
+    garbage if the address is mid-instruction), this first detects the function
+    boundaries, then walks instructions from the *start* so decoding is aligned.
+    This is the tool to reach for when verifying a crash site or reading a whole
+    routine, because the agent doesn't have to know the prologue address.
+
+    Args:
+        sandbox_id: Sandbox to read from.
+        address: Any address inside the function (address, symbol, or expression).
+        max_instructions: Safety cap on instructions decoded (default 512).
+
+    Returns the detected bounds (with ``method``/``confidence``), the instruction
+    list, and ``query_index`` — the index of the instruction that contains the
+    queried address, so the agent can locate it immediately.
+    """
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+    try:
+        addr = resolve_addr(client, address)
+    except ValueError as exc:
+        return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+
+    try:
+        bounds = detect_function_bounds(client, addr)
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    cap = max(1, min(max_instructions, 4096))
+    # Disassemble from the function start, walking by real instruction size, and
+    # stop once we pass the detected end (or hit the cap). disasm_instructions
+    # already halts at a trailing RET.
+    try:
+        raw = disasm_instructions(client, bounds.start, cap)
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    instructions = []
+    query_index = None
+    truncated = False
+    for idx, ins in enumerate(raw):
+        ins_addr = int(ins["address"], 16)
+        if ins_addr >= bounds.end and bounds.method != "fallback":
+            truncated = False
+            break
+        instructions.append(ins)
+        ins_size = ins.get("size", 0) or 0
+        if ins_addr <= addr < ins_addr + ins_size:
+            query_index = len(instructions) - 1
+        if len(instructions) >= cap:
+            truncated = True
+            break
+
+    result = ok(
+        sandbox_id=sandbox_id,
+        query=f"0x{addr:X}",
+        start=f"0x{bounds.start:X}",
+        end=f"0x{bounds.end:X}",
+        size=bounds.size,
+        method=bounds.method,
+        confidence=bounds.confidence,
+        instruction_count=len(instructions),
+        instructions=instructions,
+        query_index=query_index,
+        truncated=truncated,
+    )
+    if bounds.note:
+        result["note"] = bounds.note
+    return result
 
 
 @tool
@@ -392,66 +798,18 @@ class _CallGraphBuilder:
     def _get_function_bounds(self, addr: int) -> tuple[int, int]:
         """Return (start, end) for the function containing ``addr``.
 
-        Tries x64dbg's ``get_function`` first; falls back to a heuristic scan
-        (backward for prologue, forward for RET) so we still work on images
-        where auto-analysis hasn't run.
-
-        Unlike the previous version this never returns ``None`` — if every
-        method fails we return a safe default window so the caller can still
-        disassemble something.
+        Delegates to the shared :func:`detect_function_bounds` heuristic so the
+        call-graph builder, ``find_function_start`` and ``disassemble_function``
+        all agree on boundaries. Never returns ``None``.
         """
-        # 1. x64dbg's own analysis
-        try:
-            fb = self.client.get_function(addr)
-            if fb:
-                return fb.start, fb.end
-        except Exception:
-            pass
+        from x64dbg_automate.api_runtime.runtime_helpers import detect_function_bounds
 
-        # 2. Heuristic — scan backward for common prologues, then forward for RET
-        prologue_patterns = (
-            b"\x55\x8B\xEC",      # push ebp; mov ebp, esp
-            b"\x55\x89\xE5",      # push ebp; mov ebp, esp (AT&T)
-            b"\x48\x89\x5C\x24",  # mov [rsp+...], rbx (x64)
-            b"\x48\x8B\xC4",      # mov rax, rsp (MSVC x64)
-            b"\x40\x55",          # push rbp (x64 with REX)
-        )
-        scan_start = max(0, addr - 0x2000)
-        for off in range(addr, scan_start, -1):
-            try:
-                data = self.client.read_memory(off, 8)
-            except Exception:
-                continue
-            if not data:
-                continue
-            if any(data.startswith(p) for p in prologue_patterns):
-                func_start = off
-                # Scan forward for RET (bounded to avoid runaway)
-                for foff in range(addr, min(addr + 0x8000, off + 0x20000)):
-                    try:
-                        b = self.client.read_memory(foff, 1)
-                    except Exception:
-                        break
-                    if b == b"\xC3" or b == b"\xC2":
-                        return func_start, foff + 1
-                return func_start, addr + 0x1000
-
-        # 3. Last resort — scan forward from addr looking for RET without prologue
-        for foff in range(addr, addr + 0x4000):
-            try:
-                b = self.client.read_memory(foff, 1)
-            except Exception:
-                break
-            if b == b"\xC3" or b == b"\xC2":
-                return addr, foff + 1
-
-        # 4. Absolute fallback — fixed 4 KiB window.  This guarantees we never
-        #    return None, which was the root cause of the "1-node" symptom
-        #    when all other methods failed.
-        self._diagnostics.append(
-            f"Could not determine bounds for 0x{addr:X}; using 4 KiB fallback"
-        )
-        return addr, addr + 0x1000
+        fb = detect_function_bounds(self.client, addr)
+        if fb.method == "fallback":
+            self._diagnostics.append(
+                f"Could not determine bounds for 0x{addr:X}; using 4 KiB fallback"
+            )
+        return fb.start, fb.end
 
     # ── Disassembly ───────────────────────────────────────────────────────
 

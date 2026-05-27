@@ -225,6 +225,128 @@ def trace_until_memory_change(*,
 
 
 @tool
+def watch_memory_writes(*,
+    sandbox_id: str | None = None,
+    address: str,
+    size: int,
+    max_records: int = 50,
+    timeout_sec: int = 60,
+) -> dict:
+    """Monitor a memory region and record every write that changes its contents.
+
+    Uses a persistent memory-write breakpoint. Each time the target stops because of a
+    write anywhere in the watched page(s), the region is re-read. If the bytes actually
+    changed, a record is appended. Stops when ``max_records`` is reached or ``timeout_sec``
+    elapses.  This is a multi-record upgrade of ``trace_until_memory_change``.
+
+    Args:
+        sandbox_id: Sandbox to operate on.
+        address: Region start (address, symbol, or expression).
+        size: Number of bytes to monitor (1 – 4 MiB).
+        max_records: How many distinct changes to capture before returning (1 – 500).
+        timeout_sec: Hard wall-clock limit for the entire watch session.
+
+    Returns:
+        Structured dict with a ``records`` list (each entry has before/after/diffs/cip),
+        plus aggregate metadata (total_changes, timed_out, page_level_hits, etc.).
+    """
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    try:
+        base = resolve_addr(client, address)
+    except ValueError as exc:
+        return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+    if size <= 0 or size > _MAX_REGION_READ:
+        return err("size must be between 1 and 4 MiB.", ErrorType.BAD_ARGUMENT)
+    max_records = max(1, min(max_records, 500))
+
+    records: list[dict] = []
+    page_level_hits = 0
+    snapshot: bytes | None = None
+    bp_set = False
+    deadline = time.time() + timeout_sec
+
+    try:
+        mgr.ensure_stopped(client)
+        snapshot = client.read_memory(base, size)
+        if snapshot is None or len(snapshot) != size:
+            return err(f"Failed to read {size} bytes from 0x{base:X}.",
+                       ErrorType.INVALID_STATE, sandbox_id=sandbox_id)
+
+        client.set_memory_breakpoint(base, bp_type=MemoryBreakpointType.w, singleshoot=False)
+        bp_set = True
+
+        while len(records) < max_records and time.time() < deadline:
+            remaining = max(1, int(deadline - time.time()))
+            if not client.go():
+                break
+            if not client.wait_until_stopped(remaining):
+                break
+
+            # Memory BPs are page-granular; the write may not be in our exact region.
+            current = client.read_memory(base, size)
+            if current is None or len(current) != size:
+                # Region became unreadable (e.g. deallocated) — stop gracefully.
+                break
+
+            if current == snapshot:
+                page_level_hits += 1
+                continue  # false positive: write hit the page but not our bytes
+
+            # Record the change
+            cip = None
+            try:
+                cip = client.get_reg("cip")
+            except Exception:
+                pass
+
+            records.append({
+                "index": len(records) + 1,
+                "timestamp": time.strftime("%H:%M:%S"),
+                "changed_by_instruction": (f"0x{cip:X}" if cip is not None else None),
+                "before": to_hex(snapshot),
+                "after": to_hex(current),
+                "diffs": diff_bytes(snapshot, current),
+            })
+            snapshot = current
+
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id,
+                   records_captured=len(records))
+    finally:
+        if bp_set:
+            try:
+                client.clear_memory_breakpoint(base)
+            except Exception:
+                pass
+
+    timed_out = time.time() >= deadline
+    if not records and timed_out:
+        return err("No memory changes observed before timeout.", ErrorType.TIMEOUT,
+                   sandbox_id=sandbox_id, address=f"0x{base:X}", size=size,
+                   hint="Increase timeout_sec or confirm the region is the right one.")
+
+    return ok(
+        sandbox_id=sandbox_id,
+        address=f"0x{base:X}",
+        size=size,
+        max_records=max_records,
+        timeout_sec=timeout_sec,
+        total_changes=len(records),
+        timed_out=timed_out,
+        page_level_hits=page_level_hits,
+        records=records,
+        final_snapshot=to_hex(snapshot) if snapshot is not None else None,
+    )
+
+
+@tool
 def find_crypto_material(
     sandbox_id: str | None = None,
     scan_mode: str = "all",
@@ -608,3 +730,279 @@ def _scan_region(client, base: int, size: int, scan_mode: str,
             break
         offset += chunk - overlap
     return findings, total_read
+
+
+
+@tool
+def trace_call_tree(
+    sandbox_id: str | None = None,
+    max_steps: int = 500,
+    timeout_sec: int = 60,
+    follow_tail_calls: bool = True,
+) -> dict:
+    """Single-step trace the debuggee and record a dynamic call hierarchy tree.
+
+    Steps through execution, watching for ``call`` / ``ret`` / ``jmp``
+    instructions. Builds a nested tree showing which functions called which,
+    at what depth, and whether each call was direct, indirect, or a tail call.
+
+    Args:
+        sandbox_id: Sandbox to trace.
+        max_steps: Maximum instructions to step (default 500, max 2000).
+        timeout_sec: Hard timeout for the entire trace.
+        follow_tail_calls: Treat unconditional ``jmp`` outside the current
+            function as an implicit return + call (tail call optimisation).
+
+    Returns:
+        Structured dict with ``tree`` (nested), ``flat_calls`` (linear list),
+        ``max_depth_reached``, ``total_calls``, and ``unresolved_indirect_calls``.
+    """
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    max_steps = max(1, min(max_steps, 2000))
+    deadline = time.time() + timeout_sec
+
+    # -- Helpers -----------------------------------------------------------
+    def _resolve_call_target(cip: int, insn_str: str, insn_size: int) -> tuple[int | None, str]:
+        """Resolve the target of a CALL or JMP instruction.
+
+        Returns (target_addr, call_type) where call_type is one of:
+        'direct', 'indirect', 'import', 'unresolved'.
+        """
+        # Strategy 1: expression evaluator
+        try:
+            operand = insn_str.split(None, 1)[1].strip()
+            val, success = client.eval_sync(operand)
+            if success and val:
+                # Distinguish imports by symbol lookup
+                try:
+                    sym = client.get_symbol_at(val)
+                    if sym and sym.undecoratedSymbol:
+                        return val, "import"
+                except Exception:
+                    pass
+                return val, "direct"
+        except Exception:
+            pass
+
+        # Strategy 2: decode E8 rel32 for direct CALL
+        try:
+            data = client.read_memory(cip, insn_size)
+            if data and len(data) >= 5 and data[0] == 0xE8:
+                rel = int.from_bytes(data[1:5], "little", signed=True)
+                return cip + 5 + rel, "direct"
+        except Exception:
+            pass
+
+        # Strategy 3: decode FF 15 / FF 25 (indirect via memory)
+        try:
+            data = client.read_memory(cip, insn_size)
+            if data and len(data) >= 6 and data[0] == 0xFF:
+                # FF 15 → call [rip+disp32] (x64)
+                # FF 25 → jmp [rip+disp32] (x64)
+                if data[1] in (0x15, 0x25):
+                    disp = int.from_bytes(data[2:6], "little", signed=True)
+                    ea = cip + 6 + disp
+                    try:
+                        ptr = client.read_qword(ea) if mgr.get_sandbox(sandbox_id).debugger_arch == "x64" else client.read_dword(ea)
+                        return ptr, "indirect"
+                    except Exception:
+                        return ea, "indirect"
+        except Exception:
+            pass
+
+        return None, "unresolved"
+
+    def _node_name(addr: int) -> str:
+        try:
+            sym = client.get_symbol_at(addr)
+            if sym and sym.undecoratedSymbol:
+                return sym.undecoratedSymbol
+            if sym and sym.decoratedSymbol:
+                return sym.decoratedSymbol
+        except Exception:
+            pass
+        return f"sub_{addr:X}"
+
+    def _is_inside_function(cip: int, func_start: int, func_end: int) -> bool:
+        return func_start <= cip < func_end
+
+    # -- Tree structures ---------------------------------------------------
+    # Each frame: {"address", "name", "call_type", "call_insn", "children": []}
+    # The stack holds references to the *same* dicts that end up in the tree.
+    root_addr = 0
+    try:
+        root_addr = client.get_reg("cip")
+    except Exception:
+        return err("Could not read CIP to start trace.", ErrorType.INVALID_STATE, sandbox_id=sandbox_id)
+
+    root_node: dict = {
+        "address": f"0x{root_addr:X}",
+        "name": _node_name(root_addr),
+        "call_type": "root",
+        "call_instruction": None,
+        "children": [],
+    }
+    call_stack: list[dict] = [root_node]
+    flat_calls: list[dict] = []
+    unresolved_count = 0
+    max_depth = 0
+
+    # Track current function bounds heuristically for tail-call detection.
+    # We use the nearest symbol / function start, or fall back to CIP itself.
+    current_func_start = root_addr
+    current_func_end = root_addr + 0xFFFF
+    try:
+        fb = client.get_function(root_addr)
+        if fb:
+            current_func_start = fb.start
+            current_func_end = fb.end
+    except Exception:
+        pass
+
+    # -- Trace loop --------------------------------------------------------
+    try:
+        mgr.ensure_stopped(client)
+        for step in range(max_steps):
+            if time.time() > deadline:
+                break
+
+            cip = client.get_reg("cip")
+            ins = client.disassemble_at(cip)
+            if ins is None:
+                # Can't disassemble — attempt one step then continue
+                client.stepi()
+                client.wait_until_stopped(2)
+                continue
+
+            mnemonic_lower = ins.instruction.lower()
+            op = mnemonic_lower.split()[0]
+
+            # -- CALL ------------------------------------------------------
+            if op == "call":
+                target, ctype = _resolve_call_target(cip, ins.instruction, ins.instr_size)
+                if target is None:
+                    unresolved_count += 1
+                    target_name = "unresolved"
+                    target_str = None
+                else:
+                    target_name = _node_name(target)
+                    target_str = f"0x{target:X}"
+
+                child = {
+                    "address": target_str,
+                    "name": target_name,
+                    "call_type": ctype,
+                    "call_instruction": f"0x{cip:X}",
+                    "children": [],
+                }
+                call_stack[-1]["children"].append(child)
+                call_stack.append(child)
+                flat_calls.append({
+                    "depth": len(call_stack) - 1,
+                    "caller": call_stack[-2]["address"] if len(call_stack) > 1 else None,
+                    "callee": target_str,
+                    "callee_name": target_name,
+                    "call_type": ctype,
+                    "instruction": f"0x{cip:X}",
+                })
+                max_depth = max(max_depth, len(call_stack) - 1)
+
+                # Update heuristic function bounds for tail-call detection
+                if target is not None:
+                    current_func_start = target
+                    current_func_end = target + 0xFFFF
+                    try:
+                        fb = client.get_function(target)
+                        if fb:
+                            current_func_start = fb.start
+                            current_func_end = fb.end
+                    except Exception:
+                        pass
+
+            # -- RET -------------------------------------------------------
+            elif op in ("ret", "retn"):
+                if len(call_stack) > 1:
+                    call_stack.pop()
+                    # Restore function bounds to caller's context
+                    caller_addr = int(call_stack[-1]["address"], 16)
+                    current_func_start = caller_addr
+                    current_func_end = caller_addr + 0xFFFF
+                    try:
+                        fb = client.get_function(caller_addr)
+                        if fb:
+                            current_func_start = fb.start
+                            current_func_end = fb.end
+                    except Exception:
+                        pass
+
+            # -- JMP (tail call) -------------------------------------------
+            elif follow_tail_calls and op == "jmp":
+                target, ctype = _resolve_call_target(cip, ins.instruction, ins.instr_size)
+                if target is not None and not _is_inside_function(target, current_func_start, current_func_end):
+                    # Treat as tail call: pop current frame, push new one
+                    if len(call_stack) > 1:
+                        call_stack.pop()
+
+                    child = {
+                        "address": f"0x{target:X}",
+                        "name": _node_name(target),
+                        "call_type": "tail_call",
+                        "call_instruction": f"0x{cip:X}",
+                        "children": [],
+                    }
+                    call_stack[-1]["children"].append(child)
+                    call_stack.append(child)
+                    flat_calls.append({
+                        "depth": len(call_stack) - 1,
+                        "caller": call_stack[-2]["address"] if len(call_stack) > 1 else None,
+                        "callee": f"0x{target:X}",
+                        "callee_name": _node_name(target),
+                        "call_type": "tail_call",
+                        "instruction": f"0x{cip:X}",
+                    })
+                    max_depth = max(max_depth, len(call_stack) - 1)
+
+                    current_func_start = target
+                    current_func_end = target + 0xFFFF
+                    try:
+                        fb = client.get_function(target)
+                        if fb:
+                            current_func_start = fb.start
+                            current_func_end = fb.end
+                    except Exception:
+                        pass
+
+            # -- Step ------------------------------------------------------
+            client.stepi()
+            if not client.wait_until_stopped(5):
+                break
+
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id,
+                   steps_recorded=step + 1 if 'step' in dir() else 0)
+
+    # -- Result ------------------------------------------------------------
+    total_calls = len(flat_calls)
+    truncated = step + 1 >= max_steps if 'step' in dir() else False
+    timed_out = time.time() > deadline if 'deadline' in dir() else False
+
+    return ok(
+        sandbox_id=sandbox_id,
+        start_address=root_node["address"],
+        max_steps=max_steps,
+        steps_recorded=step + 1 if 'step' in dir() else 0,
+        tree=root_node,
+        flat_calls=flat_calls,
+        max_depth_reached=max_depth,
+        total_calls=total_calls,
+        unresolved_indirect_calls=unresolved_count,
+        truncated=truncated,
+        timed_out=timed_out,
+    )

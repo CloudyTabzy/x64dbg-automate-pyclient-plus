@@ -277,6 +277,69 @@ class SandboxManager:
             )
         return sandbox.client
 
+    def ensure_connected(self, sandbox_id: str | None = None, *, probe_timeout_ms: int = 2000) -> bool:
+        """Verify the sandbox's debugger connection is live, reconnecting if not.
+
+        Cheap by design: a single short PING; only on failure does it pay the
+        cost of a full reconnect. Use this at the top of latency-tolerant or
+        connection-sensitive flows so a poisoned/dropped socket self-heals
+        transparently instead of surfacing as a NOT_CONNECTED error.
+
+        Returns:
+            True if the connection was already live or was successfully
+            reconnected; False if recovery failed (caller should surface a
+            NOT_CONNECTED / INVALID_STATE error).
+
+        Raises:
+            KeyError: if the sandbox id is unknown.
+            SandboxError: if the sandbox has no client at all.
+        """
+        sandbox = self.get_sandbox(sandbox_id)
+        client = sandbox.client
+        if client is None:
+            raise SandboxError(
+                f"Sandbox '{sandbox.sandbox_id}' has no active debugger client"
+            )
+
+        alive_probe = getattr(client, "is_connection_alive", None)
+        if callable(alive_probe):
+            try:
+                if alive_probe(probe_timeout_ms):
+                    return True
+            except Exception:
+                pass  # treat probe failure as "needs reconnect"
+
+        return self.reconnect_sandbox(sandbox.sandbox_id)
+
+    def reconnect_sandbox(self, sandbox_id: str | None = None) -> bool:
+        """Force a reconnect of the sandbox's debugger connection.
+
+        Re-discovers the session by its debugger PID and rebuilds the ZMQ
+        sockets. Returns True on a verified reconnect, False otherwise (and
+        records the failure on ``sandbox.last_error``).
+        """
+        sandbox = self.get_sandbox(sandbox_id)
+        client = sandbox.client
+        if client is None:
+            raise SandboxError(
+                f"Sandbox '{sandbox.sandbox_id}' has no active debugger client"
+            )
+        reconnect = getattr(client, "reconnect", None)
+        if not callable(reconnect):
+            raise SandboxError(
+                "This client does not support reconnect; recreate the sandbox."
+            )
+        try:
+            ok_ = bool(reconnect(sandbox.debugger_pid))
+        except Exception as exc:
+            sandbox.last_error = f"reconnect failed: {exc}"
+            self.refresh_state(sandbox)
+            return False
+        if ok_:
+            sandbox.last_error = None
+            self.refresh_state(sandbox)
+        return ok_
+
     def set_active_session(self, sandbox_id: str) -> None:
         with self._lock:
             if sandbox_id not in self._sandboxes:
