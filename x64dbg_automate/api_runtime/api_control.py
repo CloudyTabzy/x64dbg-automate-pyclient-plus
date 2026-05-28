@@ -376,3 +376,103 @@ def step_over(*, sandbox_id: str | None = None, count: int = 1) -> dict:
 def step_out(*, sandbox_id: str | None = None, frames: int = 1) -> dict:
     """Run until the current function returns (``frames`` levels). State-mutating."""
     return _step(sandbox_id, "ret", frames=max(1, frames))
+
+
+# ---------------------------------------------------------------------------
+# DLL-load breakpoints
+# ---------------------------------------------------------------------------
+
+@tool
+@unsafe
+def breakpoint_on_module_load(
+    *,
+    sandbox_id: str | None = None,
+    module_name: str,
+    singleshoot: bool = True,
+) -> dict:
+    """Set a breakpoint that fires when a specific DLL is loaded into the debuggee.
+
+    Uses x64dbg's built-in ``bpdll`` command, which hooks the loader and pauses
+    execution immediately after the named module is mapped.  This is a persistent
+    BP (fires every time the module loads) unless ``singleshoot=True``.
+
+    To remove the BP later: call ``breakpoint_clear_module_load(module_name)``.
+
+    Args:
+        sandbox_id: Target sandbox.
+        module_name: DLL filename (without path), e.g. ``'dinput8.dll'`` or
+                     ``'dinput8'``.  x64dbg performs a case-insensitive match.
+        singleshoot: Remove after the first hit (default True).
+
+    Returns:
+        ``set`` (bool), ``module_name``, ``singleshoot``.
+    """
+    client, sandbox, error = _client_or_error(sandbox_id)
+    if error:
+        return error
+    name = module_name.strip()
+    if not name:
+        return err("module_name must not be empty.", ErrorType.BAD_ARGUMENT)
+
+    # bpdll <name>[, singleshoot] — the second token is the literal string "1"
+    # when singleshoot is requested.
+    cmd = f"bpdll {name}" + (", 1" if singleshoot else "")
+    try:
+        result = client.cmd_sync(cmd)
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    if not result:
+        return err(
+            f"bpdll command failed for module '{name}'.",
+            ErrorType.RPC_ERROR,
+            hint=(
+                "Ensure the module name is correct (no path, e.g. 'dinput8.dll'). "
+                "Use breakpoint_list() to verify. If the module is already loaded, "
+                "consider trace_until_module_load() for a programmatic wait-loop instead."
+            ),
+            sandbox_id=sandbox_id,
+        )
+
+    return ok(
+        sandbox_id=sandbox_id,
+        set=True,
+        module_name=name,
+        singleshoot=singleshoot,
+        note=(
+            "Breakpoint will fire when x64dbg detects the DLL being loaded. "
+            "Use breakpoint_clear_module_load to remove it."
+        ),
+    )
+
+
+@tool
+@unsafe
+def breakpoint_clear_module_load(
+    *,
+    sandbox_id: str | None = None,
+    module_name: str = "",
+) -> dict:
+    """Remove a DLL-load breakpoint set by ``breakpoint_on_module_load``.
+
+    Omit ``module_name`` to clear **all** DLL-load breakpoints.
+
+    Args:
+        sandbox_id: Target sandbox.
+        module_name: DLL name to clear; omit to clear all.
+    """
+    client, sandbox, error = _client_or_error(sandbox_id)
+    if error:
+        return error
+    name = module_name.strip()
+    cmd = f"bcdll {name}" if name else "bcdll"
+    try:
+        result = client.cmd_sync(cmd)
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+    return ok(sandbox_id=sandbox_id, cleared=bool(result),
+              module_name=name or None)

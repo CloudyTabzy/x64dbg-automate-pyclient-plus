@@ -1006,3 +1006,167 @@ def trace_call_tree(
         truncated=truncated,
         timed_out=timed_out,
     )
+
+
+# ---------------------------------------------------------------------------
+# trace_until_module_load — resume until a specific DLL appears
+# ---------------------------------------------------------------------------
+
+@tool
+def trace_until_module_load(
+    *,
+    sandbox_id: str | None = None,
+    module_name: str,
+    timeout_sec: float = 30.0,
+    include_all_new: bool = False,
+) -> dict:
+    """Resume execution until a specific module is loaded into the debuggee.
+
+    Leverages x64dbg's default DLL-load pause events: each time a new DLL is
+    mapped the debugger stops, this tool checks whether the target module has
+    appeared, and resumes automatically if not.  Stops (and returns) the moment
+    ``module_name`` is found in the module list, leaving the process paused at
+    the DLL-load event so the agent can immediately inspect the new module.
+
+    Typical use: detecting codec injection (VSFilter.dll), lazy-loaded crypto
+    DLLs, or anti-cheat overlay modules.
+
+    Args:
+        sandbox_id: Target sandbox.
+        module_name: Substring to match against module names (case-insensitive).
+                     E.g. ``'dinput8'`` matches ``dinput8.dll``.
+        timeout_sec: Max seconds to wait (default 30).
+        include_all_new: When True, also report every *other* module that was
+                         loaded before the target (useful for auditing load order).
+
+    Returns:
+        ``found`` (bool), ``module`` info dict (base/size/path/entry) when found,
+        ``resume_count`` (auto-resumes before finding target), and optionally
+        ``modules_loaded_before`` when ``include_all_new`` is True.
+    """
+    mgr = get_manager()
+    try:
+        sandbox = mgr.get_sandbox(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+    if sandbox.client is None:
+        return err(
+            f"Sandbox '{sandbox.sandbox_id}' has no active debugger client.",
+            ErrorType.NOT_CONNECTED,
+        )
+    client = sandbox.client
+    needle = module_name.strip().lower()
+    if not needle:
+        return err("module_name must not be empty.", ErrorType.BAD_ARGUMENT)
+
+    # Snapshot the module list before we start so we only track new arrivals.
+    try:
+        baseline = {m.name.lower() for m in (client.get_modules() or [])}
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(f"get_modules failed: {exc}", classify_exception(exc),
+                   sandbox_id=sandbox_id)
+
+    # Early-exit: already loaded.
+    for name in baseline:
+        if needle in name:
+            try:
+                mods = client.get_modules() or []
+                hit = next((m for m in mods if needle in m.name.lower()), None)
+            except Exception:
+                hit = None
+            return ok(
+                sandbox_id=sandbox_id,
+                found=True,
+                module=_module_info(hit) if hit else None,
+                resume_count=0,
+                modules_loaded_before=[],
+                note="Module was already loaded before trace started.",
+            )
+
+    # Kick off execution if currently paused.
+    resume_count = 0
+    try:
+        if not client.is_running():
+            client.go()
+            resume_count += 1
+    except Exception:
+        pass
+
+    deadline = time.time() + timeout_sec
+    modules_loaded_before: list[dict] = []
+
+    while time.time() < deadline:
+        time.sleep(0.1)
+
+        try:
+            running = client.is_running()
+        except Exception:
+            running = False
+
+        if running:
+            continue
+
+        # Paused — check the module list.
+        try:
+            current_mods = client.get_modules() or []
+        except Exception:
+            current_mods = []
+
+        current_names = {m.name.lower() for m in current_mods}
+        new_names = current_names - baseline
+        baseline = current_names
+
+        # Collect new arrivals for include_all_new reporting.
+        if include_all_new:
+            for m in current_mods:
+                if m.name.lower() in new_names:
+                    modules_loaded_before.append(_module_info(m))
+
+        # Check for the target module.
+        hit = next((m for m in current_mods if needle in m.name.lower()), None)
+        if hit is not None:
+            # Remove the hit from the "loaded before" list — it IS the target.
+            modules_loaded_before = [
+                x for x in modules_loaded_before
+                if x.get("name", "").lower() != hit.name.lower()
+            ]
+            return ok(
+                sandbox_id=sandbox_id,
+                found=True,
+                module=_module_info(hit),
+                resume_count=resume_count,
+                modules_loaded_before=modules_loaded_before,
+            )
+
+        # Target not yet loaded — resume.
+        try:
+            client.go()
+            resume_count += 1
+        except Exception:
+            pass
+
+    # Timeout.
+    return err(
+        f"Timed out after {timeout_sec}s waiting for module matching '{module_name}'.",
+        ErrorType.TIMEOUT,
+        hint=(
+            "Increase timeout_sec for slow loaders, or use get_modules() to check what "
+            "is currently loaded. The module may load later in the process lifecycle."
+        ),
+        sandbox_id=sandbox_id,
+        resume_count=resume_count,
+        found=False,
+    )
+
+
+def _module_info(m) -> dict:
+    """Compact module descriptor from a get_modules() entry."""
+    return {
+        "name": m.name,
+        "base": f"0x{m.base:X}",
+        "size": m.size,
+        "entry": f"0x{m.entry:X}" if m.entry else None,
+        "path": m.path,
+    }

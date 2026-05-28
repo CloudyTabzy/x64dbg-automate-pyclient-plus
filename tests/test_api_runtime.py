@@ -6103,3 +6103,369 @@ class TestBreakpointClearNotFound:
         assert r["success"]
         assert r["cleared"] is False
         assert r.get("not_found") is True
+
+
+# ---------------------------------------------------------------------------
+# V4 Wishlist: compare_memory
+# ---------------------------------------------------------------------------
+
+class TestCompareMemory:
+    def test_identical_regions(self, manager):
+        """Identical byte sequences must return match=True and no diff runs."""
+        from x64dbg_automate.api_runtime.api_memory import compare_memory
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.eval_sync.return_value = (0, True)
+        data = bytes(range(16))
+        sb.client.read_memory.return_value = data
+
+        r = compare_memory(sandbox_id="aa11", address_a="0x401000",
+                           address_b="0x402000", size=16)
+        assert r["success"]
+        assert r["match"] is True
+        assert r["diff_count"] == 0
+        assert r["diff_runs"] == []
+        assert r["percent_match"] == 100.0
+
+    def test_differing_regions(self, manager):
+        """Differing bytes must produce diff_runs and match=False."""
+        from x64dbg_automate.api_runtime.api_memory import compare_memory
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.eval_sync.side_effect = [(0x401000, True), (0x402000, True)]
+        data_a = b"\x90\x90\x90\x90"
+        data_b = b"\x90\xCC\x90\xCC"
+        sb.client.read_memory.side_effect = [data_a, data_b]
+
+        r = compare_memory(sandbox_id="aa11", address_a="0x401000",
+                           address_b="0x402000", size=4)
+        assert r["success"]
+        assert r["match"] is False
+        assert r["diff_count"] == 2
+        assert len(r["diff_runs"]) >= 1
+
+    def test_size_capped_at_64k(self, manager):
+        """Size above 64 KiB must be silently capped."""
+        from x64dbg_automate.api_runtime.api_memory import compare_memory
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.eval_sync.return_value = (0, True)
+        sb.client.read_memory.return_value = b"\x00" * 65536
+
+        r = compare_memory(sandbox_id="aa11", address_a="0x0",
+                           address_b="0x10000", size=1_000_000)
+        assert r["success"]
+        assert r["bytes_compared"] == 65536
+
+    def test_unreadable_region_returns_error(self, manager):
+        """Unreadable address_a must return NOT_FOUND."""
+        from x64dbg_automate.api_runtime.api_memory import compare_memory
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.eval_sync.return_value = (0x401000, True)
+        sb.client.read_memory.return_value = None   # unreadable
+
+        r = compare_memory(sandbox_id="aa11", address_a="0x401000",
+                           address_b="0x402000", size=4)
+        assert not r["success"]
+        assert r["error_type"] == "NOT_FOUND"
+
+    def test_no_client_returns_error(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import compare_memory
+        sb = _mock_sandbox(manager)
+        sb.client = None
+        r = compare_memory(sandbox_id="aa11", address_a="0x0", address_b="0x1000", size=4)
+        assert not r["success"]
+        assert r["error_type"] == "NOT_CONNECTED"
+
+
+# ---------------------------------------------------------------------------
+# V4 Wishlist: dump_module_to_disk
+# ---------------------------------------------------------------------------
+
+class TestDumpModuleToDisk:
+    def test_dumps_module_by_address(self, manager, tmp_path):
+        """Happy path: address inside module, writes bytes to disk."""
+        from x64dbg_automate.api_runtime.api_memory import dump_module_to_disk
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.eval_sync.return_value = (0x401234, True)
+
+        mod = MagicMock()
+        mod.name = "target.exe"
+        mod.path = r"C:\game\target.exe"
+        mod.base = 0x400000
+        mod.size = 0x10000
+        sb.client.get_modules.return_value = [mod]
+        sb.client.read_memory.return_value = b"\x4D\x5A" + b"\x00" * (65534)
+
+        out = str(tmp_path / "target_dump.bin")
+        r = dump_module_to_disk(sandbox_id="aa11", address="0x401234", output_path=out)
+
+        assert r["success"]
+        assert r["module"] == "target.exe"
+        assert r["bytes_written"] == 0x10000
+        import os
+        assert os.path.isfile(out)
+
+    def test_dumps_module_by_name(self, manager, tmp_path):
+        """module_name substring match must locate the correct module."""
+        from x64dbg_automate.api_runtime.api_memory import dump_module_to_disk
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+
+        mod = MagicMock()
+        mod.name = "dinput8.dll"
+        mod.path = r"C:\windows\system32\dinput8.dll"
+        mod.base = 0x700000
+        mod.size = 0x8000
+        sb.client.get_modules.return_value = [mod]
+        sb.client.read_memory.return_value = b"\x00" * 0x8000
+
+        out = str(tmp_path / "dinput8.bin")
+        r = dump_module_to_disk(sandbox_id="aa11", module_name="dinput8", output_path=out)
+
+        assert r["success"]
+        assert r["module"] == "dinput8.dll"
+
+    def test_address_not_in_any_module(self, manager, tmp_path):
+        """Address outside all modules must return NOT_FOUND."""
+        from x64dbg_automate.api_runtime.api_memory import dump_module_to_disk
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.eval_sync.return_value = (0xDEAD0000, True)
+
+        mod = MagicMock()
+        mod.base = 0x400000
+        mod.size = 0x1000
+        sb.client.get_modules.return_value = [mod]
+
+        r = dump_module_to_disk(sandbox_id="aa11", address="0xDEAD0000",
+                                output_path=str(tmp_path / "x.bin"))
+        assert not r["success"]
+        assert r["error_type"] == "NOT_FOUND"
+
+    def test_module_name_not_found(self, manager, tmp_path):
+        """Non-matching module_name must return NOT_FOUND."""
+        from x64dbg_automate.api_runtime.api_memory import dump_module_to_disk
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.get_modules.return_value = []
+
+        r = dump_module_to_disk(sandbox_id="aa11", module_name="nonexistent",
+                                output_path=str(tmp_path / "x.bin"))
+        assert not r["success"]
+        assert r["error_type"] == "NOT_FOUND"
+
+    def test_no_address_or_name_is_bad_argument(self, manager, tmp_path):
+        from x64dbg_automate.api_runtime.api_memory import dump_module_to_disk
+        sb = _mock_sandbox(manager)
+        r = dump_module_to_disk(sandbox_id="aa11", output_path=str(tmp_path / "x.bin"))
+        assert not r["success"]
+        assert r["error_type"] == "BAD_ARGUMENT"
+
+
+# ---------------------------------------------------------------------------
+# V4 Wishlist: trace_until_module_load
+# ---------------------------------------------------------------------------
+
+class TestTraceUntilModuleLoad:
+    @pytest.fixture(autouse=True)
+    def _mgr(self, manager):
+        self._manager = manager
+
+    def test_module_already_loaded(self, monkeypatch):
+        """If target module is already in the list, return immediately."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_composite import trace_until_module_load
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(self._manager)
+        mod = MagicMock()
+        mod.name = "dinput8.dll"; mod.base = 0x700000; mod.size = 0x8000
+        mod.entry = 0x700100; mod.path = r"C:\windows\system32\dinput8.dll"
+        sb.client.get_modules.return_value = [mod]
+
+        r = trace_until_module_load(sandbox_id="aa11", module_name="dinput8")
+        assert r["success"]
+        assert r["found"] is True
+        assert r["resume_count"] == 0
+        assert r["module"]["name"] == "dinput8.dll"
+
+    def test_module_loads_after_one_resume(self, monkeypatch):
+        """Module not yet loaded; appears after one go() + pause cycle."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_composite import trace_until_module_load
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(self._manager)
+        mod = MagicMock()
+        mod.name = "dinput8.dll"; mod.base = 0x700000; mod.size = 0x8000
+        mod.entry = 0x700100; mod.path = r"C:\windows\system32\dinput8.dll"
+
+        call_count = {"n": 0}
+        def _get_mods():
+            call_count["n"] += 1
+            return [] if call_count["n"] <= 2 else [mod]
+
+        sb.client.get_modules.side_effect = _get_mods
+        sb.client.is_running.side_effect = [False, False, False, False]
+        sb.client.go.return_value = True
+
+        r = trace_until_module_load(sandbox_id="aa11", module_name="dinput8",
+                                    timeout_sec=5.0)
+        assert r["success"]
+        assert r["found"] is True
+        assert r["resume_count"] >= 1
+
+    def test_timeout_returns_error(self, monkeypatch):
+        """Timeout before module appears → TIMEOUT error."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_composite import trace_until_module_load
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(self._manager)
+        sb.client.get_modules.return_value = []
+        sb.client.is_running.return_value = True   # always running → never pauses
+
+        r = trace_until_module_load(sandbox_id="aa11", module_name="vsfilter",
+                                    timeout_sec=0.01)
+        assert not r["success"]
+        assert r["error_type"] == "TIMEOUT"
+        assert r["found"] is False
+
+    def test_no_client_returns_error(self):
+        from x64dbg_automate.api_runtime.api_composite import trace_until_module_load
+        sb = _mock_sandbox(self._manager)
+        sb.client = None
+        r = trace_until_module_load(sandbox_id="aa11", module_name="vsfilter")
+        assert not r["success"]
+        assert r["error_type"] == "NOT_CONNECTED"
+
+    def test_include_all_new_reports_intermediate_loads(self, monkeypatch):
+        """include_all_new=True must list modules loaded before the target."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_composite import trace_until_module_load
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(self._manager)
+
+        def _mod(name, base):
+            m = MagicMock()
+            m.name = name; m.base = base; m.size = 0x1000
+            m.entry = base + 0x100; m.path = f"C:\\{name}"
+            return m
+
+        first = _mod("first.dll", 0x600000)
+        target = _mod("vsfilter.dll", 0x700000)
+
+        call_count = {"n": 0}
+        def _get_mods():
+            call_count["n"] += 1
+            if call_count["n"] == 1: return []           # baseline
+            if call_count["n"] == 2: return [first]      # first.dll loaded
+            return [first, target]                       # vsfilter.dll loaded
+
+        sb.client.get_modules.side_effect = _get_mods
+        sb.client.is_running.side_effect = [False, False, False, False]
+        sb.client.go.return_value = True
+
+        r = trace_until_module_load(sandbox_id="aa11", module_name="vsfilter",
+                                    timeout_sec=5.0, include_all_new=True)
+        assert r["success"]
+        assert r["found"] is True
+        assert any("first.dll" in m["name"] for m in r["modules_loaded_before"])
+
+
+# ---------------------------------------------------------------------------
+# V4 Wishlist: breakpoint_on_module_load / breakpoint_clear_module_load
+# ---------------------------------------------------------------------------
+
+class TestBreakpointOnModuleLoad:
+    def test_sets_bpdll_command(self, manager):
+        """bpdll command must be sent with the module name."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_on_module_load
+
+        sb = _mock_sandbox(manager)
+        sb.client.cmd_sync.return_value = True
+
+        r = breakpoint_on_module_load(sandbox_id="aa11", module_name="dinput8.dll")
+        assert r["success"]
+        assert r["set"] is True
+        assert r["singleshoot"] is True
+        calls = [str(c) for c in sb.client.cmd_sync.call_args_list]
+        assert any("bpdll" in c and "dinput8.dll" in c for c in calls)
+
+    def test_singleshoot_flag_sent(self, manager):
+        """singleshoot=True must add ', 1' to the command."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_on_module_load
+
+        sb = _mock_sandbox(manager)
+        sb.client.cmd_sync.return_value = True
+
+        breakpoint_on_module_load(sandbox_id="aa11", module_name="foo.dll", singleshoot=True)
+        call_str = str(sb.client.cmd_sync.call_args)
+        assert "1" in call_str
+
+    def test_persistent_bp_no_singleshoot(self, manager):
+        """singleshoot=False must NOT add the ', 1' suffix."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_on_module_load
+
+        sb = _mock_sandbox(manager)
+        sb.client.cmd_sync.return_value = True
+
+        breakpoint_on_module_load(sandbox_id="aa11", module_name="foo.dll", singleshoot=False)
+        call_str = str(sb.client.cmd_sync.call_args)
+        assert "bpdll foo.dll" in call_str
+        assert ", 1" not in call_str
+
+    def test_command_failure_returns_error(self, manager):
+        """When cmd_sync returns False, tool must return error with hint."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_on_module_load
+
+        sb = _mock_sandbox(manager)
+        sb.client.cmd_sync.return_value = False
+
+        r = breakpoint_on_module_load(sandbox_id="aa11", module_name="missing.dll")
+        assert not r["success"]
+        assert r["error_type"] == "RPC_ERROR"
+        assert "hint" in r
+
+    def test_empty_module_name_bad_argument(self, manager):
+        from x64dbg_automate.api_runtime.api_control import breakpoint_on_module_load
+        sb = _mock_sandbox(manager)
+        r = breakpoint_on_module_load(sandbox_id="aa11", module_name="  ")
+        assert not r["success"]
+        assert r["error_type"] == "BAD_ARGUMENT"
+
+    def test_clear_sends_bcdll(self, manager):
+        """breakpoint_clear_module_load must send 'bcdll <name>'."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_clear_module_load
+
+        sb = _mock_sandbox(manager)
+        sb.client.cmd_sync.return_value = True
+
+        r = breakpoint_clear_module_load(sandbox_id="aa11", module_name="dinput8.dll")
+        assert r["success"]
+        calls = [str(c) for c in sb.client.cmd_sync.call_args_list]
+        assert any("bcdll" in c and "dinput8.dll" in c for c in calls)
+
+    def test_clear_all_sends_bare_bcdll(self, manager):
+        """Omitting module_name must send bare 'bcdll' to clear all."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_clear_module_load
+
+        sb = _mock_sandbox(manager)
+        sb.client.cmd_sync.return_value = True
+
+        r = breakpoint_clear_module_load(sandbox_id="aa11")
+        assert r["success"]
+        call_str = str(sb.client.cmd_sync.call_args)
+        assert "bcdll" in call_str

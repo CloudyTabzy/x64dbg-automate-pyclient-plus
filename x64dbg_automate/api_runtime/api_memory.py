@@ -1036,3 +1036,242 @@ def sandbox_cross_diff(
         memory=memory_diff,
         summary=summary,
     )
+
+
+# ---------------------------------------------------------------------------
+# compare_memory — byte-by-byte diff of two live memory regions
+# ---------------------------------------------------------------------------
+
+@tool
+def compare_memory(
+    *,
+    sandbox_id: str | None = None,
+    address_a: str,
+    address_b: str,
+    size: int,
+) -> dict:
+    """Byte-by-byte diff of two live memory regions in the same sandbox.
+
+    Useful for checking whether two code regions are identical (e.g. confirming
+    a patch was applied), comparing plaintext vs ciphertext buffers, or verifying
+    that two struct instances share the same layout.
+
+    Args:
+        sandbox_id: Target sandbox.
+        address_a: First region start address, symbol, or expression.
+        address_b: Second region start address, symbol, or expression.
+        size: Number of bytes to compare (must be > 0, capped at 64 KiB).
+
+    Returns:
+        ``match`` (bool), ``bytes_compared``, ``diff_count`` (differing bytes),
+        ``diff_runs`` (contiguous changed spans: offset/before/after as hex),
+        ``percent_match``.
+    """
+    mgr = get_manager()
+    try:
+        sandbox = mgr.get_sandbox(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+    if sandbox.client is None:
+        return err(
+            f"Sandbox '{sandbox.sandbox_id}' has no active debugger client.",
+            ErrorType.NOT_CONNECTED,
+        )
+    client = sandbox.client
+
+    size = max(1, min(size, 65536))
+
+    try:
+        addr_a = resolve_addr(client, address_a)
+    except ValueError as exc:
+        return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+    try:
+        addr_b = resolve_addr(client, address_b)
+    except ValueError as exc:
+        return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+
+    try:
+        mgr.ensure_stopped(client)
+        data_a = client.read_memory(addr_a, size)
+        data_b = client.read_memory(addr_b, size)
+    except SandboxError as exc:
+        return err(str(exc), ErrorType.INVALID_STATE, sandbox_id=sandbox_id)
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    if not data_a:
+        return err(f"Could not read {size} bytes at address_a 0x{addr_a:X}.",
+                   ErrorType.NOT_FOUND, sandbox_id=sandbox_id)
+    if not data_b:
+        return err(f"Could not read {size} bytes at address_b 0x{addr_b:X}.",
+                   ErrorType.NOT_FOUND, sandbox_id=sandbox_id)
+
+    cmp_len = min(len(data_a), len(data_b))
+    runs = diff_bytes(data_a[:cmp_len], data_b[:cmp_len])
+    diff_byte_count = sum(len(bytes.fromhex(r["before"])) for r in runs)
+    match = diff_byte_count == 0
+    pct = round(100.0 * (cmp_len - diff_byte_count) / cmp_len, 2) if cmp_len else 100.0
+
+    return ok(
+        sandbox_id=sandbox_id,
+        address_a=f"0x{addr_a:X}",
+        address_b=f"0x{addr_b:X}",
+        bytes_compared=cmp_len,
+        match=match,
+        diff_count=diff_byte_count,
+        diff_runs=runs,
+        percent_match=pct,
+    )
+
+
+# ---------------------------------------------------------------------------
+# dump_module_to_disk — extract a live in-memory module image
+# ---------------------------------------------------------------------------
+
+from x64dbg_automate.api_runtime.registry import unsafe  # noqa: E402 (local import after class defs)
+
+
+@tool
+@unsafe
+def dump_module_to_disk(
+    *,
+    sandbox_id: str | None = None,
+    address: str = "",
+    module_name: str = "",
+    output_path: str,
+) -> dict:
+    """Extract the in-memory image of a loaded module and write it to disk.
+
+    Reads the module directly from the debuggee's virtual address space, so
+    the dump reflects runtime patches, relocations, and unpacking that differ
+    from the original on-disk file.  Provide either ``address`` (any VA inside
+    the module) or ``module_name`` (substring match, case-insensitive).
+
+    This is a state-mutating tool because it creates a file on the analyst's
+    machine (``output_path``).
+
+    Args:
+        sandbox_id: Target sandbox.
+        address: Any address inside the target module (hex or expression).
+        module_name: Substring of the module filename (e.g. ``'dinput8'``).
+        output_path: Destination path for the raw memory dump (e.g.
+                     ``'C:/tmp/dinput8_live.bin'``).
+
+    Returns:
+        ``module``, ``base``, ``size``, ``bytes_written``, ``output_path``.
+        The dump is a raw byte-for-byte copy of the module's virtual address
+        range — not a reconstructed PE.  Use ``pefile`` on the output for
+        further analysis.
+    """
+    import os as _os
+
+    mgr = get_manager()
+    try:
+        sandbox = mgr.get_sandbox(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+    if sandbox.client is None:
+        return err(
+            f"Sandbox '{sandbox.sandbox_id}' has no active debugger client.",
+            ErrorType.NOT_CONNECTED,
+        )
+    client = sandbox.client
+
+    if not address.strip() and not module_name.strip():
+        return err("Provide address or module_name.", ErrorType.BAD_ARGUMENT)
+    if not output_path.strip():
+        return err("output_path must not be empty.", ErrorType.BAD_ARGUMENT)
+
+    # ── locate the target module ──────────────────────────────────────────
+    try:
+        mgr.ensure_stopped(client)
+        modules = client.get_modules() or []
+    except SandboxError as exc:
+        return err(str(exc), ErrorType.INVALID_STATE, sandbox_id=sandbox_id)
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    target = None
+    if address.strip():
+        try:
+            va = resolve_addr(client, address)
+        except ValueError as exc:
+            return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+        for m in modules:
+            if m.base <= va < m.base + m.size:
+                target = m
+                break
+        if target is None:
+            return err(
+                f"Address 0x{va:X} is not inside any loaded module.",
+                ErrorType.NOT_FOUND,
+                hint="Use get_modules() to list currently loaded modules.",
+                sandbox_id=sandbox_id,
+            )
+    else:
+        needle = module_name.strip().lower()
+        for m in modules:
+            if needle in m.name.lower() or needle in m.path.lower():
+                target = m
+                break
+        if target is None:
+            return err(
+                f"No module matching '{module_name}' is currently loaded.",
+                ErrorType.NOT_FOUND,
+                hint="Use get_modules() to list currently loaded modules.",
+                sandbox_id=sandbox_id,
+            )
+
+    # ── read the module in 64 KiB chunks ─────────────────────────────────
+    base = target.base
+    total = target.size
+    if total <= 0:
+        return err(f"Module '{target.name}' reports size 0.", ErrorType.INVALID_STATE,
+                   sandbox_id=sandbox_id)
+
+    CHUNK = 65536
+    collected: list[bytes] = []
+    unreadable: list[str] = []
+    offset = 0
+    while offset < total:
+        chunk_size = min(CHUNK, total - offset)
+        try:
+            chunk = client.read_memory(base + offset, chunk_size)
+        except Exception:
+            chunk = None
+        if chunk and len(chunk) == chunk_size:
+            collected.append(chunk)
+        else:
+            collected.append(b"\x00" * chunk_size)
+            unreadable.append(f"0x{base + offset:X}")
+        offset += chunk_size
+
+    image = b"".join(collected)
+
+    # ── write to disk ─────────────────────────────────────────────────────
+    out = _os.path.abspath(output_path)
+    try:
+        _os.makedirs(_os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "wb") as fh:
+            fh.write(image)
+    except OSError as exc:
+        return err(f"Could not write to '{out}': {exc}", ErrorType.UNKNOWN,
+                   sandbox_id=sandbox_id)
+
+    return ok(
+        sandbox_id=sandbox_id,
+        module=target.name,
+        base=f"0x{base:X}",
+        size=total,
+        bytes_written=len(image),
+        output_path=out,
+        unreadable_chunks=unreadable,
+        note=(
+            "Raw in-memory dump: reflects runtime relocations, unpacking, and patches. "
+            "Not a reconstructed PE — section raw-offsets match virtual layout."
+        ),
+    )
