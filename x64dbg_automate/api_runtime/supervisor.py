@@ -221,6 +221,14 @@ class SandboxManager:
         bitness_exe = target_exe or self._exe_path_for_pid(attach_pid) or ""
         resolved = resolve_debugger_path(base_path, bitness_exe)
 
+        # Cache the resolved path so future sandbox_create/connect_to_session calls
+        # that omit x64dbg_path can self-recover (no need for X64DBG_PATH each time).
+        from x64dbg_automate.dbg_paths import cache_debugger_path
+        try:
+            cache_debugger_path(resolved)
+        except Exception:
+            pass
+
         client = X64DbgClient(resolved)
         try:
             if target_exe:

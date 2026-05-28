@@ -11,6 +11,64 @@ import os
 import struct
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Path cache — shared module-level state (no circular-import risk)
+# ---------------------------------------------------------------------------
+# Updated after every successful sandbox_create / connect_to_session so
+# subsequent calls that omit x64dbg_path or X64DBG_PATH can self-recover.
+_path_cache: str = ""
+
+
+def cache_debugger_path(path: str) -> None:
+    """Record *path* as the most recently confirmed debugger binary."""
+    global _path_cache
+    if path:
+        try:
+            if Path(path).is_file():
+                _path_cache = path
+        except Exception:
+            pass
+
+
+def get_cached_debugger_path() -> str:
+    """Return the last successfully resolved debugger path (empty if never set)."""
+    return _path_cache
+
+
+def _scan_common_install_paths() -> str:
+    """Scan well-known Windows x64dbg install locations; return first found or ''."""
+    bases = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "x64dbg",
+        Path(os.environ.get("PROGRAMFILES", "")) / "x64dbg",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "x64dbg",
+        Path("C:/Program Files/x64dbg"),
+        Path("C:/Program Files (x86)/x64dbg"),
+        Path("C:/x64dbg"),
+        Path("C:/tools/x64dbg"),
+        Path(os.environ.get("USERPROFILE", "")) / "Desktop" / "x64dbg",
+        Path(os.environ.get("USERPROFILE", "")) / "x64dbg",
+    ]
+    for base in bases:
+        try:
+            if not base.is_dir():
+                continue
+        except Exception:
+            continue
+        for sub in (
+            "release/x96dbg.exe",
+            "release/x64/x64dbg.exe",
+            "release/x32/x32dbg.exe",
+            "x96dbg.exe",
+            "x64dbg.exe",
+        ):
+            p = base / sub
+            try:
+                if p.is_file():
+                    return str(p)
+            except Exception:
+                continue
+    return ""
+
 
 def pe_bitness(exe_path: str) -> int:
     """Read the PE Machine field to determine if an executable is 32- or 64-bit."""
@@ -33,17 +91,28 @@ def pe_bitness(exe_path: str) -> int:
 
 
 def resolve_x64dbg_path_with_env(x64dbg_path: str) -> str:
-    """Resolve x64dbg path from the parameter, falling back to the X64DBG_PATH env var.
+    """Resolve x64dbg path, consulting four sources in priority order.
+
+    1. ``x64dbg_path`` parameter
+    2. ``X64DBG_PATH`` environment variable
+    3. Process-lifetime path cache (populated by ``cache_debugger_path``)
+    4. Common Windows install locations scan
 
     Raises:
-        FileNotFoundError: If neither the parameter nor the env var provides a path.
+        FileNotFoundError: If all four sources fail to produce a path.
     """
     path = x64dbg_path.strip() if x64dbg_path else ""
     if not path:
         path = os.environ.get("X64DBG_PATH", "").strip()
     if not path:
+        path = _path_cache
+    if not path:
+        path = _scan_common_install_paths()
+    if not path:
         raise FileNotFoundError(
-            "x64dbg path not provided and X64DBG_PATH environment variable is not set."
+            "x64dbg path not provided. Set the X64DBG_PATH environment variable, "
+            "pass x64dbg_path to sandbox_create / connect_to_session, "
+            "or install x64dbg in a standard location (e.g. C:\\x64dbg)."
         )
     return path
 

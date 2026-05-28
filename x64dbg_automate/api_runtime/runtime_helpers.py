@@ -17,15 +17,35 @@ _GP_REGS_32 = ["eax", "ebx", "ecx", "edx", "ebp", "esp", "esi", "edi", "eip", "e
 # Common function prologues, used by the heuristic boundary scanner when
 # x64dbg's own analysis hasn't run on the target yet.
 _PROLOGUE_PATTERNS = (
-    b"\x55\x8B\xEC",      # push ebp; mov ebp, esp           (x86 frame)
-    b"\x55\x89\xE5",      # push ebp; mov ebp, esp           (AT&T encoding)
+    # ── x64 prologues ───────────────────────────────────────────────────────
     b"\x48\x89\x5C\x24",  # mov [rsp+x], rbx                 (x64 reg save)
+    b"\x48\x89\x4C\x24",  # mov [rsp+x], rcx                 (x64 home rcx)
+    b"\x4C\x89\x44\x24",  # mov [rsp+x], r8                  (x64 home r8)
+    b"\x4C\x89\x4C\x24",  # mov [rsp+x], r9                  (x64 home r9)
     b"\x48\x8B\xC4",      # mov rax, rsp                     (MSVC x64 home)
     b"\x40\x55",          # push rbp                         (x64 REX prefix)
     b"\x48\x83\xEC",      # sub rsp, imm8                    (x64 stack alloc)
     b"\x48\x81\xEC",      # sub rsp, imm32                   (x64 big frame)
+    # ── x86 prologues ───────────────────────────────────────────────────────
+    b"\x55\x8B\xEC",      # push ebp; mov ebp, esp           (MSVC x86 frame)
+    b"\x55\x89\xE5",      # push ebp; mov ebp, esp           (GCC x86 frame)
+    b"\x83\xEC",          # sub esp, imm8                    (x86 stack alloc)
+    b"\x81\xEC",          # sub esp, imm32                   (x86 big frame)
+    b"\x8B\xFF",          # mov edi, edi                     (hot-patch 2-byte NOP, W32 DLLs)
+    b"\x55\x53",          # push ebp; push ebx               (x86 multi-reg save)
+    b"\x55\x56",          # push ebp; push esi
+    b"\x55\x57",          # push ebp; push edi
+    b"\x53\x56\x57",      # push ebx; push esi; push edi
+    b"\x56\x57",          # push esi; push edi
+    b"\x57\x56",          # push edi; push esi
+    b"\x57\x55",          # push edi; push ebp
 )
 _RET_BYTES = (b"\xC3", b"\xC2")  # ret / ret imm16
+
+# Inter-function padding bytes that compilers emit for alignment.
+# A run of 2+ consecutive CC or 90 bytes marks an inter-function boundary;
+# the byte immediately after is the (non-standard) function entry.
+_PADDING_BYTE_VALUES = (0xCC, 0x90)  # INT3, NOP
 
 # Windows PAGE_* protection constants (base values; GUARD/NOCACHE are modifiers).
 _PAGE_PROTECT_NAMES = {
@@ -100,10 +120,14 @@ def detect_function_bounds(
 
     1. **x64dbg analysis** (``get_function``) — authoritative when auto-analysis
        has run. ``confidence="high"``.
-    2. **Prologue + RET scan** — walk backward for a known prologue, then forward
-       for a RET. Works on un-analyzed images. ``confidence="medium"``.
-    3. **RET-only scan** — no prologue found; bound forward to the next RET from
-       ``addr``. ``confidence="low"``.
+    2. **Prologue + RET scan** — walk backward for a known prologue byte sequence,
+       then forward for a RET. Works on un-analyzed images. ``confidence="medium"``.
+    2b. **Padding/alignment scan** — when no classic prologue is found, look for
+       inter-function ``CC``/``NOP`` padding (2+ consecutive bytes) as a boundary
+       marker. Catches MSVC-optimized entries (``jnz``, early-exit) that have no
+       push-ebp preamble. ``confidence="low"``.
+    3. **RET-only scan** — no prologue/padding found; bound forward to the next
+       RET from ``addr``. ``confidence="low"``.
     4. **Fixed window** — last resort 4 KiB span so callers always get *some*
        range to disassemble rather than nothing. ``confidence="low"``.
 
@@ -142,6 +166,50 @@ def detect_function_bounds(
                 func_start, addr + 0x1000, "prologue_scan", "low",
                 note="Prologue found but no RET within scan window; end is approximate.",
             )
+
+    # 2b. Padding/alignment scan — catches non-standard entries (jnz, early-exit
+    #     patterns) where no classic prologue bytes appear. Read the entire backward
+    #     window in one bulk call so this adds only a single RPC, then scan the
+    #     buffer in Python for CC/NOP padding runs (2+ consecutive bytes) that
+    #     compilers emit between functions for alignment.
+    look_back = min(max_back, addr)
+    if look_back >= 4:
+        try:
+            bulk = client.read_memory(addr - look_back, look_back)
+        except Exception:
+            bulk = b""
+        if bulk and len(bulk) >= 4:
+            # Scan right-to-left for the nearest 2+ padding-byte run.
+            i = len(bulk) - 1
+            while i >= 1:
+                curr = bulk[i]
+                prev = bulk[i - 1]
+                if curr in _PADDING_BYTE_VALUES and curr == prev:
+                    # Extend the run leftward to find its full extent.
+                    j = i - 1
+                    while j >= 0 and bulk[j] == curr:
+                        j -= 1
+                    # Function starts at the byte immediately after the run.
+                    func_start = (addr - look_back) + i + 1
+                    if 0 < func_start < addr:
+                        for foff in range(func_start, min(func_start + max_forward, func_start + 0x10000)):
+                            try:
+                                b = client.read_memory(foff, 1)
+                            except Exception:
+                                break
+                            if b in _RET_BYTES:
+                                return FunctionBounds(
+                                    func_start, foff + 1, "padding_scan", "low",
+                                    note="Non-standard prologue; function start inferred from "
+                                         "inter-function alignment padding (CC/NOP run).",
+                                )
+                        return FunctionBounds(
+                            func_start, func_start + 0x1000, "padding_scan", "low",
+                            note="Non-standard prologue inferred from padding. End is approximate.",
+                        )
+                    i = j  # skip past this run and continue scanning further back
+                else:
+                    i -= 1
 
     # 3. RET-only scan forward from addr.
     for foff in range(addr, addr + (max_forward // 2)):

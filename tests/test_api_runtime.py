@@ -4690,3 +4690,344 @@ class TestControlTools:
         assert is_unsafe("step_into")
         assert not is_unsafe("read_registers")
         assert not is_unsafe("breakpoint_list")
+
+
+# ---------------------------------------------------------------------------
+# P0: _require_client sandbox-first priority
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mgr_v3():
+    """Fresh SandboxManager patched as the global manager."""
+    m = SandboxManager()
+    from x64dbg_automate.api_runtime import supervisor
+    orig = supervisor._manager
+    supervisor._manager = m
+    yield m
+    supervisor._manager = orig
+
+
+class TestRequireClientSandboxFirst:
+    """_require_client must prefer the active sandbox over the legacy global."""
+
+    def test_sandbox_preferred_when_legacy_global_is_none(self, mgr_v3):
+        """After sandbox_create (_client = None), legacy tools should resolve the sandbox client."""
+        import x64dbg_automate.mcp_server as ms
+        sb = _mock_sandbox(mgr_v3, sid="p0test")
+        mgr_v3._active_session_id = "p0test"
+        # Simulate "sandbox_create was called, connect_to_session was NOT called"
+        orig_client = ms._client
+        ms._client = None
+        try:
+            client = ms._require_client()
+            assert client is sb.client, "Expected sandbox client, got legacy global"
+        finally:
+            ms._client = orig_client
+
+    def test_legacy_global_used_when_no_active_sandbox(self, mgr_v3):
+        """When no active sandbox exists, _require_client falls back to _client."""
+        import x64dbg_automate.mcp_server as ms
+        mgr_v3._active_session_id = None
+        fake_client = MagicMock()
+        orig_client = ms._client
+        ms._client = fake_client
+        try:
+            client = ms._require_client()
+            assert client is fake_client
+        finally:
+            ms._client = orig_client
+
+    def test_raises_when_both_none(self, mgr_v3):
+        """Raises RuntimeError with actionable hint when neither source has a client."""
+        import x64dbg_automate.mcp_server as ms
+        mgr_v3._active_session_id = None
+        orig_client = ms._client
+        ms._client = None
+        try:
+            with pytest.raises(RuntimeError, match="sandbox_create"):
+                ms._require_client()
+        finally:
+            ms._client = orig_client
+
+
+# ---------------------------------------------------------------------------
+# P0: sandbox_info legacy_connection_active field
+# ---------------------------------------------------------------------------
+
+class TestSandboxInfoLegacyConnectionActive:
+    def test_active_when_client_connected(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_info
+        sb = _mock_sandbox(manager)
+        sb.client.sess_req_rep_port = 1234
+        sb.client.is_connection_alive.return_value = True
+        r = sandbox_info(sandbox_id="aa11", probe_connection=True)
+        assert r["success"]
+        assert r["legacy_connection_active"] is True
+
+    def test_inactive_when_client_has_no_port(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_info
+        sb = _mock_sandbox(manager)
+        sb.client.sess_req_rep_port = 0
+        sb.client.is_connection_alive.return_value = True
+        r = sandbox_info(sandbox_id="aa11", probe_connection=True)
+        assert r["success"]
+        assert r["legacy_connection_active"] is False
+
+    def test_inactive_when_probe_dead(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_info
+        sb = _mock_sandbox(manager)
+        sb.client.sess_req_rep_port = 1234
+        sb.client.is_connection_alive.return_value = False
+        r = sandbox_info(sandbox_id="aa11", probe_connection=True)
+        assert r["success"]
+        assert r["legacy_connection_active"] is False
+
+    def test_not_present_when_probe_skipped(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_info
+        sb = _mock_sandbox(manager)
+        r = sandbox_info(sandbox_id="aa11", probe_connection=False)
+        assert r["success"]
+        assert "legacy_connection_active" not in r
+
+
+# ---------------------------------------------------------------------------
+# P1: prologue pattern extension (padding_scan heuristic)
+# ---------------------------------------------------------------------------
+
+class TestPaddingScanBoundaryDetection:
+    """detect_function_bounds step 2b: CC/NOP inter-function padding heuristic."""
+
+    def _make_client(self, bulk_data: bytes, bulk_base: int, ret_addr: int | None = None):
+        """Client whose read_memory serves bulk_data and optional ret byte."""
+        client = MagicMock()
+        def read_mem(addr, size):
+            # Bulk backward read
+            if addr == bulk_base and size == len(bulk_data):
+                return bulk_data
+            # Per-byte forward scan for RET
+            if ret_addr is not None and addr == ret_addr and size == 1:
+                return b"\xC3"
+            return b"\x90" * size  # harmless NOPs for other reads
+        client.read_memory.side_effect = read_mem
+        client.get_function.return_value = None
+        return client
+
+    def test_cc_padding_infers_func_start(self):
+        from x64dbg_automate.api_runtime.runtime_helpers import detect_function_bounds
+        # Build a fake backward window: 8 bytes of code, then CC CC CC, then more code
+        # The function starts at offset 11 (= bulk_base + 11)
+        bulk_base = 0x6D4D80
+        # offset:  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+        # bytes:  [code...CC CC CC  jnz jnz  code code code code]
+        # padding run CC CC at indices 7,8,9 → func_start = bulk_base + 10
+        chunk = bytes([0x55, 0x8B, 0xEC, 0x50, 0x53, 0x56, 0x57, 0xCC, 0xCC, 0xCC, 0x75, 0xF0, 0x83, 0xEC, 0x10, 0x53])
+        addr = bulk_base + len(chunk)  # query address is just past the chunk
+
+        client = MagicMock()
+        client.get_function.return_value = None
+        def _read(a, size):
+            # step 2 prologue scan: byte-by-byte starting from addr backward
+            # return data such that no prologue hits (simulate un-recognized code)
+            if a >= bulk_base + len(chunk):
+                return b"\x75\xF0\x83\xEC" # jnz + sub esp — no classic prologue at addr
+            # step 2b bulk read
+            if a == bulk_base and size == len(chunk):
+                return chunk
+            # forward RET scan
+            if size == 1 and a >= addr:
+                return b"\xC3"  # immediate RET
+            return b"\x00" * size
+        client.read_memory.side_effect = _read
+
+        bounds = detect_function_bounds(client, addr, max_back=len(chunk), max_forward=0x100)
+        assert bounds.method == "padding_scan"
+        # func_start should be bulk_base + 10 (byte after CC CC CC)
+        assert bounds.start == bulk_base + 10
+        assert bounds.confidence == "low"
+        assert "padding" in bounds.note.lower()
+
+    def test_nop_padding_infers_func_start(self):
+        from x64dbg_automate.api_runtime.runtime_helpers import detect_function_bounds
+        bulk_base = 0x400000
+        # 90 90 90 then the function starts
+        chunk = bytes([0x01, 0x02, 0x90, 0x90, 0x90, 0xB8, 0x00, 0x00])
+        addr = bulk_base + len(chunk)
+
+        client = MagicMock()
+        client.get_function.return_value = None
+        def _read(a, size):
+            if a == bulk_base and size == len(chunk):
+                return chunk
+            if size == 1 and a >= addr:
+                return b"\xC3"
+            return b"\x00" * size
+        client.read_memory.side_effect = _read
+
+        bounds = detect_function_bounds(client, addr, max_back=len(chunk), max_forward=0x100)
+        assert bounds.method == "padding_scan"
+        assert bounds.start == bulk_base + 5  # byte after 90 90 90
+
+    def test_single_cc_byte_not_matched(self):
+        """A single CC byte should not trigger the padding scan (need 2+)."""
+        from x64dbg_automate.api_runtime.runtime_helpers import detect_function_bounds
+        bulk_base = 0x400000
+        # Only one CC, then code — prologue scan should find 55 8B EC at offset 4
+        chunk = bytes([0x01, 0x02, 0x03, 0xCC, 0x55, 0x8B, 0xEC, 0x83])
+        addr = bulk_base + len(chunk)
+
+        client = MagicMock()
+        client.get_function.return_value = None
+        def _read(a, size):
+            # Per-byte prologue scan: return available bytes (may be < size)
+            if size == 8 and bulk_base <= a < addr:
+                off = a - bulk_base
+                return chunk[off:off + 8]  # Python slicing never raises
+            if a == bulk_base and size == len(chunk):
+                return chunk
+            if size == 1 and a >= addr:
+                return b"\xC3"
+            return b"\x00" * size
+        client.read_memory.side_effect = _read
+
+        bounds = detect_function_bounds(client, addr, max_back=len(chunk), max_forward=0x100)
+        # 55 8B EC (push ebp; mov ebp, esp) at offset 4 wins via prologue_scan
+        assert bounds.method == "prologue_scan"
+        assert bounds.start == bulk_base + 4
+
+
+# ---------------------------------------------------------------------------
+# P1: xref module-aware scan
+# ---------------------------------------------------------------------------
+
+class TestXrefModuleAwareScan:
+    """_scan_xrefs_to must scan the target module fully regardless of max_bytes."""
+
+    def _make_page(self, base, size, state=0x1000, protect=0x20):
+        p = MagicMock()
+        p.base_address = base
+        p.region_size = size
+        p.state = state
+        p.protect = protect
+        return p
+
+    def _make_module(self, base, size, name="test.exe"):
+        m = MagicMock()
+        m.base = base
+        m.size = size
+        m.name = name
+        return m
+
+    def test_target_module_scanned_fully_beyond_cap(self):
+        """Pages in the target module are not capped even if max_bytes is exceeded."""
+        from x64dbg_automate.api_runtime.api_analysis import _scan_xrefs_to
+        target = 0x6D4D90
+        # One big page containing the target module
+        mod_base, mod_size = 0x400000, 200 * 1024 * 1024  # 200 MiB
+        page = self._make_page(mod_base, mod_size)
+        mod = self._make_module(mod_base, mod_size)
+
+        # Build 10-byte data with a rel32 CALL to target at offset 0
+        rel = (target - (mod_base + 5)) & 0xFFFFFFFF
+        data = bytes([0xE8]) + rel.to_bytes(4, "little") + bytes(5)
+
+        client = MagicMock()
+        client.memmap.return_value = [page]
+        client.get_modules.return_value = [mod]
+        client.read_memory.return_value = data[:min(len(data), mod_size)]
+        ins = MagicMock(); ins.instruction = "call 0x6D4D90"
+        client.disassemble_at.return_value = ins
+
+        # max_bytes = 1 byte (would skip the page if not in target module)
+        refs, truncated = _scan_xrefs_to(client, target, "x86", max_bytes=1)
+        # The page is in the target module so it's scanned regardless
+        assert len(refs) == 1
+        assert refs[0]["type"] == "CALL"
+
+    def test_other_module_capped_at_max_bytes(self):
+        """Pages NOT in the target module respect the max_bytes ceiling."""
+        from x64dbg_automate.api_runtime.api_analysis import _scan_xrefs_to
+        target = 0x6D4D90
+        mod_base, mod_size = 0x400000, 0x1000
+        # Target module doesn't contain target addr — so it's an "other" module
+        other_page = self._make_page(0x10000000, 200 * 1024 * 1024)
+        mod = self._make_module(mod_base, mod_size)  # target module is elsewhere
+
+        client = MagicMock()
+        client.memmap.return_value = [other_page]
+        client.get_modules.return_value = [mod]
+        client.read_memory.return_value = bytes(16)
+
+        refs, truncated = _scan_xrefs_to(client, target, "x86", max_bytes=8)
+        # read_memory called with at most 8 bytes from the other page
+        call_size = client.read_memory.call_args[0][1]
+        assert call_size <= 8
+
+    def test_indirect_call_note_added_when_empty(self, manager):
+        """When scan finds no callers, a note about indirect calls is included."""
+        from x64dbg_automate.api_runtime.api_analysis import get_xrefs
+        sb = _mock_sandbox(manager)
+        sb.debugger_arch = "x32"
+        sb.client.get_xrefs.side_effect = Exception("XERROR_XREF_FAILED")
+        sb.client.cmd_sync.return_value = True
+        sb.client.eval_sync.return_value = (0x6D4D90, True)
+        sb.client.get_modules.return_value = []
+        sb.client.memmap.return_value = []
+
+        r = get_xrefs(sandbox_id="aa11", address="0x6D4D90", analyze=True, scan_fallback=True)
+        assert r["success"]
+        assert r["total"] == 0
+        # Should include a note about indirect calls
+        notes = "\n".join(r.get("notes") or [])
+        assert "indirect" in notes.lower() or "FF D" in notes
+
+
+# ---------------------------------------------------------------------------
+# P2: dbg_paths path cache
+# ---------------------------------------------------------------------------
+
+class TestDbgPathCache:
+    def test_cache_set_and_get(self, tmp_path):
+        import x64dbg_automate.dbg_paths as dp
+        # Create a temp file to act as a fake executable
+        fake_exe = tmp_path / "x64dbg.exe"
+        fake_exe.write_bytes(b"MZ")
+        orig = dp._path_cache
+        try:
+            dp.cache_debugger_path(str(fake_exe))
+            assert dp.get_cached_debugger_path() == str(fake_exe)
+        finally:
+            dp._path_cache = orig
+
+    def test_cache_not_set_for_nonexistent_file(self):
+        import x64dbg_automate.dbg_paths as dp
+        orig = dp._path_cache
+        try:
+            dp.cache_debugger_path("C:\\nonexistent\\x64dbg.exe")
+            assert dp._path_cache == orig  # unchanged
+        finally:
+            dp._path_cache = orig
+
+    def test_resolve_uses_cache_when_env_absent(self, tmp_path, monkeypatch):
+        import x64dbg_automate.dbg_paths as dp
+        fake_exe = tmp_path / "x64dbg.exe"
+        fake_exe.write_bytes(b"MZ")
+        monkeypatch.delenv("X64DBG_PATH", raising=False)
+        orig = dp._path_cache
+        try:
+            dp._path_cache = str(fake_exe)
+            path = dp.resolve_x64dbg_path_with_env("")
+            assert path == str(fake_exe)
+        finally:
+            dp._path_cache = orig
+
+    def test_resolve_raises_when_all_sources_empty(self, monkeypatch):
+        import x64dbg_automate.dbg_paths as dp
+        monkeypatch.delenv("X64DBG_PATH", raising=False)
+        monkeypatch.setattr(dp, "_scan_common_install_paths", lambda: "")
+        orig = dp._path_cache
+        dp._path_cache = ""
+        try:
+            with pytest.raises(FileNotFoundError, match="X64DBG_PATH"):
+                dp.resolve_x64dbg_path_with_env("")
+        finally:
+            dp._path_cache = orig

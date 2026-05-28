@@ -36,17 +36,34 @@ def _scan_xrefs_to(client, target: int, arch: str, max_bytes: int = _XREF_SCAN_D
     can't be resolved statically. Each byte-level candidate is verified with the
     real disassembler so data bytes that merely look like E8/E9 are rejected.
 
-    Returns ``(refs, truncated)`` where ``truncated`` is True if the scan ceiling
-    was hit before all executable memory was covered.
+    The module containing ``target`` is scanned fully regardless of ``max_bytes``;
+    other executable pages are capped at ``max_bytes`` total. This prevents
+    callers being missed when the target is in a large game image.
+
+    Returns ``(refs, truncated)`` where ``truncated`` is True if non-target-module
+    pages were cut short by the ``max_bytes`` ceiling.
     """
     mask = 0xFFFFFFFFFFFFFFFF if arch == "x64" else 0xFFFFFFFF
+
+    # Identify the module that owns the target so we can scan it without a ceiling.
+    target_mod_base = 0
+    target_mod_size = 0
+    try:
+        for mod in client.get_modules():
+            if mod.base <= target < mod.base + mod.size:
+                target_mod_base = mod.base
+                target_mod_size = mod.size
+                break
+    except Exception:
+        pass
+
     try:
         pages = client.memmap()
     except Exception:
         return [], False
 
     refs: list[dict] = []
-    scanned = 0
+    scanned_other = 0
     truncated = False
     seen: set[int] = set()
 
@@ -56,16 +73,25 @@ def _scan_xrefs_to(client, target: int, arch: str, max_bytes: int = _XREF_SCAN_D
         if (page.protect & _PAGE_EXECUTE_ANY) == 0:
             continue
         size = page.region_size
-        if scanned + size > max_bytes:
-            truncated = True
-            break
+        in_target_mod = (
+            target_mod_size > 0
+            and target_mod_base <= page.base_address < target_mod_base + target_mod_size
+        )
+        if not in_target_mod:
+            # Apply the bytes ceiling only to non-target-module pages.
+            remaining = max_bytes - scanned_other
+            if remaining <= 0:
+                truncated = True
+                continue
+            size = min(size, remaining)
         try:
             data = client.read_memory(page.base_address, size)
         except Exception:
             continue
         if not data:
             continue
-        scanned += len(data)
+        if not in_target_mod:
+            scanned_other += len(data)
 
         base = page.base_address
         # Locate candidate opcodes, then verify each with the disassembler.
@@ -211,8 +237,18 @@ def get_xrefs(
             return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
         notes.append(
             "Native xref DB was empty; results are direct rel32 CALL/JMP callers "
-            "found by scanning executable memory. Indirect references are not included."
+            "found by scanning executable memory. The target module was scanned fully; "
+            "other loaded modules are subject to the scan ceiling. "
+            "Indirect references (register-indirect, vtable dispatch) are not included."
         )
+        if not refs:
+            notes.append(
+                f"No direct callers found for 0x{addr:X}. The function may be called "
+                "indirectly via a register (FF D0/FF D1) or through a vtable/dispatch table. "
+                "Try memory_search_pattern to search for the function's address as a "
+                f"4-byte immediate (e.g. pattern '{''.join(f'{b:02X} ' for b in addr.to_bytes(4, 'little')).strip()}') "
+                "in data sections to find potential dispatch sites."
+            )
         return ok(
             sandbox_id=sandbox_id,
             address=f"0x{addr:X}",

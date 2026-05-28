@@ -120,6 +120,18 @@ def sandbox_info(sandbox_id: str | None = None, *, probe_connection: bool = True
                 "RPC link is down but the sandbox is registered — call "
                 "sandbox_reconnect to re-establish it."
             )
+        # True when the sandbox has a live ZMQ connection — agents can use ALL
+        # tools (including legacy ones) without an additional connect_to_session.
+        # After sandbox_create this is always True if the sandbox launched OK.
+        try:
+            port = int(getattr(client, "sess_req_rep_port", 0) or 0)
+        except Exception:
+            port = 0
+        info["legacy_connection_active"] = (
+            client is not None
+            and port > 0
+            and alive is not False
+        )
     return ok(**info)
 
 

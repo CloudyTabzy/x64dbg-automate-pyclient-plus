@@ -77,24 +77,28 @@ def _get_unified_manager():
 def _require_client() -> X64DbgClient:
     """Return a *healthy* active client, unifying the legacy and sandbox tiers.
 
-    Resolution order:
-      1. The legacy global ``_client`` (set by connect_to_session/start_session).
-      2. The active sandbox's client (set by sandbox_create / runtime tools).
+    Resolution order (sandbox-first — agents that use only sandbox_create never
+    need to call connect_to_session):
+
+      1. The active sandbox's client (set by sandbox_create / runtime tools).
+         Preferred because sandbox_create does not touch the legacy ``_client``
+         global, so the modern agent-only flow works without any extra call.
+      2. The legacy global ``_client`` (set by connect_to_session/start_session).
 
     Whichever is found is health-checked via its dedicated probe socket and
-    transparently reconnected if the link has dropped (e.g. an idle timeout
-    between tool calls). This is what makes the legacy control tools "just work"
-    on the same connection the sandbox tools use, instead of failing with
-    NOT_CONNECTED when the session was created through the modern flow.
+    transparently reconnected if the link has dropped.
     """
-    client = _client
+    # 1. Active sandbox (preferred — sandbox_create sets this, not _client)
+    client = None
+    try:
+        client = _get_unified_manager().get_client(None)
+    except Exception:
+        client = None
+
+    # 2. Legacy global fallback (connect_to_session / start_session path)
     if client is None:
-        # Fall back to the active sandbox so tools created via sandbox_create
-        # (which never set the legacy global) still resolve.
-        try:
-            client = _get_unified_manager().get_client(None)
-        except Exception:
-            client = None
+        client = _client
+
     if client is None:
         raise RuntimeError(
             "Not connected to x64dbg. Use sandbox_create, start_session, or connect_to_session first."
@@ -238,6 +242,8 @@ def start_session(x64dbg_path: str = "", target_exe: str = "", cmdline: str = ""
     try:
         path = _resolve_x64dbg_path_with_env(x64dbg_path)
         resolved = _resolve_debugger_path(path, target_exe)
+        from x64dbg_automate.dbg_paths import cache_debugger_path
+        cache_debugger_path(resolved)
         _client = X64DbgClient(resolved)
         pid = _client.start_session(target_exe, cmdline, current_dir)
         arch = "x64" if "x64dbg" in Path(resolved).name.lower() else "x32"
@@ -274,6 +280,8 @@ def connect_to_session(x64dbg_path: str = "", session_pid: int = 0) -> dict:
     try:
         path = _resolve_x64dbg_path_with_env(x64dbg_path)
         resolved = _resolve_debugger_path(path)
+        from x64dbg_automate.dbg_paths import cache_debugger_path
+        cache_debugger_path(resolved)
         _client = X64DbgClient(resolved)
         _client.attach_session(session_pid)
         arch = "x64" if "x64dbg" in Path(resolved).name.lower() else "x32"
