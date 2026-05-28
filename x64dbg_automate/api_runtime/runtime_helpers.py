@@ -14,6 +14,10 @@ _GP_REGS_64 = [
 ]
 _GP_REGS_32 = ["eax", "ebx", "ecx", "edx", "ebp", "esp", "esi", "edi", "eip", "eflags"]
 
+# Segment registers (same names for both architectures).
+# Useful for WOW64 analysis (FS/GS base, TEB/TIB), privilege-level checks, etc.
+_SEG_REGS = ["cs", "ds", "es", "fs", "gs", "ss"]
+
 # Common function prologues, used by the heuristic boundary scanner when
 # x64dbg's own analysis hasn't run on the target yet.
 _PROLOGUE_PATTERNS = (
@@ -305,6 +309,17 @@ def capture_registers(client: Any, arch: str) -> dict[str, str]:
     """Snapshot the general-purpose registers as ``{name: '0x...'}`` (debuggee must be stopped)."""
     out: dict[str, str] = {}
     for reg in gp_regs(arch):
+        try:
+            out[reg] = f"0x{client.get_reg(reg):X}"
+        except Exception:
+            pass
+    return out
+
+
+def capture_segment_registers(client: Any) -> dict[str, str]:
+    """Snapshot CS/DS/ES/FS/GS/SS as ``{name: '0x...'}`` (architecture-independent)."""
+    out: dict[str, str] = {}
+    for reg in _SEG_REGS:
         try:
             out[reg] = f"0x{client.get_reg(reg):X}"
         except Exception:

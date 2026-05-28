@@ -19,7 +19,9 @@ from x64dbg_automate.api_runtime.registry import tool, unsafe
 from x64dbg_automate.api_runtime.responses import (
     ErrorType, classify_exception, err, is_bug, lookup_error, ok,
 )
-from x64dbg_automate.api_runtime.runtime_helpers import capture_registers, gp_regs, resolve_addr
+from x64dbg_automate.api_runtime.runtime_helpers import (
+    capture_registers, capture_segment_registers, gp_regs, resolve_addr,
+)
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 
 
@@ -56,14 +58,20 @@ def read_registers(sandbox_id: str | None = None) -> dict:
     try:
         mgr.ensure_stopped(client)
         regs = capture_registers(client, sandbox.debugger_arch)
+        seg_regs = capture_segment_registers(client)
     except SandboxError as exc:
         return err(str(exc), ErrorType.INVALID_STATE, sandbox_id=sandbox_id)
     except Exception as exc:  # noqa: BLE001
         if is_bug(exc):
             raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
-    return ok(sandbox_id=sandbox_id, arch=sandbox.debugger_arch,
-              registers=regs, count=len(regs))
+    return ok(
+        sandbox_id=sandbox_id,
+        arch=sandbox.debugger_arch,
+        registers=regs,
+        segment_registers=seg_regs,
+        count=len(regs),
+    )
 
 
 @tool

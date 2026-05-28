@@ -183,7 +183,8 @@ def dump_stack_walk(
             "module": mod["name"] if mod else None,
             "rva": (f"0x{mod['rva']:X}" if mod else None),
             "stack_address": None,
-            "call_verified": None,  # frame 0 is live IP, not a return address
+            "call_verified": None,
+            "faulting_instruction": True,  # frame 0 is the crash/current IP, not a return address
         })
 
     base, data = stack["base"], stack["data"]

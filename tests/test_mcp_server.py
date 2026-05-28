@@ -647,6 +647,37 @@ class TestExecuteCommand:
         result = mcp_mod.execute_command("msg hello")
         assert result["success"] is True
 
+    def test_display_command_returns_output_note(self, mock_client):
+        """P2: display-only commands (db, disasm, r, lm) must include output_note."""
+        mock_client.cmd_sync.return_value = True
+        for cmd in ("db 0x401000", "disasm 0x401000", "lm", "r"):
+            result = mcp_mod.execute_command(cmd)
+            assert result["success"] is True, f"failed for {cmd!r}"
+            assert "output_note" in result, f"missing output_note for {cmd!r}"
+            assert "RPC" in result["output_note"] or "GUI" in result["output_note"]
+
+    def test_mutation_command_has_no_output_note(self, mock_client):
+        """P2: state-mutation commands must NOT get an output_note."""
+        mock_client.cmd_sync.return_value = True
+        result = mcp_mod.execute_command("seteip 0x401000")
+        assert result["success"] is True
+        assert "output_note" not in result
+
+    def test_result_false_adds_result_note(self, mock_client):
+        """P2: when result=False for a non-display command, result_note must explain it."""
+        mock_client.cmd_sync.return_value = False
+        result = mcp_mod.execute_command("someunknowncmd")
+        assert result["success"] is True          # tool itself succeeded (RPC ran)
+        assert result["result"] is False
+        assert "result_note" in result
+        assert "false" in result["result_note"].lower() or "rejected" in result["result_note"].lower()
+
+    def test_output_note_hints_at_dedicated_tool(self, mock_client):
+        """P2: the output_note for 'r' must direct agents to read_registers."""
+        mock_client.cmd_sync.return_value = True
+        result = mcp_mod.execute_command("r")
+        assert "read_registers" in result.get("output_note", "")
+
 
 # ---------------------------------------------------------------------------
 # Breakpoint tool tests

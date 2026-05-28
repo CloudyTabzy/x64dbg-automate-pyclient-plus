@@ -8,9 +8,20 @@ forcing them to guess why an operation stalled.
 
 from __future__ import annotations
 
+import os
+
 from x64dbg_automate.api_runtime.registry import get_telemetry, reset_telemetry, tool
-from x64dbg_automate.api_runtime.responses import ErrorType, err, ok
+from x64dbg_automate.api_runtime.responses import ErrorType, err, lookup_error, ok
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
+
+# System DLLs that generate automatic pause events during process startup
+# (system breakpoint, DLL load, WOW64 thunk). sandbox_run_to_entry auto-resumes
+# through these so agents land cleanly at the target entry point.
+_STARTUP_SKIP_MODULES = frozenset({
+    "ntdll.dll", "ntdll32.dll",
+    "kernel32.dll", "kernelbase.dll",
+    "wow64.dll", "wow64win.dll", "wow64cpu.dll",
+})
 
 
 @tool
@@ -79,17 +90,19 @@ def wait_for_stable_state(
 ) -> dict:
     """Block until the debugger reaches a desired stable state.
 
-    Useful when an agent knows it just resumed execution (``go()``) and
-    wants to confirm x64dbg is actually running before proceeding with
-    memory reads or thread operations.
+    Useful after ``sandbox_continue`` or ``go()`` to confirm the debuggee
+    transitioned to the expected state before making further queries.
 
     Args:
-        desired_state: One of ``running``, ``stopped``, ``paused``.
-        timeout: Max seconds to wait.
-        poll_interval: Seconds between polls.
+        desired_state: One of ``running``, ``stopped``, ``paused``,
+                       ``paused_event`` (DLL-load / OutputDebugString pauses),
+                       or ``paused_breakpoint``.  ``paused`` matches any
+                       non-running stopped state.
+        timeout: Max seconds to wait (default 10).
+        poll_interval: Seconds between polls (default 0.25).
 
     Returns:
-        Dict with ``reached`` (bool) and ``actual_state``.
+        Dict with ``reached`` (bool), ``actual_state``, and ``waited`` seconds.
     """
     import time
 
@@ -100,7 +113,15 @@ def wait_for_stable_state(
         return err(str(exc), ErrorType.NOT_CONNECTED)
 
     desired = desired_state.lower().strip()
+    _valid = {"running", "stopped", "paused", "paused_event", "paused_breakpoint"}
+    if desired not in _valid:
+        return err(
+            f"Unknown desired_state '{desired_state}'. Valid: {', '.join(sorted(_valid))}.",
+            ErrorType.BAD_ARGUMENT,
+        )
+
     end = time.time() + timeout
+    actual = "unknown"  # always defined so the timeout branch can reference it
 
     while time.time() < end:
         try:
@@ -109,22 +130,49 @@ def wait_for_stable_state(
         except Exception as exc:
             return err(f"State poll failed: {exc}", ErrorType.UNKNOWN)
 
+        # Derive actual state — prefer the state machine when available for
+        # paused_event vs paused_breakpoint discrimination.
         if not debugging:
             actual = "disconnected"
-        elif running and desired == "running":
-            return ok(reached=True, actual_state="running", waited=timeout - (end - time.time()))
-        elif not running and desired == "stopped":
-            return ok(reached=True, actual_state="stopped", waited=timeout - (end - time.time()))
-        elif not running and desired == "paused" and debugging:
-            return ok(reached=True, actual_state="paused", waited=timeout - (end - time.time()))
+        elif running:
+            actual = "running"
+        else:
+            sm = getattr(client, "_axon_state_machine", None)
+            if sm is not None:
+                sm_state = str(sm.current_state)
+                actual = sm_state if sm_state in _valid else "paused"
+            else:
+                actual = "paused"
+
+        # Early-exit on disconnected so callers don't loop until timeout.
+        if actual == "disconnected":
+            return err(
+                "Debugger disconnected while waiting.",
+                ErrorType.NOT_CONNECTED,
+                hint="The debuggee may have exited. Use sandbox_info to inspect.",
+                actual_state=actual,
+            )
+
+        waited = timeout - (end - time.time())
+        if actual == desired:
+            return ok(reached=True, actual_state=actual, waited=waited)
+        # "paused" is a superset that matches any non-running state.
+        if desired == "paused" and actual in ("paused", "paused_event", "paused_breakpoint", "stopped"):
+            return ok(reached=True, actual_state=actual, waited=waited)
+        # "stopped" and generic "paused" are interchangeable in many callers.
+        if desired == "stopped" and actual in ("stopped", "paused", "paused_breakpoint"):
+            return ok(reached=True, actual_state=actual, waited=waited)
 
         time.sleep(poll_interval)
 
     return err(
         f"Timeout waiting for state '{desired}' after {timeout}s.",
         ErrorType.TIMEOUT,
-        hint="Use 'get_debugger_state' to inspect, then 'force_resume' or 'stepi' manually.",
-        actual_state=actual if 'actual' in dir() else "unknown",
+        hint=(
+            "Use get_debugger_state to inspect. If stuck at a startup event, "
+            "call sandbox_run_to_entry instead of sandbox_continue."
+        ),
+        actual_state=actual,
     )
 
 
@@ -175,6 +223,247 @@ def force_resume(
         ErrorType.UNKNOWN,
         hint="x64dbg may be hung or the debuggee may have crashed. "
              "Try 'session_summary' to inspect, or restart the sandbox.",
+    )
+
+
+@tool
+def sandbox_run_to_entry(
+    *,
+    sandbox_id: str | None = None,
+    timeout_sec: float = 30.0,
+) -> dict:
+    """Run the debuggee from the system breakpoint to its executable entry point.
+
+    Process startup fires a succession of automatic pauses — system breakpoint,
+    DLL load events, WOW64 thunk, optional TLS callbacks — that defeat simple
+    ``go()`` / ``sandbox_continue`` loops.  This tool handles them all:
+
+    * Sets a one-shot breakpoint at the target module's entry point.
+    * Loops calling ``go()`` and auto-resumes whenever the pause is inside a
+      known OS startup module (ntdll, kernel32, kernelbase, wow64*).
+    * Stops and reports if the process halts in **non-startup code** that is not
+      the entry point (a user-set breakpoint fired before EP, or an exception) —
+      giving the agent full visibility rather than blindly continuing.
+
+    Use this immediately after ``sandbox_create`` instead of ``sandbox_continue``
+    to reliably land at the entry point.
+
+    Args:
+        sandbox_id: Target sandbox (omit for active session).
+        timeout_sec: Max seconds to wait (default 30). Increase for slow loaders.
+
+    Returns:
+        On success: ``reached_entry=True``, ``entry_point``, ``module``,
+        ``resume_count``, ``registers``.
+        On non-startup stop: ``reached_entry=False``, ``current_ip``, ``module``.
+    """
+    import time
+
+    from x64dbg_automate.api_runtime.runtime_helpers import capture_registers
+
+    mgr = get_manager()
+    try:
+        sandbox = mgr.get_sandbox(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+    if sandbox.client is None:
+        return err(
+            f"Sandbox '{sandbox.sandbox_id}' has no active debugger client.",
+            ErrorType.NOT_CONNECTED,
+        )
+
+    client = sandbox.client
+    arch = sandbox.debugger_arch
+    ip_reg = "rip" if arch == "x64" else "eip"
+
+    # ── locate the target module and its entry point ──────────────────────
+    try:
+        modules = client.get_modules() or []
+    except Exception as exc:
+        return err(f"get_modules failed: {exc}", ErrorType.RPC_ERROR,
+                   hint="The process may not be at a loader pause yet. Try force_resume first.")
+
+    target_module = None
+    if sandbox.target_exe:
+        exe_name = os.path.basename(sandbox.target_exe).lower()
+        for m in modules:
+            if m.name.lower() == exe_name or m.path.lower().endswith(os.sep + exe_name):
+                target_module = m
+                break
+    if target_module is None:
+        for m in modules:
+            if not m.name.lower().endswith(".dll"):
+                target_module = m
+                break
+    if target_module is None and modules:
+        target_module = modules[0]
+
+    if target_module is None:
+        return err(
+            "No modules loaded yet — cannot locate the entry point.",
+            ErrorType.NOT_FOUND,
+            hint="Ensure the process is past the initial system breakpoint. "
+                 "Call force_resume once if needed, then retry.",
+        )
+
+    entry_point = target_module.entry
+    if not entry_point:
+        return err(
+            f"Module '{target_module.name}' reports no entry point.",
+            ErrorType.NOT_FOUND,
+            hint="The target may be a pure-data DLL or x64dbg analysis has not run yet.",
+        )
+
+    # ── set a one-shot sentinel BP at the entry point ─────────────────────
+    try:
+        bp_ok = client.set_breakpoint(entry_point, name="__axon_run_to_entry__", singleshoot=True)
+    except Exception as exc:
+        bp_ok = False
+
+    if not bp_ok:
+        # EP may already be set (duplicate) or already past it — check IP first.
+        try:
+            current_ip = client.get_reg(ip_reg)
+        except Exception:
+            current_ip = None
+        if current_ip == entry_point:
+            regs = capture_registers(client, arch)
+            return ok(
+                sandbox_id=sandbox.sandbox_id,
+                reached_entry=True,
+                entry_point=f"0x{entry_point:X}",
+                module=target_module.name,
+                resume_count=0,
+                registers=regs,
+                note="Already at entry point.",
+            )
+        return err(
+            f"Could not set entry-point breakpoint at 0x{entry_point:X}.",
+            ErrorType.RPC_ERROR,
+            hint="A duplicate breakpoint may exist or the address is not executable. "
+                 "Check breakpoint_list and clear any conflicts.",
+        )
+
+    # ── drive through startup events until we reach the entry point ───────
+    deadline = time.time() + timeout_sec
+    resume_count = 0
+    _current_modules = {m.name.lower(): m for m in modules}
+
+    def _refresh_modules():
+        try:
+            for m in (client.get_modules() or []):
+                _current_modules[m.name.lower()] = m
+        except Exception:
+            pass
+
+    def _module_for_ip(ip: int):
+        for m in _current_modules.values():
+            if m.base <= ip < m.base + m.size:
+                return m
+        return None
+
+    # Kick off execution if currently paused.
+    try:
+        if not client.is_running():
+            client.go()
+            resume_count += 1
+    except Exception:
+        pass
+
+    while time.time() < deadline:
+        time.sleep(0.1)
+
+        try:
+            running = client.is_running()
+        except Exception:
+            running = False
+
+        if running:
+            continue  # still executing — wait for the next stop
+
+        # Process is paused — determine where.
+        try:
+            current_ip = client.get_reg(ip_reg)
+        except Exception:
+            current_ip = None
+
+        if current_ip == entry_point:
+            # ✓ Reached the entry point.
+            try:
+                client.clear_breakpoint(entry_point)
+            except Exception:
+                pass
+            mgr.refresh_state(sandbox)
+            regs = capture_registers(client, arch)
+            return ok(
+                sandbox_id=sandbox.sandbox_id,
+                reached_entry=True,
+                entry_point=f"0x{entry_point:X}",
+                module=target_module.name,
+                resume_count=resume_count,
+                registers=regs,
+            )
+
+        # Not at entry point. Classify the stop.
+        _refresh_modules()
+        ip_mod = _module_for_ip(current_ip) if current_ip is not None else None
+        ip_mod_name = ip_mod.name.lower() if ip_mod else ""
+
+        if ip_mod_name in _STARTUP_SKIP_MODULES or ip_mod is None:
+            # Startup event (system DLL or unknown) — resume automatically.
+            try:
+                client.go()
+                resume_count += 1
+            except Exception:
+                pass
+            continue
+
+        # Stopped in user / non-startup code that is NOT the entry point.
+        # A user-set breakpoint or exception fired before EP. Report and stop.
+        try:
+            client.clear_breakpoint(entry_point)
+        except Exception:
+            pass
+        mgr.refresh_state(sandbox)
+        regs = capture_registers(client, arch)
+        return ok(
+            sandbox_id=sandbox.sandbox_id,
+            reached_entry=False,
+            current_ip=f"0x{current_ip:X}" if current_ip is not None else None,
+            entry_point=f"0x{entry_point:X}",
+            module=ip_mod.name if ip_mod else None,
+            resume_count=resume_count,
+            registers=regs,
+            note=(
+                f"Process paused in '{ip_mod.name if ip_mod else 'unknown'}' before the entry point — "
+                "a user breakpoint or exception fired first. "
+                "Call sandbox_continue to proceed toward the entry point."
+            ),
+        )
+
+    # ── timeout ───────────────────────────────────────────────────────────
+    try:
+        client.clear_breakpoint(entry_point)
+    except Exception:
+        pass
+    try:
+        current_ip = client.get_reg(ip_reg)
+        ip_str = f"0x{current_ip:X}"
+    except Exception:
+        ip_str = "unknown"
+
+    return err(
+        f"Timed out after {timeout_sec}s waiting to reach entry point 0x{entry_point:X}.",
+        ErrorType.TIMEOUT,
+        hint=(
+            "Increase timeout_sec for slow loaders, or inspect with get_debugger_state. "
+            "If stuck in a user module, a breakpoint fired before EP — use sandbox_continue."
+        ),
+        sandbox_id=sandbox.sandbox_id,
+        entry_point=f"0x{entry_point:X}",
+        module=target_module.name,
+        current_ip=ip_str,
+        resume_count=resume_count,
     )
 
 

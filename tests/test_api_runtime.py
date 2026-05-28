@@ -5578,3 +5578,404 @@ class TestSandboxHeadless:
 
         sb.headless = False
         assert sb.to_info()["headless"] is False
+
+
+# ---------------------------------------------------------------------------
+# P3a: wait_for_stable_state — actual_state always defined + new desired states
+# ---------------------------------------------------------------------------
+
+class TestWaitForStableStateFixed:
+    """Tests for the P3a fix: actual_state is always defined, new desired states."""
+
+    def test_actual_state_defined_on_timeout(self, manager, monkeypatch):
+        """Timeout response must include actual_state even when desired was never reached."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import wait_for_stable_state
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.is_debugging.return_value = True
+
+        r = wait_for_stable_state(
+            sandbox_id="aa11", desired_state="running", timeout=0.01, poll_interval=0.005
+        )
+        assert not r["success"]
+        assert r["error_type"] == "TIMEOUT"
+        assert "actual_state" in r
+        assert r["actual_state"] != "unknown"  # must be "paused", "stopped", etc., not stale "unknown"
+
+    def test_paused_event_desired_state(self, manager, monkeypatch):
+        """desired_state='paused_event' must succeed when state machine reports paused_event."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import wait_for_stable_state
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.is_debugging.return_value = True
+        sm = MagicMock()
+        sm.current_state = "paused_event"
+        sb.client._axon_state_machine = sm
+
+        r = wait_for_stable_state(
+            sandbox_id="aa11", desired_state="paused_event", timeout=1.0, poll_interval=0.05
+        )
+        assert r["success"]
+        assert r["actual_state"] == "paused_event"
+
+    def test_paused_breakpoint_desired_state(self, manager, monkeypatch):
+        """desired_state='paused_breakpoint' must succeed when state machine reports it."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import wait_for_stable_state
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.is_debugging.return_value = True
+        sm = MagicMock()
+        sm.current_state = "paused_breakpoint"
+        sb.client._axon_state_machine = sm
+
+        r = wait_for_stable_state(
+            sandbox_id="aa11", desired_state="paused_breakpoint", timeout=1.0, poll_interval=0.05
+        )
+        assert r["success"]
+        assert r["actual_state"] == "paused_breakpoint"
+
+    def test_disconnected_early_exit(self, manager, monkeypatch):
+        """When is_debugging returns False the loop must exit early with NOT_CONNECTED."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import wait_for_stable_state
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.is_debugging.return_value = False  # disconnected
+
+        r = wait_for_stable_state(
+            sandbox_id="aa11", desired_state="running", timeout=5.0, poll_interval=0.05
+        )
+        assert not r["success"]
+        assert r["error_type"] == "NOT_CONNECTED"
+        assert r["actual_state"] == "disconnected"
+
+    def test_paused_superset_matches_stopped(self, manager, monkeypatch):
+        """desired_state='paused' should match when actual is 'stopped' (no state machine)."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import wait_for_stable_state
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.is_debugging.return_value = True
+        # No state machine — actual defaults to "paused"
+
+        r = wait_for_stable_state(
+            sandbox_id="aa11", desired_state="paused", timeout=1.0, poll_interval=0.05
+        )
+        assert r["success"]
+        assert r["actual_state"] == "paused"
+
+    def test_stopped_matches_paused_breakpoint(self, manager, monkeypatch):
+        """desired_state='stopped' should match when state machine reports paused_breakpoint."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import wait_for_stable_state
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.is_debugging.return_value = True
+        sm = MagicMock()
+        sm.current_state = "paused_breakpoint"
+        sb.client._axon_state_machine = sm
+
+        r = wait_for_stable_state(
+            sandbox_id="aa11", desired_state="stopped", timeout=1.0, poll_interval=0.05
+        )
+        assert r["success"]
+        assert r["actual_state"] == "paused_breakpoint"
+
+
+# ---------------------------------------------------------------------------
+# P3b: dump_stack_walk frame 0 faulting_instruction field
+# ---------------------------------------------------------------------------
+
+class TestDumpStackWalkFaultingInstruction:
+    def test_frame0_has_faulting_instruction_true(self, monkeypatch):
+        """Frame 0 must carry faulting_instruction=True."""
+        from x64dbg_automate.api_runtime.api_dump import dump_stack_walk
+
+        base = 0x200000
+        stack = bytes(0x20)
+        insp = _FakeInspector(
+            arch="x32",
+            context={"thread_id": 1, "arch": "x32",
+                     "registers": {"eip": 0x401000, "esp": base}},
+            stack={"base": base, "size": len(stack), "data": stack},
+            modules=[{"name": "app.exe", "base": 0x400000, "end": 0x410000}],
+        )
+        _patch_inspector(monkeypatch, insp)
+
+        r = dump_stack_walk(dump_path="x.dmp")
+        assert r["success"]
+        frame0 = r["frames"][0]
+        assert frame0["frame"] == 0
+        assert frame0["faulting_instruction"] is True
+
+    def test_subsequent_frames_have_no_faulting_instruction_flag(self, monkeypatch):
+        """Non-zero frames must not have faulting_instruction set to True."""
+        from x64dbg_automate.api_runtime.api_dump import dump_stack_walk
+
+        base = 0x200000
+        ret_addr = 0x401050
+        stack = bytearray(0x20)
+        stack[0:4] = ret_addr.to_bytes(4, "little")
+        preceding = bytes([0x00, 0x00, 0x00, 0xE8, 0x11, 0x22, 0x33, 0x44])
+
+        insp = _FakeInspector(
+            arch="x32",
+            context={"thread_id": 1, "arch": "x32",
+                     "registers": {"eip": 0x401000, "esp": base}},
+            stack={"base": base, "size": len(stack), "data": bytes(stack)},
+            modules=[{"name": "app.exe", "base": 0x400000, "end": 0x410000}],
+            va_bytes={ret_addr - 8: preceding},
+        )
+        _patch_inspector(monkeypatch, insp)
+
+        r = dump_stack_walk(dump_path="x.dmp")
+        assert r["success"]
+        for frame in r["frames"][1:]:
+            assert frame.get("faulting_instruction") is not True
+
+
+# ---------------------------------------------------------------------------
+# P3c: read_registers includes segment_registers dict
+# ---------------------------------------------------------------------------
+
+class TestSegmentRegisters:
+    def test_read_registers_includes_segment_registers(self, manager):
+        """read_registers response must contain a segment_registers dict with CS/DS/etc."""
+        from x64dbg_automate.api_runtime.api_control import read_registers
+
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.client.is_running.return_value = False
+        seg_vals = {"cs": 0x33, "ds": 0x2B, "es": 0x2B, "fs": 0x53, "gs": 0x2B, "ss": 0x2B}
+        gp_vals = {"rax": 0x1, "rip": 0x401000}
+
+        def _get_reg(r):
+            return seg_vals.get(r, gp_vals.get(r, 0))
+
+        sb.client.get_reg.side_effect = _get_reg
+
+        r = read_registers("aa11")
+        assert r["success"]
+        assert "segment_registers" in r
+        segs = r["segment_registers"]
+        for name in ("cs", "ds", "es", "fs", "gs", "ss"):
+            assert name in segs
+        assert segs["cs"] == "0x33"
+        assert segs["fs"] == "0x53"
+
+    def test_segment_registers_separate_from_gp_registers(self, manager):
+        """Segment registers must not appear in the main registers dict."""
+        from x64dbg_automate.api_runtime.api_control import read_registers
+
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.client.is_running.return_value = False
+        sb.client.get_reg.return_value = 0
+
+        r = read_registers("aa11")
+        assert r["success"]
+        for seg in ("cs", "ds", "es", "fs", "gs", "ss"):
+            assert seg not in r["registers"]
+
+    def test_segment_registers_returned_for_x32_too(self, manager):
+        """x32 sandboxes must also return segment_registers."""
+        from x64dbg_automate.api_runtime.api_control import read_registers
+
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.is_running.return_value = False
+        sb.client.get_reg.return_value = 0
+
+        r = read_registers("aa11")
+        assert r["success"]
+        assert "segment_registers" in r
+        assert len(r["segment_registers"]) == 6
+
+
+# ---------------------------------------------------------------------------
+# P0: sandbox_run_to_entry
+# ---------------------------------------------------------------------------
+
+def _make_module(name, base, size, entry=None):
+    """Build a SimpleNamespace module as returned by client.get_modules()."""
+    m = MagicMock()
+    m.name = name
+    m.path = f"C:\\windows\\system32\\{name}"
+    m.base = base
+    m.size = size
+    m.entry = entry or 0
+    return m
+
+
+class TestSandboxRunToEntry:
+    @pytest.fixture(autouse=True)
+    def _mgr(self, manager):
+        self._manager = manager
+
+    def _make_sb(self, arch="x32", target="target.exe"):
+        sb = _mock_sandbox(self._manager, arch=arch)
+        sb.target_exe = target
+        return sb
+
+    def test_reaches_entry_point(self, monkeypatch):
+        """Happy path: process stops exactly at entry point."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = self._make_sb()
+        entry_addr = 0x401000
+        target_mod = _make_module("target.exe", base=0x400000, size=0x20000, entry=entry_addr)
+        sb.client.get_modules.return_value = [target_mod]
+        sb.client.set_breakpoint.return_value = True
+        sb.client.is_running.side_effect = [False, False]   # paused at start, paused at EP
+        sb.client.go.return_value = True
+        sb.client.get_reg.return_value = entry_addr          # IP == entry_point
+        sb.client.clear_breakpoint.return_value = True
+        self._manager.refresh_state = MagicMock()
+
+        r = sandbox_run_to_entry(sandbox_id="aa11", timeout_sec=5.0)
+        assert r["success"]
+        assert r["reached_entry"] is True
+        assert r["entry_point"] == f"0x{entry_addr:X}"
+        assert r["module"] == "target.exe"
+        assert "registers" in r
+
+    def test_auto_skips_startup_modules(self, monkeypatch):
+        """Stops in ntdll must be auto-resumed; EP stop must succeed."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = self._make_sb()
+        entry_addr = 0x401000
+        ntdll_mod = _make_module("ntdll.dll", base=0x7FF00000, size=0x100000, entry=0)
+        target_mod = _make_module("target.exe", base=0x400000, size=0x20000, entry=entry_addr)
+
+        sb.client.get_modules.return_value = [ntdll_mod, target_mod]
+        sb.client.set_breakpoint.return_value = True
+        # First call to kick off; then two more polls: first in ntdll, then at EP
+        sb.client.is_running.side_effect = [False, False, False]
+        sb.client.go.return_value = True
+        # First IP read: inside ntdll; second IP read: at EP
+        sb.client.get_reg.side_effect = [0x7FF12345, 0x7FF12345, entry_addr, entry_addr, 0, 0, 0]
+        sb.client.clear_breakpoint.return_value = True
+        self._manager.refresh_state = MagicMock()
+
+        r = sandbox_run_to_entry(sandbox_id="aa11", timeout_sec=5.0)
+        assert r["success"]
+        assert r["reached_entry"] is True
+        assert r["resume_count"] >= 2  # initial go + at least one ntdll skip
+
+    def test_stops_at_user_bp_before_entry(self, monkeypatch):
+        """If execution stops in a non-startup module before EP, return reached_entry=False."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = self._make_sb()
+        entry_addr = 0x501000
+        user_mod = _make_module("user_code.dll", base=0x600000, size=0x10000, entry=0x600100)
+        target_mod = _make_module("target.exe", base=0x500000, size=0x20000, entry=entry_addr)
+
+        sb.client.get_modules.return_value = [user_mod, target_mod]
+        sb.client.set_breakpoint.return_value = True
+        sb.client.is_running.side_effect = [False, False]
+        sb.client.go.return_value = True
+        user_bp_addr = 0x605000
+        sb.client.get_reg.return_value = user_bp_addr     # stopped in user_code.dll
+        sb.client.clear_breakpoint.return_value = True
+        self._manager.refresh_state = MagicMock()
+
+        r = sandbox_run_to_entry(sandbox_id="aa11", timeout_sec=5.0)
+        assert r["success"]
+        assert r["reached_entry"] is False
+        assert r["current_ip"] == f"0x{user_bp_addr:X}"
+
+    def test_timeout_returns_error(self, monkeypatch):
+        """When deadline is exceeded before reaching EP, return TIMEOUT error."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = self._make_sb()
+        entry_addr = 0x401000
+        target_mod = _make_module("target.exe", base=0x400000, size=0x20000, entry=entry_addr)
+        sb.client.get_modules.return_value = [target_mod]
+        sb.client.set_breakpoint.return_value = True
+        sb.client.is_running.return_value = True   # always running → never pauses
+        sb.client.get_reg.return_value = 0x400000
+        sb.client.clear_breakpoint.return_value = True
+
+        r = sandbox_run_to_entry(sandbox_id="aa11", timeout_sec=0.01)
+        assert not r["success"]
+        assert r["error_type"] == "TIMEOUT"
+
+    def test_no_modules_returns_not_found(self, monkeypatch):
+        """Empty module list must fail with NOT_FOUND."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = self._make_sb()
+        sb.client.get_modules.return_value = []
+
+        r = sandbox_run_to_entry(sandbox_id="aa11")
+        assert not r["success"]
+        assert r["error_type"] == "NOT_FOUND"
+
+    def test_module_no_entry_returns_not_found(self, monkeypatch):
+        """Module with entry=0 must fail with NOT_FOUND."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = self._make_sb()
+        mod_no_entry = _make_module("target.exe", base=0x400000, size=0x20000, entry=0)
+        sb.client.get_modules.return_value = [mod_no_entry]
+
+        r = sandbox_run_to_entry(sandbox_id="aa11")
+        assert not r["success"]
+        assert r["error_type"] == "NOT_FOUND"
+
+    def test_no_client_returns_error(self, monkeypatch):
+        """Missing client must produce a NOT_CONNECTED error."""
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+
+        sb = self._make_sb()
+        sb.client = None
+
+        r = sandbox_run_to_entry(sandbox_id="aa11")
+        assert not r["success"]
+        assert r["error_type"] == "NOT_CONNECTED"
+
+    def test_already_at_entry_point(self, monkeypatch):
+        """If BP set fails but IP is already at EP, return reached_entry=True immediately."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = self._make_sb()
+        entry_addr = 0x401000
+        target_mod = _make_module("target.exe", base=0x400000, size=0x20000, entry=entry_addr)
+        sb.client.get_modules.return_value = [target_mod]
+        sb.client.set_breakpoint.return_value = False   # fails — already there
+        sb.client.get_reg.return_value = entry_addr      # IP == entry
+        self._manager.refresh_state = MagicMock()
+
+        r = sandbox_run_to_entry(sandbox_id="aa11", timeout_sec=5.0)
+        assert r["success"]
+        assert r["reached_entry"] is True
+        assert "Already at entry point" in r.get("note", "")

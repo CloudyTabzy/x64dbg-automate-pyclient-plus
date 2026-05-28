@@ -843,19 +843,61 @@ def eval_expression(expression: str) -> dict:
         return err_from_exc(exc)
 
 
+# Commands whose output goes to the x64dbg GUI only — no RPC return value.
+# For these, point agents at the dedicated structured tool instead.
+_EXEC_CMD_OUTPUT_HINTS: dict[str, str] = {
+    "db":     "Use read_memory(address, size) for raw bytes as hex.",
+    "dd":     "Use read_memory(address, size) for raw bytes as hex.",
+    "dq":     "Use read_memory(address, size) for raw bytes as hex.",
+    "disasm": "Use disassemble(address, count) for structured disassembly output.",
+    "d":      "Use disassemble(address, count) for structured disassembly output.",
+    "lm":     "Use get_modules() for a structured module list.",
+    "r":      "Use read_registers() for a structured register dump.",
+    "kv":     "Use dump_stack_walk(dump_path) for offline stacks, or read_registers() live.",
+    "bp":     "Use breakpoint_set(address) for structured BP management.",
+    "bl":     "Use list_breakpoints() to get all active breakpoints.",
+    "bc":     "Use breakpoint_clear(address) to remove a breakpoint.",
+}
+
+
 @mcp.tool()
 def execute_command(command: str) -> dict:
-    """Execute a raw x64dbg command.
+    """Execute a raw x64dbg command and return its boolean result.
 
     See https://help.x64dbg.com/en/latest/commands/ for available commands.
 
+    **Important:** x64dbg's RPC returns only a success/failure boolean — display
+    commands (``db``, ``disasm``, ``r``, ``lm``, etc.) update the GUI window and
+    do NOT return their output via RPC.  Use the dedicated MCP tools (read_memory,
+    disassemble, read_registers, get_modules) when you need structured data back.
+    This tool is best for state-mutation commands (``bp``, ``bc``, ``seteip``,
+    ``SetBreakpointCommand``, custom scripts) where you only need confirmation the
+    command ran.
+
     Args:
-        command: x64dbg command string
+        command: x64dbg command string.
     """
     try:
         client = _require_client()
         result = client.cmd_sync(command)
-        return ok(command=command, result=result)
+
+        resp = ok(command=command, result=result)
+
+        # Surface a hint for common display-only commands so agents know
+        # which structured tool to call for the actual data.
+        cmd_token = command.strip().split()[0].lower() if command.strip() else ""
+        hint = _EXEC_CMD_OUTPUT_HINTS.get(cmd_token)
+        if hint:
+            resp["output_note"] = (
+                "This command updates the x64dbg GUI but does not return output via RPC. "
+                + hint
+            )
+        elif not result:
+            resp["result_note"] = (
+                "result=false: x64dbg rejected the command or it has no boolean return value. "
+                "Verify syntax at https://help.x64dbg.com/en/latest/commands/"
+            )
+        return resp
     except Exception as exc:
         return err_from_exc(exc)
 
@@ -2113,14 +2155,76 @@ def extract_section_from_dump(dump_path: str, section_va: str, size: int, output
             except ImportError:
                 pass
 
+        # Fallback 4: module-table → local disk PE section reconstruction.
+        # Minidumps often omit mapped-module memory from their memory descriptors
+        # (only stack and heap regions are captured). When the VA is in a known
+        # module, load that module's on-disk PE and extract via VA→RVA→file-offset.
+        # The loaded base from the dump (mod["base"]) is used for ASLR-correct RVA
+        # calculation, not the PE's own ImageBase.
+        _disk_fallback_note = None
         if extracted is None:
-            return err(f"Could not extract bytes at VA {_format_address(va)} from dump.",
-                       ErrorType.NOT_FOUND, hint=_ERROR_HINTS[ErrorType.NOT_FOUND],
-                       section_va=_format_address(va), dump_path=dump_path)
+            try:
+                from x64dbg_automate.external.minidump_reader import DumpInspector, DumpError as _DE
+                _insp = DumpInspector.from_file(dump_path)
+                _mod = _insp.module_for_va(va)
+                if _mod:
+                    _disk_path = _mod.get("path")
+                    if _disk_path and os.path.isfile(_disk_path):
+                        import pefile as _pef
+                        _pe = _pef.PE(_disk_path, fast_load=False)
+                        _rva = va - _mod["base"]          # RVA relative to loaded base
+                        for _sec in _pe.sections:
+                            _sec_start = _sec.VirtualAddress
+                            _sec_end = _sec_start + _sec.Misc_VirtualSize
+                            if _sec_start <= _rva < _sec_end:
+                                _raw_off = _sec.PointerToRawData + (_rva - _sec_start)
+                                _slice = _pe.__data__[_raw_off: _raw_off + size]
+                                if _slice:
+                                    extracted = bytes(_slice)
+                                    _disk_fallback_note = (
+                                        f"Extracted from on-disk {os.path.basename(_disk_path)} "
+                                        f"(loaded at {_format_address(_mod['base'])}). "
+                                        "In-memory patches/relocations are NOT reflected."
+                                    )
+                                break
+            except Exception:
+                pass
+
+        if extracted is None:
+            # Provide a richer error: tell the agent which module owns the VA and why
+            # all fallbacks failed, so it knows what to try next.
+            _mod_hint = ""
+            try:
+                from x64dbg_automate.external.minidump_reader import DumpInspector, DumpError as _DE2
+                _insp2 = DumpInspector.from_file(dump_path)
+                _m = _insp2.module_for_va(va)
+                if _m:
+                    _disk = _m.get("path", "")
+                    _on_disk = "on disk" if _disk and os.path.isfile(_disk) else "NOT found on disk"
+                    _mod_hint = (
+                        f" VA belongs to {_m['name']} (loaded at {_format_address(_m['base'])}, "
+                        f"file {_on_disk}). The dump lacks memory descriptors for this region — "
+                        "a full/heap dump is needed, or extract the section from the local DLL file."
+                    )
+            except Exception:
+                pass
+            return err(
+                f"Could not extract bytes at VA {_format_address(va)} from dump." + _mod_hint,
+                ErrorType.NOT_FOUND,
+                hint=(
+                    "The minidump may not include this memory region. "
+                    "Try a full dump (method='procdump') or extract from the local DLL with pefile."
+                ),
+                section_va=_format_address(va),
+                dump_path=dump_path,
+            )
 
         with open(output_path, "wb") as f:
             f.write(extracted)
-        return ok(section_va=_format_address(va), size=len(extracted), output_path=output_path)
+        result = ok(section_va=_format_address(va), size=len(extracted), output_path=output_path)
+        if _disk_fallback_note:
+            result["note"] = _disk_fallback_note
+        return result
     except Exception as exc:
         return err_from_exc(exc)
 
