@@ -5979,3 +5979,127 @@ class TestSandboxRunToEntry:
         assert r["success"]
         assert r["reached_entry"] is True
         assert "Already at entry point" in r.get("note", "")
+
+    def test_reuses_preexisting_ep_bp(self, monkeypatch):
+        """V5 fix: when set_breakpoint fails but an existing BP exists at EP, proceed."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+        from x64dbg_automate.models import BreakpointType
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = self._make_sb()
+        entry_addr = 0x401000
+        target_mod = _make_module("target.exe", base=0x400000, size=0x20000, entry=entry_addr)
+        sb.client.get_modules.return_value = [target_mod]
+        sb.client.set_breakpoint.return_value = False   # duplicate — fails
+
+        # Simulate a pre-existing BP at the entry address
+        existing_bp = MagicMock()
+        existing_bp.addr = entry_addr
+        sb.client.get_reg.side_effect = [
+            0x7C000000,    # IP check after set_breakpoint fails (not at EP yet)
+            entry_addr,    # IP read during poll loop (stopped at EP)
+            *[0]*20,
+        ]
+        sb.client.get_breakpoints.return_value = [existing_bp]
+        sb.client.is_running.side_effect = [False, False]
+        sb.client.go.return_value = True
+        sb.client.clear_breakpoint.return_value = True
+        self._manager.refresh_state = MagicMock()
+
+        r = sandbox_run_to_entry(sandbox_id="aa11", timeout_sec=5.0)
+        assert r["success"]
+        assert r["reached_entry"] is True
+
+    def test_skip_modules_include_dbghelp_and_gdi32full(self):
+        """V5 fix: dbghelp.dll and gdi32full.dll must be in the startup skip set."""
+        from x64dbg_automate.api_runtime.api_infrastructure import _STARTUP_SKIP_MODULES
+        assert "dbghelp.dll" in _STARTUP_SKIP_MODULES
+        assert "gdi32full.dll" in _STARTUP_SKIP_MODULES
+
+    def test_tls_callback_modules_auto_skipped(self, monkeypatch):
+        """V5 fix: stops in dbghelp.dll/gdi32full.dll are auto-resumed like ntdll."""
+        import time as _time
+        from x64dbg_automate.api_runtime.api_infrastructure import sandbox_run_to_entry
+        monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+        sb = self._make_sb()
+        entry_addr = 0x501000
+        dbghelp_mod = _make_module("dbghelp.dll", base=0x600000, size=0x80000, entry=0)
+        target_mod = _make_module("target.exe", base=0x500000, size=0x20000, entry=entry_addr)
+
+        sb.client.get_modules.return_value = [dbghelp_mod, target_mod]
+        sb.client.set_breakpoint.return_value = True
+        sb.client.is_running.side_effect = [False, False, False]
+        sb.client.go.return_value = True
+        # First stop in dbghelp.dll, second stop at entry point
+        sb.client.get_reg.side_effect = [0x650000, 0x650000, entry_addr, entry_addr, 0, 0, 0]
+        sb.client.clear_breakpoint.return_value = True
+        self._manager.refresh_state = MagicMock()
+
+        r = sandbox_run_to_entry(sandbox_id="aa11", timeout_sec=5.0)
+        assert r["success"]
+        assert r["reached_entry"] is True
+        assert r["resume_count"] >= 2   # initial go + dbghelp skip
+
+
+# ---------------------------------------------------------------------------
+# V5 Fix 3: breakpoint_clear not_found disambiguation
+# ---------------------------------------------------------------------------
+
+class TestBreakpointClearNotFound:
+    def test_clear_existing_bp_returns_cleared_true(self, manager):
+        """Clearing a BP that exists must return cleared=True and not_found absent/False."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_clear
+        from x64dbg_automate.models import BreakpointType
+
+        sb = _mock_sandbox(manager)
+        sb.client.eval_sync.return_value = (0x401000, True)
+        existing_bp = MagicMock()
+        existing_bp.addr = 0x401000
+        sb.client.get_breakpoints.return_value = [existing_bp]
+        sb.client.clear_breakpoint.return_value = True
+
+        r = breakpoint_clear(sandbox_id="aa11", address="0x401000")
+        assert r["success"]
+        assert r["cleared"] is True
+        assert not r.get("not_found", False)
+
+    def test_clear_nonexistent_bp_returns_not_found_true(self, manager):
+        """Clearing a BP that does not exist must return cleared=False and not_found=True."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_clear
+
+        sb = _mock_sandbox(manager)
+        sb.client.eval_sync.return_value = (0x401000, True)
+        sb.client.get_breakpoints.return_value = []   # no BPs at all
+        sb.client.clear_breakpoint.return_value = False
+
+        r = breakpoint_clear(sandbox_id="aa11", address="0x401000")
+        assert r["success"]
+        assert r["cleared"] is False
+        assert r.get("not_found") is True
+
+    def test_clear_all_no_address_no_not_found_field(self, manager):
+        """When clearing all BPs (no address), not_found must not appear in the response."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_clear
+
+        sb = _mock_sandbox(manager)
+        sb.client.clear_breakpoint.return_value = True
+
+        r = breakpoint_clear(sandbox_id="aa11", address="", bp_class="software")
+        assert r["success"]
+        assert "not_found" not in r
+
+    def test_clear_hardware_not_found(self, manager):
+        """not_found must also work for hardware breakpoints."""
+        from x64dbg_automate.api_runtime.api_control import breakpoint_clear
+
+        sb = _mock_sandbox(manager)
+        sb.client.eval_sync.return_value = (0x401000, True)
+        sb.client.get_breakpoints.return_value = []
+        sb.client.clear_hardware_breakpoint.return_value = False
+
+        r = breakpoint_clear(sandbox_id="aa11", address="0x401000", bp_class="hardware")
+        assert r["success"]
+        assert r["cleared"] is False
+        assert r.get("not_found") is True

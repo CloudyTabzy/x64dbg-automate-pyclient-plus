@@ -225,7 +225,13 @@ def breakpoint_set(
 @tool
 @unsafe
 def breakpoint_clear(*, sandbox_id: str | None = None, address: str = "", bp_class: str = "software") -> dict:
-    """Remove a breakpoint (or all of a class when address is omitted). State-mutating."""
+    """Remove a breakpoint (or all of a class when address is omitted). State-mutating.
+
+    Response fields:
+        cleared: True if a breakpoint was successfully removed.
+        not_found: True when the specific address had no breakpoint to remove
+                   (distinct from a real failure). Only set when ``address`` is given.
+    """
     client, sandbox, error = _client_or_error(sandbox_id)
     if error:
         return error
@@ -236,6 +242,24 @@ def breakpoint_clear(*, sandbox_id: str | None = None, address: str = "", bp_cla
         except ValueError as exc:
             return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
     cls = bp_class.lower().strip()
+
+    # Pre-check existence so callers can distinguish "BP was already gone" from
+    # a genuine clear failure (the x64dbg RPC returns the same False in both cases).
+    existed: bool | None = None
+    if target is not None:
+        try:
+            from x64dbg_automate.models import BreakpointType
+            _bt_map = {
+                "software": BreakpointType.BpNormal,
+                "hardware": BreakpointType.BpHardware,
+                "memory":   BreakpointType.BpMemory,
+            }
+            if cls in _bt_map:
+                existing = client.get_breakpoints(_bt_map[cls]) or []
+                existed = any(bp.addr == target for bp in existing)
+        except Exception:
+            pass
+
     try:
         if cls == "software":
             success = client.clear_breakpoint(target)
@@ -250,9 +274,13 @@ def breakpoint_clear(*, sandbox_id: str | None = None, address: str = "", bp_cla
         if is_bug(exc):
             raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
-    return ok(sandbox_id=sandbox_id, bp_class=cls,
+
+    resp = ok(sandbox_id=sandbox_id, bp_class=cls,
               address=(f"0x{target:X}" if target is not None else None),
               cleared=bool(success))
+    if target is not None and existed is False:
+        resp["not_found"] = True
+    return resp
 
 
 @tool

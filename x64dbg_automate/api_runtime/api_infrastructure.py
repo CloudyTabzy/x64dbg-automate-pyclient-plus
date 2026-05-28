@@ -18,9 +18,19 @@ from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 # (system breakpoint, DLL load, WOW64 thunk). sandbox_run_to_entry auto-resumes
 # through these so agents land cleanly at the target entry point.
 _STARTUP_SKIP_MODULES = frozenset({
+    # Core OS loader / WOW64 thunk layer
     "ntdll.dll", "ntdll32.dll",
     "kernel32.dll", "kernelbase.dll",
     "wow64.dll", "wow64win.dll", "wow64cpu.dll",
+    # Windows system DLLs with TLS callbacks that fire during complex process startups
+    # (reported in V5 feedback: dbghelp.dll and gdi32full.dll trigger repeated paused_event
+    # stops that prevent sandbox_run_to_entry from reaching the target entry point)
+    "dbghelp.dll",
+    "gdi32full.dll",
+    "ucrtbase.dll",
+    "vcruntime140.dll", "vcruntime140_1.dll",
+    "msvcp140.dll", "msvcp_win.dll",
+    "concrt140.dll",
 })
 
 
@@ -337,12 +347,22 @@ def sandbox_run_to_entry(
                 registers=regs,
                 note="Already at entry point.",
             )
-        return err(
-            f"Could not set entry-point breakpoint at 0x{entry_point:X}.",
-            ErrorType.RPC_ERROR,
-            hint="A duplicate breakpoint may exist or the address is not executable. "
-                 "Check breakpoint_list and clear any conflicts.",
-        )
+        # A pre-existing BP at the entry point (e.g. set by sandbox_create or a
+        # previous run) can serve as our sentinel — reuse it rather than failing.
+        _pre_existing = False
+        try:
+            from x64dbg_automate.models import BreakpointType
+            existing = client.get_breakpoints(BreakpointType.BpNormal) or []
+            _pre_existing = any(bp.addr == entry_point for bp in existing)
+        except Exception:
+            pass
+        if not _pre_existing:
+            return err(
+                f"Could not set entry-point breakpoint at 0x{entry_point:X}.",
+                ErrorType.RPC_ERROR,
+                hint="A duplicate breakpoint may exist or the address is not executable. "
+                     "Check breakpoint_list and clear any conflicts.",
+            )
 
     # ── drive through startup events until we reach the entry point ───────
     deadline = time.time() + timeout_sec
