@@ -380,3 +380,139 @@ def sandbox_dump(*, sandbox_id: str | None = None, output_dir: str = "", method:
         return err("Dump failed.", ErrorType.SNAPSHOT_FAILED,
                    hint="Try running as Administrator or a different method.", sandbox_id=sandbox_id)
     return ok(sandbox_id=sandbox_id, dump_path=dump_path, size=os.path.getsize(dump_path), method=method)
+
+
+# ── Headless window-suppression hooks ─────────────────────────────────────────
+# x64 Windows calling convention: args 1-4 in RCX/RDX/R8/R9; rest on stack.
+#   CreateWindowEx: dwExStyle=RCX, lpClass=RDX, lpName=R8, dwStyle=R9  → strip WS_VISIBLE from R9
+#   ShowWindow:     hWnd=RCX, nCmdShow=RDX                             → force SW_HIDE (0) via RDX
+# x86 stdcall: args at [esp+4], [esp+8], … (CALL has pushed the return address).
+#   CreateWindowEx arg4 (dwStyle) = [esp+10]
+#   ShowWindow     arg2 (nCmdShow) = [esp+8]
+_HEADLESS_CMDS_X64: dict[str, str] = {
+    "user32.CreateWindowExW": "r9 &= 0xEFFFFFFF",   # clear WS_VISIBLE bit
+    "user32.CreateWindowExA": "r9 &= 0xEFFFFFFF",
+    "user32.ShowWindow":       "rdx &= 0",           # SW_HIDE = 0
+}
+_HEADLESS_CMDS_X32: dict[str, str] = {
+    "user32.CreateWindowExW": "[esp+10] &= 0xEFFFFFFF",
+    "user32.CreateWindowExA": "[esp+10] &= 0xEFFFFFFF",
+    "user32.ShowWindow":       "[esp+8] &= 0",
+}
+
+
+@tool
+def sandbox_enable_headless(*, sandbox_id: str | None = None) -> dict:
+    """Suppress the debuggee's windows so it runs hidden in the background.
+
+    Sets silent breakpoints on ``CreateWindowExW``, ``CreateWindowExA``, and
+    ``ShowWindow``. Each hook strips ``WS_VISIBLE`` from the window-style argument
+    (so the window is created hidden) or forces ``nCmdShow=0`` (``SW_HIDE``), then
+    resumes the debuggee automatically via a trailing ``run`` command.
+
+    Call while the target is paused (e.g. at the system breakpoint after
+    ``sandbox_create``), then resume with ``sandbox_continue``. The game runs at
+    full speed with no window appearing on screen.
+
+    If the debuggee pauses unexpectedly at one of these hooks it means the
+    auto-resume ``run`` command was not recognised by the running x64dbg version
+    — call ``sandbox_continue`` once to proceed. The window will still be hidden
+    because the argument patch fires before the pause.
+
+    Args:
+        sandbox_id: Target sandbox (omit for active session).
+    """
+    mgr = get_manager()
+    try:
+        sandbox = mgr.get_sandbox(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+    if sandbox.client is None:
+        return err(
+            f"Sandbox '{sandbox.sandbox_id}' has no active debugger client.",
+            ErrorType.NOT_FOUND,
+        )
+
+    client = sandbox.client
+    hooks = _HEADLESS_CMDS_X64 if sandbox.debugger_arch == "x64" else _HEADLESS_CMDS_X32
+
+    applied: list[str] = []
+    failed: list[dict] = []
+    for fn, cmd in hooks.items():
+        # Append "run" so the debugger auto-resumes after the argument patch fires.
+        # The \n is the x64dbg script command separator.
+        full_cmd = f"{cmd}\nrun"
+        try:
+            r1 = client.cmd_sync(f"bp {fn}")
+            r2 = client.cmd_sync(f'SetBreakpointCommand {fn}, "{full_cmd}"')
+            r3 = client.cmd_sync(f"SetBreakpointFastResume {fn}, 1")
+            if r1 and r2 and r3:
+                applied.append(fn)
+            else:
+                failed.append({"function": fn, "error": f"cmd_sync returned False ({r1},{r2},{r3})"})
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"function": fn, "error": str(exc)})
+
+    sandbox.headless = bool(applied)
+    result = ok(
+        sandbox_id=sandbox.sandbox_id,
+        arch=sandbox.debugger_arch,
+        hooked=applied,
+        note=(
+            "WS_VISIBLE stripped from CreateWindowEx; nCmdShow forced to SW_HIDE. "
+            "Resume the process — the game window will remain hidden."
+        ),
+    )
+    if failed:
+        result["failed"] = failed
+        result["warning"] = (
+            "Some hooks failed. Ensure user32.dll is loaded and the process is stopped. "
+            "Most games import user32 statically so it loads before the entry point."
+        )
+    return result
+
+
+@tool
+def sandbox_disable_headless(*, sandbox_id: str | None = None) -> dict:
+    """Remove the window-suppression hooks placed by sandbox_enable_headless.
+
+    Clears the ``CreateWindowExW``, ``CreateWindowExA``, and ``ShowWindow``
+    breakpoints. Subsequent window-creation and show calls will behave normally.
+
+    Args:
+        sandbox_id: Target sandbox (omit for active session).
+    """
+    mgr = get_manager()
+    try:
+        sandbox = mgr.get_sandbox(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+    if sandbox.client is None:
+        return err(
+            f"Sandbox '{sandbox.sandbox_id}' has no active debugger client.",
+            ErrorType.NOT_FOUND,
+        )
+
+    client = sandbox.client
+    hooks = _HEADLESS_CMDS_X64 if sandbox.debugger_arch == "x64" else _HEADLESS_CMDS_X32
+
+    removed: list[str] = []
+    failed: list[dict] = []
+    for fn in hooks:
+        try:
+            if client.cmd_sync(f"bc {fn}"):
+                removed.append(fn)
+            else:
+                failed.append({"function": fn, "error": "bc returned False"})
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"function": fn, "error": str(exc)})
+
+    sandbox.headless = False
+    result = ok(
+        sandbox_id=sandbox.sandbox_id,
+        removed=removed,
+        note="Window-suppression hooks removed. Next window creation will be visible.",
+    )
+    if failed:
+        result["failed"] = failed
+    return result

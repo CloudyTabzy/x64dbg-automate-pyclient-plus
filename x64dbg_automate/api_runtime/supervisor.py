@@ -159,6 +159,7 @@ class ProcessSandbox:
     debuggee_pid: int | None = None             # the actual target PID
     state: str = "created"                       # created|running|stopped|detached|destroyed|crashed
     anti_debug_applied: bool = False
+    headless: bool = False                              # window-suppression hooks active
     last_error: str | None = None
     checkpoints: dict[str, Checkpoint] = field(default_factory=dict)
     patches: list[dict] = field(default_factory=list)   # in-memory patch records
@@ -179,6 +180,7 @@ class ProcessSandbox:
             "attach_pid": self.attach_pid,
             "state": self.state,
             "anti_debug_applied": self.anti_debug_applied,
+            "headless": self.headless,
             "created_at": self.created_at.isoformat(timespec="seconds"),
             "checkpoints": [cp.to_info() for cp in self.checkpoints.values()],
             "patch_count": len(self.patches),

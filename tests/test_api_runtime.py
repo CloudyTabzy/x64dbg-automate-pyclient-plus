@@ -5446,3 +5446,135 @@ class TestEnumerateExceptionHandlers:
         assert r["veh"]["count"] == 1
         assert r["veh"]["handlers"][0]["handler_encoded"] == f"0x{handler_enc:X}"
         assert "RtlEncodePointer" in r["veh"]["note"]
+
+
+# ---------------------------------------------------------------------------
+# sandbox_enable_headless / sandbox_disable_headless
+# ---------------------------------------------------------------------------
+
+class TestSandboxHeadless:
+    @pytest.fixture(autouse=True)
+    def manager(self):
+        from x64dbg_automate.api_runtime import supervisor as sv
+        mgr = SandboxManager()
+        sv._manager = mgr
+        yield mgr
+        sv._manager = None
+
+    def test_enable_headless_x64_applies_all_hooks(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_enable_headless
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.client.cmd_sync.return_value = True
+
+        r = sandbox_enable_headless(sandbox_id="aa11")
+
+        assert r["success"]
+        assert set(r["hooked"]) == {
+            "user32.CreateWindowExW",
+            "user32.CreateWindowExA",
+            "user32.ShowWindow",
+        }
+        assert sb.headless is True
+        # Verify SetBreakpointCommand was called for each function
+        calls = [str(c) for c in sb.client.cmd_sync.call_args_list]
+        assert any("SetBreakpointCommand" in c and "CreateWindowExW" in c for c in calls)
+        assert any("SetBreakpointCommand" in c and "ShowWindow" in c for c in calls)
+        # Verify fast-resume was set
+        assert any("SetBreakpointFastResume" in c for c in calls)
+
+    def test_enable_headless_x64_command_clears_ws_visible_in_r9(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_enable_headless, _HEADLESS_CMDS_X64
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.client.cmd_sync.return_value = True
+
+        sandbox_enable_headless(sandbox_id="aa11")
+
+        # Confirm r9 is modified and 0xEFFFFFFF mask is used
+        cmd = _HEADLESS_CMDS_X64["user32.CreateWindowExW"]
+        assert "r9" in cmd
+        assert "EFFFFFF" in cmd.upper()
+
+    def test_enable_headless_x32_uses_stack_offsets(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_enable_headless, _HEADLESS_CMDS_X32
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.cmd_sync.return_value = True
+
+        r = sandbox_enable_headless(sandbox_id="aa11")
+
+        assert r["success"]
+        assert sb.headless is True
+        cwex_cmd = _HEADLESS_CMDS_X32["user32.CreateWindowExW"]
+        assert "esp+10" in cwex_cmd.lower() or "[esp+10]" in cwex_cmd.lower()
+        sw_cmd = _HEADLESS_CMDS_X32["user32.ShowWindow"]
+        assert "esp+8" in sw_cmd.lower() or "[esp+8]" in sw_cmd.lower()
+
+    def test_enable_headless_partial_failure_records_errors(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_enable_headless
+        sb = _mock_sandbox(manager, arch="x64")
+
+        call_count = {"n": 0}
+        def _cmd(s):
+            call_count["n"] += 1
+            # Fail all commands for ShowWindow
+            if "ShowWindow" in s:
+                return False
+            return True
+        sb.client.cmd_sync.side_effect = _cmd
+
+        r = sandbox_enable_headless(sandbox_id="aa11")
+
+        assert r["success"]                           # tool itself succeeded
+        assert "user32.ShowWindow" not in r["hooked"]
+        assert "failed" in r
+        assert any("ShowWindow" in f["function"] for f in r["failed"])
+        # headless=True because at least some hooks were applied
+        assert sb.headless is True
+
+    def test_enable_headless_no_client_returns_error(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_enable_headless
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.client = None
+
+        r = sandbox_enable_headless(sandbox_id="aa11")
+
+        assert not r["success"]
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_disable_headless_clears_all_bps(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_disable_headless
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.headless = True
+        sb.client.cmd_sync.return_value = True
+
+        r = sandbox_disable_headless(sandbox_id="aa11")
+
+        assert r["success"]
+        assert set(r["removed"]) == {
+            "user32.CreateWindowExW",
+            "user32.CreateWindowExA",
+            "user32.ShowWindow",
+        }
+        assert sb.headless is False
+        calls = [str(c) for c in sb.client.cmd_sync.call_args_list]
+        assert all(any(f"bc {fn}" in c for c in calls) for fn in [
+            "user32.CreateWindowExW", "user32.CreateWindowExA", "user32.ShowWindow",
+        ])
+
+    def test_disable_headless_no_client_returns_error(self, manager):
+        from x64dbg_automate.api_runtime.api_sandbox import sandbox_disable_headless
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.client = None
+
+        r = sandbox_disable_headless(sandbox_id="aa11")
+
+        assert not r["success"]
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+    def test_headless_flag_reflected_in_sandbox_info(self, manager):
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.headless = True
+        info = sb.to_info()
+        assert info["headless"] is True
+
+        sb.headless = False
+        assert sb.to_info()["headless"] is False
