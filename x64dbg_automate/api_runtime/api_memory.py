@@ -281,6 +281,7 @@ def read_memory_range(
     size: int,
     chunk_size: int = 65536,
     offset: int = 0,
+    include_region: bool = True,
 ) -> dict:
     """Read a large memory region in one call, returning hex-encoded chunks.
 
@@ -294,6 +295,9 @@ def read_memory_range(
         size: Total bytes to read (max 64 MiB).
         chunk_size: Internal read chunk (default 64 KiB; reduce if hitting RPC timeouts).
         offset: Skip this many bytes from the start before returning data (for pagination).
+        include_region: Annotate the result with the containing region's section,
+            protection, and executability (cached, so it's nearly free). Set False
+            to skip if you don't need it.
     """
     _MAX_READ = 64 * 1024 * 1024  # 64 MiB hard cap
 
@@ -354,6 +358,11 @@ def read_memory_range(
     )
     if failed_chunks:
         result["unreadable_chunks"] = failed_chunks
+    if include_region:
+        from x64dbg_automate.api_runtime.runtime_helpers import region_info
+        region = region_info(mgr, sandbox_id, base)
+        if region is not None:
+            result["region"] = region
     return result
 
 

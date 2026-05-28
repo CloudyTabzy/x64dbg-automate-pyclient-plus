@@ -163,6 +163,10 @@ class ProcessSandbox:
     checkpoints: dict[str, Checkpoint] = field(default_factory=dict)
     patches: list[dict] = field(default_factory=list)   # in-memory patch records
     client: "X64DbgClient | None" = None
+    # Short-TTL memory-map cache so rapid sequential reads don't each re-fetch
+    # the whole map (set/used via SandboxManager.region_for_address).
+    _memmap_cache: list | None = field(default=None, repr=False, compare=False)
+    _memmap_cache_ts: float = field(default=0.0, repr=False, compare=False)
 
     def to_info(self) -> dict:
         """JSON-safe metadata for tool responses (never includes the client)."""
@@ -241,6 +245,11 @@ class SandboxManager:
         )
         with self._lock:
             self._sandboxes[sandbox.sandbox_id] = sandbox
+            # Newly created sandbox becomes the active session so that tools
+            # invoked without an explicit sandbox_id (including the legacy
+            # control tools) operate on it. This is what unifies the two tiers
+            # onto a single connection.
+            self._active_session_id = sandbox.sandbox_id
         return sandbox
 
     def destroy_sandbox(self, sandbox_id: str) -> bool:
@@ -339,6 +348,39 @@ class SandboxManager:
             sandbox.last_error = None
             self.refresh_state(sandbox)
         return ok_
+
+    def cached_memmap(self, sandbox_id: str | None = None, *, ttl: float = 2.0) -> list:
+        """Return the debuggee memory map, cached per-sandbox for ``ttl`` seconds.
+
+        ``memmap()`` is a relatively heavy RPC that returns the whole address
+        space; caching it lets region lookups annotate fast read loops without a
+        round-trip per call. On RPC failure the previous snapshot is reused.
+        """
+        import time
+        sandbox = self.get_sandbox(sandbox_id)
+        now = time.monotonic()
+        if sandbox._memmap_cache is not None and (now - sandbox._memmap_cache_ts) < ttl:
+            return sandbox._memmap_cache
+        client = sandbox.client
+        pages: list = sandbox._memmap_cache or []
+        if client is not None:
+            try:
+                pages = client.memmap()
+            except Exception:
+                pass  # keep the stale snapshot rather than losing region info
+        sandbox._memmap_cache = pages
+        sandbox._memmap_cache_ts = now
+        return pages
+
+    def region_for_address(self, sandbox_id: str | None = None, *, address: int, ttl: float = 2.0):
+        """Return the cached memmap page containing ``address`` (or None)."""
+        for p in self.cached_memmap(sandbox_id, ttl=ttl):
+            try:
+                if p.base_address <= address < p.base_address + p.region_size:
+                    return p
+            except Exception:
+                continue
+        return None
 
     def set_active_session(self, sandbox_id: str) -> None:
         with self._lock:

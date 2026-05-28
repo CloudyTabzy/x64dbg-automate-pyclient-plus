@@ -27,6 +27,30 @@ COMPAT_VERSION = "Axon_MCP" # TODO: externalize
 logger = logging.getLogger(__name__)
 all_instances: list['X64DbgClient'] = []
 
+# ZMTP heartbeat — libzmq sends keepalive PING/PONG frames transparently so the
+# connection survives long idle gaps (e.g. multi-second LLM "think" time between
+# tool calls) instead of being dropped, and a genuinely dead peer is detected
+# within HEARTBEAT_TIMEOUT. Both ends use libzmq, so the plugin's REP/PUB sockets
+# answer the heartbeats without any plugin-side code.
+_ZMQ_HEARTBEAT_IVL_MS = 5000       # send a PING every 5s of inactivity
+_ZMQ_HEARTBEAT_TIMEOUT_MS = 15000  # mark the link dead if no PONG within 15s
+_ZMQ_HEARTBEAT_TTL_MS = 15000      # ask the peer to drop us if we go silent 15s
+
+
+def _apply_heartbeat(sock: "zmq.Socket") -> None:
+    """Enable ZMTP heartbeats on a socket (best-effort across pyzmq versions)."""
+    for opt, val in (
+        ("HEARTBEAT_IVL", _ZMQ_HEARTBEAT_IVL_MS),
+        ("HEARTBEAT_TIMEOUT", _ZMQ_HEARTBEAT_TIMEOUT_MS),
+        ("HEARTBEAT_TTL", _ZMQ_HEARTBEAT_TTL_MS),
+    ):
+        code = getattr(zmq, opt, None)
+        if code is not None:
+            try:
+                sock.setsockopt(code, val)
+            except Exception:
+                pass
+
 
 if _IS_WINDOWS:
     def ctrl_c_handler(sig_t: int) -> bool:
@@ -127,6 +151,7 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
         sock.setsockopt(zmq.SNDTIMEO, 6000)
         sock.setsockopt(zmq.RCVTIMEO, 10000)
         sock.setsockopt(zmq.LINGER, 0)
+        _apply_heartbeat(sock)
         sock.connect(f"tcp://{self.remote_host}:{self.sess_req_rep_port}")
         return sock
 
@@ -162,6 +187,7 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
         self.sub_socket.setsockopt(zmq.CONNECT_TIMEOUT, 6000)
         self.sub_socket.setsockopt(zmq.SNDTIMEO, 6000)
         self.sub_socket.setsockopt(zmq.RCVTIMEO, 10000)
+        _apply_heartbeat(self.sub_socket)
         self.sub_socket.connect(f"tcp://{self.remote_host}:{self.sess_pub_sub_port}")
         self.sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self.sub_thread = threading.Thread(target=self._sub_thread)
@@ -321,7 +347,7 @@ class X64DbgClient(XAutoHighLevelCommandAbstractionMixin, DebugEventQueueMixin):
         Returns False on any error (dead plugin, wrong port, timeout) and never
         raises, so it is safe to call before every sensitive operation.
         """
-        if not self.sess_req_rep_port or self.context is None:
+        if not self.sess_req_rep_port or self.context is None or self.context.closed:
             return False
         probe = None
         try:

@@ -111,6 +111,39 @@ def _make_read_only_stub(func: Callable) -> Callable:
     return _stub
 
 
+def _with_connection_healing(func: Callable) -> Callable:
+    """Wrap a tool so a NOT_CONNECTED result transparently reconnects and retries.
+
+    Runtime tools return structured ``{success, error_type}`` dicts rather than
+    raising, so this inspects the result: on a ``NOT_CONNECTED`` failure it
+    reconnects the relevant sandbox (via ``ensure_connected``) and, **only for
+    read-only tools** (not ``@unsafe``), retries the call once. State-mutating
+    tools are never auto-retried — a half-applied ``go``/``write``/``step`` must
+    not be silently replayed — but their connection is still healed so the
+    agent's *next* call succeeds.
+    """
+    name = func.__name__
+    retry_ok = name not in _UNSAFE_NAMES
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+        if not (isinstance(result, dict) and result.get("success") is False):
+            return result
+        if result.get("error_type") != ErrorType.NOT_CONNECTED:
+            return result
+        try:
+            from x64dbg_automate.api_runtime.supervisor import get_manager
+            healed = get_manager().ensure_connected(kwargs.get("sandbox_id"))
+        except Exception:
+            healed = False
+        if healed and retry_ok:
+            return func(*args, **kwargs)
+        return result
+
+    return wrapper
+
+
 def _tool_annotations(func: Callable) -> ToolAnnotations | None:
     """Build MCP ToolAnnotations for a registered function."""
     destructive = func.__name__ in _UNSAFE_NAMES
@@ -140,6 +173,19 @@ def register_all(mcp) -> int:
             # function for the stub, then re-wrap with telemetry.
             orig = getattr(func, "__wrapped__", func)
             target = _telemetry_wrap(_make_read_only_stub(orig))
+        else:
+            # Wrap live tools so a dropped connection self-heals (and read-only
+            # tools transparently retry once) instead of surfacing NOT_CONNECTED.
+            target = _with_connection_healing(target)
+        # Runtime tools are the canonical, sandbox-native, self-healing surface.
+        # Where a name collides with a legacy mcp_server tool (e.g. write_memory,
+        # step_into, step_over), the runtime version must win — but FastMCP keeps
+        # the *first* registration, and legacy tools register first. So drop any
+        # existing same-named tool before binding the runtime one.
+        try:
+            mcp._tool_manager._tools.pop(func.__name__, None)
+        except Exception:
+            pass
         mcp.tool(annotations=_tool_annotations(func))(target)
         count += 1
     return count

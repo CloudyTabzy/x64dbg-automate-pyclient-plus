@@ -27,6 +27,46 @@ _PROLOGUE_PATTERNS = (
 )
 _RET_BYTES = (b"\xC3", b"\xC2")  # ret / ret imm16
 
+# Windows PAGE_* protection constants (base values; GUARD/NOCACHE are modifiers).
+_PAGE_PROTECT_NAMES = {
+    0x01: "NOACCESS", 0x02: "READONLY", 0x04: "READWRITE", 0x08: "WRITECOPY",
+    0x10: "EXECUTE", 0x20: "EXECUTE_READ", 0x40: "EXECUTE_READWRITE", 0x80: "EXECUTE_WRITECOPY",
+}
+_PAGE_EXECUTE_ANY = 0x10 | 0x20 | 0x40 | 0x80
+
+
+def protect_name(protect: int) -> str:
+    """Human-readable name for a Windows PAGE_* protection value (e.g. EXECUTE_READ|GUARD)."""
+    name = _PAGE_PROTECT_NAMES.get(protect & 0xFF, f"0x{protect:X}")
+    flags = []
+    if protect & 0x100:
+        flags.append("GUARD")
+    if protect & 0x200:
+        flags.append("NOCACHE")
+    return name + ("|" + "|".join(flags) if flags else "")
+
+
+def region_info(mgr, sandbox_id, address: int, *, ttl: float = 2.0) -> dict | None:
+    """Cheap region metadata for ``address`` via the manager's cached memory map.
+
+    Returns ``{region_base, region_size, protection, executable, section}`` or
+    None when the address isn't in any mapped region. Uses the short-TTL memmap
+    cache so it adds no RPC in tight read loops.
+    """
+    try:
+        page = mgr.region_for_address(sandbox_id, address=address, ttl=ttl)
+    except Exception:
+        return None
+    if page is None:
+        return None
+    return {
+        "region_base": f"0x{page.base_address:X}",
+        "region_size": page.region_size,
+        "protection": protect_name(page.protect),
+        "executable": bool(page.protect & _PAGE_EXECUTE_ANY),
+        "section": page.info or None,
+    }
+
 
 @dataclass
 class FunctionBounds:
@@ -69,10 +109,13 @@ def detect_function_bounds(
 
     Never raises and never returns ``None`` — a usable range is always produced.
     """
-    # 1. x64dbg's own analysis — authoritative.
+    # 1. x64dbg's own analysis — authoritative *only if* it actually contains the
+    #    queried address. On relocated/un-rebased images x64dbg can return bounds
+    #    in the wrong frame (preferred-base RVAs) that don't contain ``addr``;
+    #    trusting those produced confidently-wrong results. Reject and fall back.
     try:
         fb = client.get_function(addr)
-        if fb:
+        if fb and fb.start <= addr < fb.end:
             return FunctionBounds(fb.start, fb.end, "x64dbg", "high")
     except Exception:
         pass

@@ -236,7 +236,12 @@ def get_xrefs(
 
 @tool
 def get_function_boundaries(*, sandbox_id: str | None = None, address: str) -> dict:
-    """Get the start/end boundaries and instruction count of the function at an address.
+    """Get the start/end (absolute VAs) of the function containing an address.
+
+    Uses x64dbg's native analysis when it returns bounds that actually contain
+    the queried address; otherwise falls back to the heuristic scanner (the same
+    one `find_function_start`/`get_cfg` use) so a stale/mis-framed analysis DB no
+    longer yields confidently-wrong bounds. Reports `method` and `confidence`.
 
     Args:
         sandbox_id: Sandbox to query.
@@ -252,41 +257,26 @@ def get_function_boundaries(*, sandbox_id: str | None = None, address: str) -> d
     except ValueError as exc:
         return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
     try:
-        fb = client.get_function(addr)
+        bounds = detect_function_bounds(client, addr)
     except Exception as exc:  # noqa: BLE001
         if is_bug(exc):
             raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
-    if fb is None:
-        return err(f"No function found at or near 0x{addr:X}.", ErrorType.NOT_FOUND,
-                   hint="x64dbg may need to run analysis first (try 'anal' command or let auto-analysis finish).",
-                   sandbox_id=sandbox_id)
-    return ok(
+
+    result = ok(
         sandbox_id=sandbox_id,
         address=f"0x{addr:X}",
-        start=f"0x{fb.start:X}",
-        end=f"0x{fb.end:X}",
-        instruction_count=fb.instruction_count,
-        manual=fb.manual,
+        start=f"0x{bounds.start:X}",
+        end=f"0x{bounds.end:X}",
+        size=bounds.size,
+        contains_query=bounds.start <= addr < bounds.end,
+        method=bounds.method,
+        confidence=bounds.confidence,
+        **_module_rva(client, bounds.start),
     )
-
-
-_PAGE_PROTECT_NAMES = {
-    0x01: "NOACCESS", 0x02: "READONLY", 0x04: "READWRITE", 0x08: "WRITECOPY",
-    0x10: "EXECUTE", 0x20: "EXECUTE_READ", 0x40: "EXECUTE_READWRITE", 0x80: "EXECUTE_WRITECOPY",
-}
-
-
-def _protect_name(protect: int) -> str:
-    # PAGE_GUARD (0x100) and PAGE_NOCACHE (0x200) are modifier flags on the base.
-    base_only = protect & 0xFF
-    name = _PAGE_PROTECT_NAMES.get(base_only, f"0x{protect:X}")
-    flags = []
-    if protect & 0x100:
-        flags.append("GUARD")
-    if protect & 0x200:
-        flags.append("NOCACHE")
-    return name + ("|" + "|".join(flags) if flags else "")
+    if bounds.note:
+        result["note"] = bounds.note
+    return result
 
 
 @tool
@@ -351,18 +341,11 @@ def resolve_address(*, sandbox_id: str | None = None, address: str) -> dict:
     except Exception:
         pass
 
-    # ── Section / protection from the live memory map ──────────────────────
-    try:
-        for p in client.memmap():
-            if p.base_address <= addr < p.base_address + p.region_size:
-                result["section"] = p.info or None
-                result["protection"] = _protect_name(p.protect)
-                result["executable"] = bool(p.protect & _PAGE_EXECUTE_ANY)
-                result["region_base"] = f"0x{p.base_address:X}"
-                result["region_size"] = p.region_size
-                break
-    except Exception:
-        pass
+    # ── Section / protection from the (cached) live memory map ─────────────
+    from x64dbg_automate.api_runtime.runtime_helpers import region_info
+    region = region_info(mgr, sandbox_id, addr)
+    if region is not None:
+        result.update(region)
 
     # ── Nearest symbol + user label ────────────────────────────────────────
     try:
@@ -380,6 +363,17 @@ def resolve_address(*, sandbox_id: str | None = None, address: str) -> dict:
         pass
 
     return ok(sandbox_id=sandbox_id, **result)
+
+
+def _module_rva(client, addr: int) -> dict:
+    """Best-effort {module, module_rva} for an absolute VA (empty dict on failure)."""
+    try:
+        for m in client.get_modules():
+            if m.base <= addr < m.base + m.size:
+                return {"module": m.name, "module_rva": f"0x{addr - m.base:X}"}
+    except Exception:
+        pass
+    return {}
 
 
 @tool
@@ -424,6 +418,7 @@ def find_function_start(*, sandbox_id: str | None = None, address: str) -> dict:
         contains_query=bounds.start <= addr < bounds.end,
         method=bounds.method,
         confidence=bounds.confidence,
+        **_module_rva(client, bounds.start),
     )
     if bounds.note:
         result["note"] = bounds.note
@@ -516,17 +511,171 @@ def disassemble_function(
     return result
 
 
-@tool
-def analyze_function_cfg(*, sandbox_id: str | None = None, address: str) -> dict:
-    """Analyze a function and return its control flow graph (CFG).
+def _disasm_map(client, start: int, size: int, arch: str) -> dict[int, dict]:
+    """Disassemble [start, start+size) once → {addr: {bytes, mnemonic}}.
 
-    Returns basic blocks with branch targets, instruction counts, terminal
-    flags, and the raw instruction bytes in each block. This is the runtime
-    equivalent of IDA's graph view.
+    x64dbg's analyze_function returns instruction "bytes" in a serialized form
+    that isn't raw opcodes (it embeds addresses), so the CFG bytes were garbage.
+    We instead read real memory and disassemble it, then look up each block's
+    instructions by address — accurate bytes + mnemonics, and consistent with
+    the Capstone fallback path.
+    """
+    if size <= 0 or size > 0x20000:
+        size = min(max(size, 0x40), 0x20000)
+    try:
+        data = client.read_memory(start, size)
+    except Exception:
+        return {}
+    if not data:
+        return {}
+    from x64dbg_automate.external.decompiler import disassemble_bytes
+    out: dict[int, dict] = {}
+    try:
+        for i in disassemble_bytes(data, start, arch):
+            out[i.address] = {
+                "bytes": i.bytes.hex(),
+                "mnemonic": (i.mnemonic + (" " + i.raw_op_str if i.raw_op_str else "")).strip(),
+            }
+    except Exception:
+        return out
+    return out
+
+
+def _cfg_from_x64dbg(cfg: dict, dmap: dict[int, dict]) -> dict:
+    """Convert x64dbg's analyze_function result into the unified CFG shape.
+
+    Block topology comes from x64dbg (superior boundaries); instruction bytes /
+    mnemonics come from ``dmap`` (real disassembly) rather than x64dbg's bogus
+    serialized bytes.
+    """
+    blocks = []
+    edges = []
+    for n in cfg["nodes"]:
+        start = n["start"]
+        succ = []
+        brtrue, brfalse = n.get("brtrue"), n.get("brfalse")
+        if brtrue:
+            succ.append(brtrue)
+            edges.append({"from": f"0x{start:X}", "to": f"0x{brtrue:X}",
+                          "type": "branch_taken" if brfalse else "jump"})
+        if brfalse:
+            succ.append(brfalse)
+            edges.append({"from": f"0x{start:X}", "to": f"0x{brfalse:X}", "type": "fallthrough"})
+        for e in n.get("exits", []):
+            if e not in (brtrue, brfalse):
+                succ.append(e)
+                edges.append({"from": f"0x{start:X}", "to": f"0x{e:X}", "type": "exit"})
+        instructions = []
+        for ins in n["instructions"]:
+            ia = ins["address"]
+            entry = dmap.get(ia)
+            item = {"address": f"0x{ia:X}"}
+            if entry:
+                item["bytes"] = entry["bytes"]
+                item["mnemonic"] = entry["mnemonic"]
+            instructions.append(item)
+        blocks.append({
+            "start": f"0x{start:X}",
+            "end": f"0x{n['end']:X}",
+            "instruction_count": n["instruction_count"],
+            "terminal": n["terminal"],
+            "indirect_call": n.get("indirect_call", False),
+            "successors": [f"0x{s:X}" for s in succ],
+            "instructions": instructions,
+        })
+    return {"blocks": blocks, "edges": edges}
+
+
+def _cfg_from_capstone(client, bounds, arch: str) -> dict | None:
+    """Build a CFG by disassembling [start,end) with Capstone — used when x64dbg
+    analysis is unavailable. Returns None if the bytes can't be read."""
+    from x64dbg_automate.external.decompiler import build_cfg, disassemble_bytes
+
+    size = bounds.size
+    if size <= 0 or size > 0x20000:
+        size = min(max(size, 0x40), 0x20000)
+    try:
+        data = client.read_memory(bounds.start, size)
+    except Exception:
+        return None
+    if not data:
+        return None
+    insns = disassemble_bytes(data, bounds.start, arch)
+    if not insns:
+        return None
+    cfg = build_cfg(insns, bounds.start)
+
+    blocks = []
+    edges = []
+    for start in sorted(cfg.blocks):
+        blk = cfg.blocks[start]
+        last = blk.last_insn
+        if last is None:
+            terminator = "empty"
+        elif last.is_ret:
+            terminator = "ret"
+        elif last.is_jump:
+            terminator = "jmp"
+        elif last.is_cond_jump:
+            terminator = "cond_jump"
+        elif last.is_call:
+            terminator = "call"
+        else:
+            terminator = "fallthrough"
+        for s in blk.successors:
+            etype = "fallthrough"
+            if terminator == "jmp":
+                etype = "jump"
+            elif terminator == "cond_jump":
+                etype = "branch_taken" if s != (last.address + last.size) else "fallthrough"
+            edges.append({"from": f"0x{start:X}", "to": f"0x{s:X}", "type": etype})
+        blocks.append({
+            "start": f"0x{start:X}",
+            "end": f"0x{blk.end:X}",
+            "instruction_count": len(blk.instructions),
+            "terminal": (last.is_ret if last else False),
+            "terminator": terminator,
+            "successors": [f"0x{s:X}" for s in blk.successors],
+            "predecessors": [f"0x{p:X}" for p in blk.predecessors],
+            "instructions": [
+                {"address": f"0x{i.address:X}", "bytes": i.bytes.hex(),
+                 "mnemonic": (i.mnemonic + (" " + i.raw_op_str if i.raw_op_str else "")).strip()}
+                for i in blk.instructions
+            ],
+        })
+    return {"blocks": blocks, "edges": edges}
+
+
+def _detect_loops(blocks: list[dict], edges: list[dict]) -> list[dict]:
+    """Identify back-edges (target address <= source block start) as loop markers."""
+    starts = {b["start"] for b in blocks}
+    loops = []
+    for e in edges:
+        try:
+            if e["to"] in starts and int(e["to"], 16) <= int(e["from"], 16):
+                loops.append({"header": e["to"], "back_edge_from": e["from"]})
+        except Exception:
+            continue
+    return loops
+
+
+@tool
+def get_cfg(*, sandbox_id: str | None = None, address: str) -> dict:
+    """Return the control-flow graph (basic blocks + edges) of a function.
+
+    Reliable on un-analyzed images: tries x64dbg's native analysis first
+    (``confidence=high``), and if that hasn't run, falls back to a Capstone
+    basic-block reconstruction over the heuristically detected function bounds
+    (``confidence=medium``). Gives an agent the structure needed to reason about
+    large functions instead of a flat instruction stream.
 
     Args:
         sandbox_id: Sandbox to query.
-        address: Function entry point (address, symbol, or expression).
+        address: Any address inside the function (entry preferred; address,
+                 symbol, or expression).
+
+    Returns ``blocks`` (start/end/instructions/successors/terminator), ``edges``
+    (from/to/type), ``loops`` (back-edges), plus ``method`` and ``confidence``.
     """
     mgr = get_manager()
     try:
@@ -534,41 +683,85 @@ def analyze_function_cfg(*, sandbox_id: str | None = None, address: str) -> dict
     except (KeyError, SandboxError) as exc:
         return lookup_error(exc)
     try:
-        entry = resolve_addr(client, address)
+        addr = resolve_addr(client, address)
     except ValueError as exc:
         return err(str(exc), ErrorType.BAD_ARGUMENT, sandbox_id=sandbox_id)
+
     try:
-        cfg = client.analyze_function(entry)
+        bounds = detect_function_bounds(client, addr)
     except Exception as exc:  # noqa: BLE001
         if is_bug(exc):
             raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
-    if cfg is None:
-        return err(f"Failed to analyze function at 0x{entry:X}.", ErrorType.INVALID_STATE,
-                   hint="Ensure the address is the start of a valid function.", sandbox_id=sandbox_id)
-    nodes = []
-    for n in cfg["nodes"]:
-        nodes.append({
-            "start": f"0x{n['start']:X}",
-            "end": f"0x{n['end']:X}",
-            "instruction_count": n["instruction_count"],
-            "terminal": n["terminal"],
-            "split": n["split"],
-            "indirect_call": n["indirect_call"],
-            "brtrue": (f"0x{n['brtrue']:X}" if n["brtrue"] else None),
-            "brfalse": (f"0x{n['brfalse']:X}" if n["brfalse"] else None),
-            "exits": [f"0x{e:X}" for e in n["exits"]],
-            "instructions": [
-                {"address": f"0x{ins['address']:X}", "bytes": to_hex(ins["bytes"])}
-                for ins in n["instructions"]
-            ],
-        })
+    entry = bounds.start
+
+    # 1. Native x64dbg analysis (authoritative when available).
+    cfg_data = None
+    method = None
+    confidence = None
+    try:
+        native = client.analyze_function(entry)
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        native = None
+    if native and native.get("nodes"):
+        nodes = native["nodes"]
+        span_start = min(n["start"] for n in nodes)
+        span_end = max(n["end"] for n in nodes)
+        arch = "x64"
+        try:
+            arch = mgr.get_sandbox(sandbox_id).debugger_arch or "x64"
+        except Exception:
+            pass
+        dmap = _disasm_map(client, span_start, span_end - span_start + 16, arch)
+        cfg_data = _cfg_from_x64dbg(native, dmap)
+        method, confidence = "x64dbg", "high"
+
+    # 2. Capstone fallback over the detected bounds.
+    if cfg_data is None:
+        arch = "x64"
+        try:
+            sb = mgr.get_sandbox(sandbox_id)
+            arch = sb.debugger_arch or "x64"
+        except Exception:
+            pass
+        cfg_data = _cfg_from_capstone(client, bounds, arch)
+        method, confidence = "capstone_fallback", "medium"
+
+    if not cfg_data:
+        return err(
+            f"Could not build a CFG for the function at 0x{entry:X}.",
+            ErrorType.INVALID_STATE,
+            hint="The code bytes may be unreadable, or the address isn't code.",
+            sandbox_id=sandbox_id,
+        )
+
+    loops = _detect_loops(cfg_data["blocks"], cfg_data["edges"])
     return ok(
         sandbox_id=sandbox_id,
-        entry_point=f"0x{cfg['entry_point']:X}",
-        node_count=len(nodes),
-        nodes=nodes,
+        entry_point=f"0x{entry:X}",
+        function_start=f"0x{bounds.start:X}",
+        function_end=f"0x{bounds.end:X}",
+        method=method,
+        confidence=confidence,
+        block_count=len(cfg_data["blocks"]),
+        edge_count=len(cfg_data["edges"]),
+        blocks=cfg_data["blocks"],
+        edges=cfg_data["edges"],
+        loops=loops,
     )
+
+
+@tool
+def analyze_function_cfg(*, sandbox_id: str | None = None, address: str) -> dict:
+    """Analyze a function and return its control flow graph (CFG).
+
+    Backwards-compatible alias for ``get_cfg`` (the runtime equivalent of IDA's
+    graph view). Prefer ``get_cfg`` for new code — it also works on un-analyzed
+    images via a Capstone fallback and reports method/confidence.
+    """
+    return get_cfg(sandbox_id=sandbox_id, address=address)
 
 
 @tool

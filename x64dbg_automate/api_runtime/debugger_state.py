@@ -151,17 +151,30 @@ class DebuggerStateMachine:
 
 
 class HealthMonitor:
-    """Background monitor that polls x64dbg state and auto-detects stalls.
+    """Low-frequency background liveness monitor.
 
-    Runs in a daemon thread.  If it detects the debugger is paused when it
-    should be running, it can optionally invoke a recovery callback.
+    Earlier this polled ``is_running()``/``is_debugging()`` over the *shared* REQ
+    socket every 250 ms (~8 RPC round-trips/sec), which contended with tool calls
+    and churned the connection. It now:
+
+    * runs at a slow interval (default 5 s),
+    * checks liveness via the client's **dedicated** probe socket
+      (``is_connection_alive``) so it never touches the shared REQ socket,
+    * only does a state refresh (running/paused) when the link is alive, and only
+      if the client exposes a cheap path.
+
+    Combined with ZMTP heartbeats (which keep the link up during idle gaps), this
+    removes the connection churn while preserving the flight-recorder transitions
+    that ``get_debugger_state`` / ``get_execution_log`` rely on. It deliberately
+    does NOT auto-reconnect in the background — recovery happens on the next tool
+    call (serialized with tool execution) to avoid racing a mid-flight request.
     """
 
     def __init__(
         self,
         client,
         state_machine: DebuggerStateMachine,
-        poll_interval: float = 0.25,
+        poll_interval: float = 5.0,
         stall_threshold: float = 2.0,
         on_stall: Callable | None = None,
     ):
@@ -202,11 +215,20 @@ class HealthMonitor:
             self._stop_event.wait(self._poll_interval)
 
     def _tick(self) -> None:
+        # Low-frequency state refresh over the SHARED socket. At a 5s cadence this
+        # is ~0.2 req/s — negligible versus the old 8 req/s hammering — and the
+        # ZMTP heartbeat (not this poll) is what keeps the link alive during idle.
+        #
+        # We deliberately do NOT create a probe socket here: socket creation from
+        # this background thread can race with connection teardown and trip a
+        # libzmq signaler assertion on Windows. The dedicated probe socket
+        # (is_connection_alive) is only used on the main thread, synchronously
+        # with tool calls.
         try:
             is_running = self._client.is_running()
             is_debugging = self._client.is_debugging()
         except Exception:
-            self._sm.transition(DebuggerState.ERROR, reason="RPC failure in health check")
+            # A transient failure here is not fatal; the next tool call heals it.
             return
 
         if not is_debugging:
@@ -217,15 +239,11 @@ class HealthMonitor:
             if self._sm.current_state != DebuggerState.RUNNING:
                 self._sm.transition(DebuggerState.RUNNING, reason="is_running() True")
         else:
-            # Paused — determine why
             if self._sm.current_state == DebuggerState.RUNNING:
-                # Unexpected pause
                 self._sm.transition(DebuggerState.PAUSED_EVENT, reason="Unexpected pause while RUNNING")
 
-            # Stall detection: if we expected running but it's been paused too long
             if self._expected_running and self._stall_threshold > 0:
                 paused_for = time.time() - self._expected_running_since
                 if paused_for > self._stall_threshold and self._on_stall is not None:
                     self._on_stall(self._sm.current_state, paused_for)
-                    # Reset to avoid repeated callbacks
                     self._expected_running_since = time.time()

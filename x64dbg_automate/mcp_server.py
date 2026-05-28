@@ -75,10 +75,41 @@ def _get_unified_manager():
 # ---------------------------------------------------------------------------
 
 def _require_client() -> X64DbgClient:
-    """Return the active client or raise a clear error."""
-    if _client is None:
-        raise RuntimeError("Not connected to x64dbg. Use connect_to_session or start_session first.")
-    return _client
+    """Return a *healthy* active client, unifying the legacy and sandbox tiers.
+
+    Resolution order:
+      1. The legacy global ``_client`` (set by connect_to_session/start_session).
+      2. The active sandbox's client (set by sandbox_create / runtime tools).
+
+    Whichever is found is health-checked via its dedicated probe socket and
+    transparently reconnected if the link has dropped (e.g. an idle timeout
+    between tool calls). This is what makes the legacy control tools "just work"
+    on the same connection the sandbox tools use, instead of failing with
+    NOT_CONNECTED when the session was created through the modern flow.
+    """
+    client = _client
+    if client is None:
+        # Fall back to the active sandbox so tools created via sandbox_create
+        # (which never set the legacy global) still resolve.
+        try:
+            client = _get_unified_manager().get_client(None)
+        except Exception:
+            client = None
+    if client is None:
+        raise RuntimeError(
+            "Not connected to x64dbg. Use sandbox_create, start_session, or connect_to_session first."
+        )
+
+    # Self-heal: probe and reconnect once if the link is dead.
+    probe = getattr(client, "is_connection_alive", None)
+    reconnect = getattr(client, "reconnect", None)
+    if callable(probe) and callable(reconnect):
+        try:
+            if not probe():
+                reconnect()
+        except Exception:
+            pass  # surface the real failure when the actual call runs
+    return client
 
 
 def _parse_address_or_expression(s: str) -> int:
@@ -428,7 +459,7 @@ def skip_instruction(count: int = 1) -> dict:
 
 @mcp.tool()
 def run_to_return(frames: int = 1) -> dict:
-    """Run until a return instruction is encountered.
+    """[DEPRECATED — prefer sandbox-native step_out] Run until a return instruction is encountered.
 
     Args:
         frames: Number of return frames to seek
@@ -683,7 +714,7 @@ def get_memory_map() -> dict:
 
 @mcp.tool()
 def get_register(register: str) -> dict:
-    """Read a single register value.
+    """[DEPRECATED — prefer sandbox-native read_register] Read a single register value.
 
     Args:
         register: Register name (e.g. 'rax', 'eip', 'rsp', 'eflags')
@@ -698,7 +729,7 @@ def get_register(register: str) -> dict:
 
 @mcp.tool()
 def set_register(register: str, value: str) -> dict:
-    """Write a value to a register.
+    """[DEPRECATED — prefer sandbox-native write_register] Write a value to a register.
 
     Args:
         register: Register name (e.g. 'rax', 'eip')
@@ -718,7 +749,7 @@ def set_register(register: str, value: str) -> dict:
 
 @mcp.tool()
 def get_all_registers() -> dict:
-    """Dump all general-purpose registers and flags."""
+    """[DEPRECATED — prefer sandbox-native read_registers] Dump all general-purpose registers and flags."""
     try:
         client = _require_client()
         regs = client.get_regs()
@@ -835,7 +866,10 @@ def set_breakpoint(
     singleshot: bool = False,
     condition: str = "",
 ) -> dict:
-    """Set a breakpoint (software, hardware, or memory).
+    """[DEPRECATED — prefer sandbox-native breakpoint_set] Set a breakpoint (software, hardware, or memory).
+
+    (This legacy tool keeps the ``condition`` parameter the sandbox-native
+    breakpoint_set doesn't yet expose; use it only when you need a conditional BP.)
 
     Args:
         address_or_symbol: Hex address or symbol name.
@@ -985,7 +1019,7 @@ def _diagnose_bp_failure(client, addr) -> str:
 
 @mcp.tool()
 def clear_breakpoint(address: str | None = None, bp_type: str = "software") -> dict:
-    """Clear breakpoint(s).
+    """[DEPRECATED — prefer sandbox-native breakpoint_clear] Clear breakpoint(s).
 
     Args:
         address: Hex address or symbol (None clears all of this type)
@@ -1073,7 +1107,7 @@ def set_conditional_breakpoint(
 
 @mcp.tool()
 def toggle_breakpoint(address: str | None = None, bp_type: str = "software", enable: bool = True) -> dict:
-    """Enable or disable breakpoint(s).
+    """[DEPRECATED — prefer sandbox-native breakpoint_toggle] Enable or disable breakpoint(s).
 
     Args:
         address: Hex address or symbol (None toggles all of this type)
@@ -1107,7 +1141,7 @@ def toggle_breakpoint(address: str | None = None, bp_type: str = "software", ena
 
 @mcp.tool()
 def list_breakpoints(bp_type: str = "software") -> dict:
-    """List all breakpoints of a given type.
+    """[DEPRECATED — prefer sandbox-native breakpoint_list] List all breakpoints of a given type.
 
     Args:
         bp_type: 'software', 'hardware', or 'memory'
@@ -2663,7 +2697,6 @@ def suggest_next_actions(context: str = "") -> dict:
     """
     suggestions = []
     try:
-        client = _client
         mgr = _get_unified_manager()
         # Try to get active sandbox info
         sandbox = None
@@ -2671,6 +2704,13 @@ def suggest_next_actions(context: str = "") -> dict:
             sandbox = mgr.get_sandbox()
         except Exception:
             pass
+
+        # Resolve the client the same way every tool does: prefer the legacy
+        # global, else the active sandbox. Avoids the stale "No active session"
+        # bug when the session was created via sandbox_create.
+        client = _client
+        if client is None and sandbox is not None:
+            client = sandbox.client
 
         # --- State-based rules ---
         if client is None:

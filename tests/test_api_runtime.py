@@ -608,20 +608,43 @@ class TestAnalysisTools:
         from x64dbg_automate.models import FunctionBoundaries
 
         sb = _mock_sandbox(manager)
+        sb.client.get_modules.return_value = []
+        # x64dbg bounds that actually contain the query → trusted, high confidence.
         sb.client.get_function.return_value = FunctionBoundaries(start=0x401000, end=0x401100, instruction_count=42, manual=False)
         r = get_function_boundaries(sandbox_id="aa11", address="0x401050")
         assert r["success"]
         assert r["start"] == "0x401000"
-        assert r["instruction_count"] == 42
+        assert r["end"] == "0x401100"
+        assert r["method"] == "x64dbg" and r["confidence"] == "high"
+        assert r["contains_query"] is True
 
-    def test_get_function_boundaries_not_found(self, manager):
+    def test_get_function_boundaries_rejects_misframed_bounds(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import get_function_boundaries
+        from x64dbg_automate.models import FunctionBoundaries
+
+        sb = _mock_sandbox(manager)
+        sb.client.get_modules.return_value = []
+        # x64dbg returns preferred-base (RVA-frame) bounds that DON'T contain the
+        # queried VA — must be rejected, not returned as high-confidence.
+        sb.client.get_function.return_value = FunctionBoundaries(
+            start=0x487280, end=0x48731D, instruction_count=10, manual=False)
+        sb.client.read_memory.side_effect = RuntimeError("unmapped")  # force fallback
+        r = get_function_boundaries(sandbox_id="aa11", address="0x88729D")
+        assert r["success"]
+        assert r["method"] != "x64dbg"        # x64dbg result was rejected
+        assert r["start"] != "0x487280"
+
+    def test_get_function_boundaries_falls_back_when_no_analysis(self, manager):
         from x64dbg_automate.api_runtime.api_analysis import get_function_boundaries
 
         sb = _mock_sandbox(manager)
+        sb.client.get_modules.return_value = []
         sb.client.get_function.return_value = None
+        sb.client.read_memory.side_effect = RuntimeError("unmapped")  # force fallback window
         r = get_function_boundaries(sandbox_id="aa11", address="0x401050")
-        assert r["success"] is False
-        assert r["error_type"] == ErrorType.NOT_FOUND
+        # No longer a hard NOT_FOUND — resilient fallback returns a usable range.
+        assert r["success"]
+        assert r["method"] == "fallback" and r["confidence"] == "low"
 
     def test_get_modules(self, manager):
         from x64dbg_automate.api_runtime.api_analysis import get_modules
@@ -4156,3 +4179,514 @@ class TestResolveAddress:
         assert r["module"] is None
         assert "module_rva" not in r
         assert "image_rva" not in r  # outside the image range too
+
+
+# ---------------------------------------------------------------------------
+# P2 — Crash-dump inspection + CFG + region metadata
+# ---------------------------------------------------------------------------
+
+class _FakeInspector:
+    """Stand-in for DumpInspector with canned data (no real .dmp needed)."""
+
+    def __init__(self, *, arch="x32", exception=None, context=None, stack=None,
+                 modules=None, va_bytes=None):
+        self._arch = arch
+        self._exception = exception
+        self._context = context
+        self._stack = stack
+        self._modules = modules or []
+        self._va_bytes = va_bytes or {}
+
+    def arch(self):
+        return self._arch
+
+    def exception(self):
+        return self._exception
+
+    def thread_context(self, thread_id=None):
+        return self._context
+
+    def read_stack(self, thread_id=None, max_bytes=0x4000):
+        return self._stack
+
+    def modules(self):
+        return self._modules
+
+    def module_for_va(self, va):
+        for m in self._modules:
+            if m["base"] <= va < m["end"]:
+                return {"name": m["name"], "path": m.get("path"), "base": m["base"],
+                        "rva": va - m["base"]}
+        return None
+
+    def read_va(self, va, size):
+        return self._va_bytes.get(va)
+
+
+def _patch_inspector(monkeypatch, inspector):
+    monkeypatch.setattr(
+        "x64dbg_automate.api_runtime.api_dump.get_inspector",
+        lambda path: inspector,
+    )
+
+
+class TestDumpRegisters:
+    def test_crash_registers_and_eflags(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_dump import dump_registers
+
+        insp = _FakeInspector(
+            arch="x32",
+            context={"thread_id": 1, "arch": "x32",
+                     "registers": {"eax": 0, "ecx": 0x12, "eip": 0x48729D, "eflags": 0x202}},
+            exception={"thread_id": 1, "code": 0xC0000005, "code_name": "ACCESS_VIOLATION",
+                       "address": 0x48729D,
+                       "access_violation": {"operation": "read", "fault_address": 0}},
+        )
+        _patch_inspector(monkeypatch, insp)
+
+        r = dump_registers(dump_path="x.dmp")
+        assert r["success"]
+        assert r["arch"] == "x32"
+        assert r["registers"]["eax"] == "0x0"
+        assert r["eflags"]["IF"] is True and r["eflags"]["CF"] is False
+        assert r["exception"]["code_name"] == "ACCESS_VIOLATION"
+        assert r["exception"]["access_violation"]["operation"] == "read"
+        assert r["is_crash_thread"] is True
+
+    def test_no_context_returns_not_found(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_dump import dump_registers
+
+        _patch_inspector(monkeypatch, _FakeInspector(context=None))
+        r = dump_registers(dump_path="x.dmp", thread_id=999)
+        assert r["success"] is False
+        assert r["error_type"] == ErrorType.NOT_FOUND
+
+
+class TestDumpStackWalk:
+    def test_walks_and_verifies_return_address(self, monkeypatch):
+        from x64dbg_automate.api_runtime.api_dump import dump_stack_walk
+
+        base = 0x200000
+        ret_addr = 0x401050  # points into module below
+        stack = bytearray(0x20)
+        # place the return address at stack offset 8 (above esp at offset 0)
+        stack[8:12] = ret_addr.to_bytes(4, "little")
+        # bytes preceding ret_addr: E8 rel32 at ret_addr-5 -> data[3] == 0xE8
+        preceding = bytes([0x00, 0x00, 0x00, 0xE8, 0x11, 0x22, 0x33, 0x44])
+
+        insp = _FakeInspector(
+            arch="x32",
+            context={"thread_id": 1, "arch": "x32",
+                     "registers": {"eip": 0x401000, "esp": base}},
+            stack={"base": base, "size": len(stack), "data": bytes(stack)},
+            modules=[{"name": "app.exe", "base": 0x400000, "end": 0x410000}],
+            va_bytes={ret_addr - 8: preceding},
+        )
+        _patch_inspector(monkeypatch, insp)
+
+        r = dump_stack_walk(dump_path="x.dmp")
+        assert r["success"]
+        assert r["frames"][0]["frame"] == 0
+        assert r["frames"][0]["return_address"] == "0x401000"
+        verified = [f for f in r["frames"] if f["return_address"] == "0x401050"]
+        assert verified and verified[0]["call_verified"] is True
+        assert verified[0]["module"] == "app.exe"
+
+
+class TestCompareDumpToLive:
+    def _live_module(self, base=0x800000, name="bully.exe"):
+        return SimpleNamespace(base=base, name=name)
+
+    def test_match(self, manager, monkeypatch):
+        from x64dbg_automate.api_runtime.api_dump import compare_dump_to_live
+
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.is_running.return_value = False
+        sb.client.get_modules.return_value = [self._live_module()]
+        code = bytes.fromhex("8b08")  # mov ecx, [eax]
+        sb.client.read_memory.return_value = code
+
+        insp = _FakeInspector(
+            arch="x32",
+            exception={"thread_id": 1, "address": 0x88729D, "code": 0xC0000005},
+            modules=[{"name": "bully.exe", "base": 0x800000, "end": 0x900000}],
+            va_bytes={0x88729D: code},
+        )
+        _patch_inspector(monkeypatch, insp)
+
+        r = compare_dump_to_live(sandbox_id="aa11", dump_path="x.dmp")
+        assert r["success"]
+        assert r["verdict"] == "MATCH"
+        assert r["module"] == "bully.exe"
+        assert r["module_rva"] == "0x8729D"
+        assert r["live_address"] == "0x88729D"
+
+    def test_mismatch(self, manager, monkeypatch):
+        from x64dbg_automate.api_runtime.api_dump import compare_dump_to_live
+
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.is_running.return_value = False
+        sb.client.get_modules.return_value = [self._live_module()]
+        sb.client.read_memory.return_value = bytes.fromhex("9090")  # nop nop
+
+        insp = _FakeInspector(
+            arch="x32",
+            exception={"thread_id": 1, "address": 0x88729D, "code": 0xC0000005},
+            modules=[{"name": "bully.exe", "base": 0x800000, "end": 0x900000}],
+            va_bytes={0x88729D: bytes.fromhex("8b08")},
+        )
+        _patch_inspector(monkeypatch, insp)
+
+        r = compare_dump_to_live(sandbox_id="aa11", dump_path="x.dmp")
+        assert r["success"]
+        assert r["verdict"] == "MISMATCH"
+        assert r["first_diff_offset"] == 0
+
+    def test_module_not_loaded_live(self, manager, monkeypatch):
+        from x64dbg_automate.api_runtime.api_dump import compare_dump_to_live
+
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.get_modules.return_value = []  # nothing loaded live
+
+        insp = _FakeInspector(
+            arch="x32",
+            exception={"thread_id": 1, "address": 0x88729D, "code": 0xC0000005},
+            modules=[{"name": "bully.exe", "base": 0x800000, "end": 0x900000}],
+            va_bytes={0x88729D: bytes.fromhex("8b08")},
+        )
+        _patch_inspector(monkeypatch, insp)
+
+        r = compare_dump_to_live(sandbox_id="aa11", dump_path="x.dmp")
+        assert r["success"]
+        assert r["verdict"] == "MODULE_NOT_LOADED"
+
+    def test_code_not_in_dump(self, manager, monkeypatch):
+        from x64dbg_automate.api_runtime.api_dump import compare_dump_to_live
+
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.get_modules.return_value = [self._live_module()]
+
+        insp = _FakeInspector(
+            arch="x32",
+            exception={"thread_id": 1, "address": 0x88729D, "code": 0xC0000005},
+            modules=[{"name": "bully.exe", "base": 0x800000, "end": 0x900000}],
+            va_bytes={},  # crash address not backed by dump memory
+        )
+        _patch_inspector(monkeypatch, insp)
+
+        r = compare_dump_to_live(sandbox_id="aa11", dump_path="x.dmp")
+        assert r["success"]
+        assert r["verdict"] == "CODE_NOT_IN_DUMP"
+
+    def test_no_crash_address(self, manager, monkeypatch):
+        from x64dbg_automate.api_runtime.api_dump import compare_dump_to_live
+
+        sb = _mock_sandbox(manager, arch="x32")
+        insp = _FakeInspector(arch="x32", exception=None)
+        _patch_inspector(monkeypatch, insp)
+
+        r = compare_dump_to_live(sandbox_id="aa11", dump_path="x.dmp")
+        assert r["success"] is False
+        assert r["verdict"] == "NO_CRASH_ADDRESS"
+
+
+class TestDumpInspectorNormalization:
+    def test_arch_and_exception_and_module(self):
+        from x64dbg_automate.external.minidump_reader import DumpInspector
+
+        rec = SimpleNamespace(
+            ExceptionCode_raw=0xC0000005, ExceptionCode=None,
+            ExceptionFlags=0, ExceptionAddress=0x88729D, NumberParameters=2,
+            ExceptionInformation=[0, 0x12345678],
+        )
+        es = SimpleNamespace(ThreadId=7, ExceptionRecord=rec, ThreadContext=None)
+        mf = SimpleNamespace(
+            sysinfo=SimpleNamespace(ProcessorArchitecture=0),  # INTEL -> x32
+            exception=SimpleNamespace(exception_records=[es]),
+            modules=SimpleNamespace(modules=[
+                SimpleNamespace(name="C:\\Bully.exe", baseaddress=0x800000, size=0x100000,
+                                endaddress=0x900000),
+            ]),
+        )
+        insp = DumpInspector(mf, "fake.dmp", raw_provider=lambda rva, size: b"")
+        assert insp.arch() == "x32"
+        exc = insp.exception()
+        assert exc["code_name"] == "ACCESS_VIOLATION"
+        assert exc["address"] == 0x88729D
+        assert exc["access_violation"]["operation"] == "read"
+        assert exc["access_violation"]["fault_address"] == 0x12345678
+        m = insp.module_for_va(0x88729D)
+        assert m["name"] == "Bully.exe"
+        assert m["rva"] == 0x8729D
+
+
+class TestGetCFG:
+    def test_x64dbg_path_high_confidence(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import get_cfg
+
+        sb = _mock_sandbox(manager)
+        sb.client.get_function.return_value = SimpleNamespace(start=0x401000, end=0x401010)
+        sb.client.analyze_function.return_value = {
+            "entry_point": 0x401000,
+            "nodes": [
+                {"start": 0x401000, "end": 0x401007, "brtrue": 0x401010, "brfalse": 0x401008,
+                 "instruction_count": 3, "terminal": False, "split": False, "indirect_call": False,
+                 "exits": [], "instructions": [{"address": 0x401000, "bytes": b"\x33\xc0"}]},
+                {"start": 0x401008, "end": 0x40100F, "brtrue": None, "brfalse": None,
+                 "instruction_count": 1, "terminal": True, "split": False, "indirect_call": False,
+                 "exits": [], "instructions": [{"address": 0x401008, "bytes": b"\xc3"}]},
+            ],
+        }
+        r = get_cfg(sandbox_id="aa11", address="0x401000")
+        assert r["success"]
+        assert r["method"] == "x64dbg" and r["confidence"] == "high"
+        assert r["block_count"] == 2
+        assert any(e["type"] == "branch_taken" for e in r["edges"])
+
+    def test_capstone_fallback(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import get_cfg
+
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.get_function.return_value = SimpleNamespace(start=0x401000, end=0x401007)
+        sb.client.analyze_function.return_value = None  # x64dbg analysis unavailable
+        # xor eax,eax; jne +2; jmp +0; ret
+        code = bytes.fromhex("33c0") + bytes.fromhex("7502") + bytes.fromhex("eb00") + bytes.fromhex("c3")
+        sb.client.read_memory.return_value = code
+
+        r = get_cfg(sandbox_id="aa11", address="0x401000")
+        assert r["success"]
+        assert r["method"] == "capstone_fallback" and r["confidence"] == "medium"
+        assert r["block_count"] >= 1
+        assert r["function_start"] == "0x401000"
+
+    def test_analyze_function_cfg_delegates(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import analyze_function_cfg
+
+        sb = _mock_sandbox(manager)
+        sb.client.get_function.return_value = SimpleNamespace(start=0x401000, end=0x401004)
+        sb.client.analyze_function.return_value = {
+            "entry_point": 0x401000,
+            "nodes": [{"start": 0x401000, "end": 0x401003, "brtrue": None, "brfalse": None,
+                       "instruction_count": 1, "terminal": True, "split": False,
+                       "indirect_call": False, "exits": [],
+                       "instructions": [{"address": 0x401000, "bytes": b"\xc3"}]}],
+        }
+        r = analyze_function_cfg(sandbox_id="aa11", address="0x401000")
+        assert r["success"] and r["block_count"] == 1
+
+
+class TestReadMemoryRegion:
+    def test_region_metadata_included(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import read_memory_range
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.return_value = b"\x90" * 16
+        sb.client.memmap.return_value = [
+            SimpleNamespace(base_address=0x401000, region_size=0x1000,
+                            protect=0x20, state=0x1000, info=".text"),
+        ]
+        r = read_memory_range(sandbox_id="aa11", address="0x401000", size=16)
+        assert r["success"]
+        assert r["region"]["section"] == ".text"
+        assert r["region"]["protection"] == "EXECUTE_READ"
+        assert r["region"]["executable"] is True
+
+    def test_region_can_be_skipped(self, manager):
+        from x64dbg_automate.api_runtime.api_memory import read_memory_range
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.read_memory.return_value = b"\x90" * 16
+        r = read_memory_range(sandbox_id="aa11", address="0x401000", size=16, include_region=False)
+        assert r["success"]
+        assert "region" not in r
+        sb.client.memmap.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Connection unification + hardening (Issues #1/#2)
+# ---------------------------------------------------------------------------
+
+class TestConnectionUnification:
+    def test_create_sandbox_sets_active(self, manager, monkeypatch):
+        # create_sandbox should make the new sandbox the active session so the
+        # legacy tier (and sandbox_id-less tools) resolve to it.
+        import x64dbg_automate
+        monkeypatch.setattr(supervisor, "resolve_x64dbg_path_with_env", lambda p: "x64dbg.exe")
+        monkeypatch.setattr(supervisor, "resolve_debugger_path", lambda p, e="": "x64dbg.exe")
+        fake = MagicMock()
+        fake.start_session.return_value = 4321
+        fake.debugee_bitness.return_value = 64
+        fake.debuggee_pid.return_value = 1234
+        fake.is_debugging.return_value = True
+        monkeypatch.setattr(x64dbg_automate, "X64DbgClient", lambda path: fake)
+
+        sb = manager.create_sandbox(target_exe="foo.exe")
+        assert manager.get_active_session_id() == sb.sandbox_id
+        # get_client(None) now resolves to the freshly created sandbox.
+        assert manager.get_client(None) is fake
+
+    def test_ensure_connected_probes_then_reconnects(self, manager):
+        sb = _mock_sandbox(manager)
+        sb.client.is_connection_alive.return_value = False
+        sb.client.reconnect.return_value = True
+        sb.client.is_debugging.return_value = True
+        sb.client.is_running.return_value = False
+        assert manager.ensure_connected("aa11") is True
+        sb.client.reconnect.assert_called_once_with(sb.debugger_pid)
+
+    def test_cached_memmap_reuses_within_ttl(self, manager):
+        sb = _mock_sandbox(manager)
+        pages = [SimpleNamespace(base_address=0x1000, region_size=0x1000, protect=0x20)]
+        sb.client.memmap.return_value = pages
+        a = manager.cached_memmap("aa11")
+        b = manager.cached_memmap("aa11")
+        assert a is b
+        sb.client.memmap.assert_called_once()  # second call served from cache
+
+
+class TestHealAndRetryGuard:
+    def _wrap(self, fn, unsafe=False):
+        from x64dbg_automate.api_runtime import registry
+        if unsafe:
+            registry._UNSAFE_NAMES.add(fn.__name__)
+        try:
+            return registry._with_connection_healing(fn)
+        finally:
+            registry._UNSAFE_NAMES.discard(fn.__name__)
+
+    def test_readonly_tool_retries_after_heal(self, manager):
+        sb = _mock_sandbox(manager)
+        sb.client.is_connection_alive.return_value = True  # ensure_connected -> True
+
+        calls = {"n": 0}
+
+        def read_tool(*, sandbox_id=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return responses.err("down", ErrorType.NOT_CONNECTED)
+            return responses.ok(value=42)
+
+        wrapped = self._wrap(read_tool, unsafe=False)
+        r = wrapped(sandbox_id="aa11")
+        assert r["success"] and r["value"] == 42
+        assert calls["n"] == 2  # healed + retried
+
+    def test_unsafe_tool_not_retried(self, manager):
+        sb = _mock_sandbox(manager)
+        sb.client.is_connection_alive.return_value = True
+
+        calls = {"n": 0}
+
+        def write_tool(*, sandbox_id=None):
+            calls["n"] += 1
+            return responses.err("down", ErrorType.NOT_CONNECTED)
+
+        wrapped = self._wrap(write_tool, unsafe=True)
+        r = wrapped(sandbox_id="aa11")
+        assert r["success"] is False
+        assert calls["n"] == 1  # healed but NOT replayed (state-mutating)
+
+    def test_non_connection_error_passes_through(self, manager):
+        sb = _mock_sandbox(manager)
+
+        def tool_fn(*, sandbox_id=None):
+            return responses.err("bad arg", ErrorType.BAD_ARGUMENT)
+
+        wrapped = self._wrap(tool_fn, unsafe=False)
+        r = wrapped(sandbox_id="aa11")
+        assert r["error_type"] == ErrorType.BAD_ARGUMENT
+
+
+# ---------------------------------------------------------------------------
+# Sandbox-native control primitives (Phase 3 port)
+# ---------------------------------------------------------------------------
+
+class TestControlTools:
+    def test_read_registers(self, manager):
+        from x64dbg_automate.api_runtime.api_control import read_registers
+
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.is_running.return_value = False
+        sb.client.get_reg.side_effect = lambda r: {"eax": 0x1, "eip": 0x401000}.get(r, 0)
+        r = read_registers("aa11")
+        assert r["success"] and r["arch"] == "x32"
+        assert r["registers"]["eax"] == "0x1"
+        assert r["registers"]["eip"] == "0x401000"
+
+    def test_read_register_single(self, manager):
+        from x64dbg_automate.api_runtime.api_control import read_register
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.get_reg.return_value = 0xDEAD
+        r = read_register(sandbox_id="aa11", register="rax")
+        assert r["success"] and r["value"] == "0xDEAD" and r["value_int"] == 0xDEAD
+
+    def test_write_register(self, manager):
+        from x64dbg_automate.api_runtime.api_control import write_register
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.set_reg.return_value = True
+        r = write_register(sandbox_id="aa11", register="rax", value=0x10)
+        assert r["success"] and r["value"] == "0x10"
+        sb.client.set_reg.assert_called_once()
+
+    def test_write_memory(self, manager):
+        from x64dbg_automate.api_runtime.api_control import write_memory
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.eval_sync.return_value = (0x401000, True)
+        sb.client.write_memory.return_value = True
+        r = write_memory(sandbox_id="aa11", address="0x401000", data_hex="9090")
+        assert r["success"] and r["bytes_written"] == 2
+        sb.client.write_memory.assert_called_once_with(0x401000, b"\x90\x90")
+
+    def test_write_memory_bad_hex(self, manager):
+        from x64dbg_automate.api_runtime.api_control import write_memory
+
+        sb = _mock_sandbox(manager)
+        r = write_memory(sandbox_id="aa11", address="0x401000", data_hex="zzzz")
+        assert r["success"] is False and r["error_type"] == ErrorType.BAD_ARGUMENT
+
+    def test_breakpoint_set_and_list(self, manager):
+        from x64dbg_automate.api_runtime.api_control import breakpoint_set, breakpoint_list
+        from x64dbg_automate.models import BreakpointType
+
+        sb = _mock_sandbox(manager)
+        sb.client.eval_sync.return_value = (0x401000, True)
+        sb.client.set_breakpoint.return_value = True
+
+        r = breakpoint_set(sandbox_id="aa11", address="0x401000")
+        assert r["success"] and r["address"] == "0x401000" and r["bp_class"] == "software"
+
+        def _bp(addr):
+            bp = MagicMock(); bp.addr = addr; bp.enabled = True; bp.hitCount = 0; bp.name = "x"
+            return bp
+        sb.client.get_breakpoints.side_effect = lambda bt: [_bp(0x401000)] if bt == BreakpointType.BpNormal else []
+        rl = breakpoint_list("aa11")
+        assert rl["success"] and rl["total"] == 1
+        assert rl["breakpoints"][0]["address"] == "0x401000"
+
+    def test_step_into_reports_cip(self, manager):
+        from x64dbg_automate.api_runtime.api_control import step_into
+
+        sb = _mock_sandbox(manager)
+        sb.client.is_running.return_value = False
+        sb.client.stepi.return_value = True
+        sb.client.get_reg.return_value = 0x401004
+        r = step_into(sandbox_id="aa11", count=1)
+        assert r["success"] and r["stepped"] is True
+        assert r["cip"] == "0x401004"
+
+    def test_control_unsafe_flags(self):
+        from x64dbg_automate.api_runtime.registry import is_unsafe
+        assert is_unsafe("write_register")
+        assert is_unsafe("write_memory")
+        assert is_unsafe("breakpoint_set")
+        assert is_unsafe("step_into")
+        assert not is_unsafe("read_registers")
+        assert not is_unsafe("breakpoint_list")
