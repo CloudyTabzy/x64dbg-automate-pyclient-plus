@@ -265,3 +265,84 @@ def patch_export(*, sandbox_id: str | None = None) -> dict:
         patches=list(sandbox.patches),
         total=len(sandbox.patches),
     )
+
+
+@tool
+def verify_patch(
+    *,
+    sandbox_id: str | None = None,
+    address: str,
+    expected_bytes: str,
+) -> dict:
+    """Verify that an expected byte sequence is present at an address.
+
+    Reads live memory at ``address`` and compares it byte-for-byte against
+    ``expected_bytes``. Returns ``match=True`` when all bytes match, or
+    ``match=False`` with a diff listing changed byte runs.
+
+    Use this after loading an ASI/hook to confirm it actually patched the target,
+    or after ``patch_rollback`` to confirm the original bytes were restored.
+
+    Args:
+        sandbox_id: Sandbox to check (omit for active session).
+        address: Address to verify (address, symbol, or expression).
+        expected_bytes: Expected bytes as a hex string, e.g. ``"E9 00 00 00 00"``
+                        or ``"e900000000"`` (spaces and tabs ignored).
+    """
+    try:
+        sandbox, client = _get_sandbox_and_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    try:
+        addr = resolve_addr(client, address)
+    except ValueError as exc:
+        return err(str(exc), ErrorType.BAD_ARGUMENT)
+
+    clean = expected_bytes.replace(" ", "").replace("\t", "")
+    try:
+        expected = bytes.fromhex(clean)
+    except ValueError:
+        return err(
+            f"Invalid hex string: {expected_bytes!r}",
+            ErrorType.BAD_ARGUMENT,
+            hint="Use two-hex-digit pairs, optionally space-separated (e.g. '90 90 90').",
+        )
+    if not expected:
+        return err("expected_bytes must not be empty.", ErrorType.BAD_ARGUMENT)
+
+    try:
+        actual = client.read_memory(addr, len(expected))
+    except Exception as exc:  # noqa: BLE001
+        if is_bug(exc):
+            raise
+        return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    if not actual:
+        return err(
+            f"Could not read {len(expected)} bytes at 0x{addr:X}.",
+            ErrorType.NOT_FOUND,
+            hint="The address may not be mapped or the sandbox may be running.",
+            sandbox_id=sandbox_id,
+        )
+
+    from x64dbg_automate.api_runtime.runtime_helpers import diff_bytes
+    diffs = diff_bytes(expected, actual)
+    match = len(diffs) == 0 and len(actual) == len(expected)
+
+    result = ok(
+        sandbox_id=sandbox_id,
+        address=f"0x{addr:X}",
+        expected=expected.hex(),
+        actual=actual.hex(),
+        size=len(expected),
+        match=match,
+    )
+    if not match:
+        result["diffs"] = diffs
+        if len(actual) < len(expected):
+            result["note"] = (
+                f"Only {len(actual)} of {len(expected)} bytes could be read — "
+                "the region may span a page boundary or unmapped area."
+            )
+    return result

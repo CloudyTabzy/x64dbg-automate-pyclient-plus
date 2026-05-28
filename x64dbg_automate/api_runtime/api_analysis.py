@@ -11,7 +11,7 @@ from __future__ import annotations
 from x64dbg_automate.api_runtime.registry import tool
 from x64dbg_automate.api_runtime.responses import ErrorType, classify_exception, err, is_bug, lookup_error, ok, to_hex
 from x64dbg_automate.api_runtime.runtime_helpers import (
-    detect_function_bounds, disasm_instructions, resolve_addr,
+    detect_function_bounds, disasm_instructions, is_potential_entry, resolve_addr,
 )
 from x64dbg_automate.api_runtime.supervisor import SandboxError, get_manager
 
@@ -20,7 +20,10 @@ _XREF_TYPE_NAMES = {0: "NONE", 1: "DATA", 2: "JMP", 3: "CALL"}
 # Memory constants for the scan-based xref fallback.
 _MEM_COMMIT = 0x1000
 _PAGE_EXECUTE_ANY = 0x10 | 0x20 | 0x40 | 0x80  # EXECUTE | _READ | _READWRITE | _WRITECOPY
+_PAGE_READABLE = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80  # any readable protection
 _XREF_SCAN_DEFAULT_MAX = 64 * 1024 * 1024  # 64 MiB scan ceiling
+_ADDR_SCAN_DEFAULT_MAX = 128 * 1024 * 1024  # 128 MiB ceiling for pointer scan
+_ADDR_SCAN_MAX_RESULTS = 50  # max pointer-ref hits before truncating
 
 
 def _xref_name(t: int) -> str:
@@ -128,6 +131,87 @@ def _scan_xrefs_to(client, target: int, arch: str, max_bytes: int = _XREF_SCAN_D
             start = i + 1
 
     return refs, truncated
+
+
+def _scan_pointer_refs_to(
+    client,
+    target: int,
+    arch: str,
+    max_bytes: int = _ADDR_SCAN_DEFAULT_MAX,
+) -> list[dict]:
+    """Scan all committed readable memory for the target address stored as a pointer.
+
+    Finds vtable entries, dispatch tables, function pointer arrays, and indirect
+    call stubs that hold the target's address as a DWORD (x86) or QWORD (x64) value.
+    Complements the E8/E9 direct-call scan for functions reachable only via
+    register-indirect or table-based dispatch.
+
+    Each result includes ``type`` (``DATA_PTR`` for data pages, ``CODE_PTR`` for
+    executable pages) so agents can distinguish vtable entries from call stubs.
+
+    Returns up to ``_ADDR_SCAN_MAX_RESULTS`` matches.
+    """
+    ptr_size = 8 if arch == "x64" else 4
+    try:
+        target_bytes = target.to_bytes(ptr_size, "little")
+    except OverflowError:
+        return []
+
+    try:
+        pages = client.memmap()
+    except Exception:
+        return []
+
+    refs: list[dict] = []
+    scanned = 0
+
+    for page in pages:
+        if len(refs) >= _ADDR_SCAN_MAX_RESULTS:
+            break
+        if (page.state & _MEM_COMMIT) == 0:
+            continue
+        # Skip NOACCESS and GUARD pages
+        low_prot = page.protect & 0xFF
+        if low_prot in (0x00, 0x01) or (page.protect & 0x100):
+            continue
+        if (page.protect & _PAGE_READABLE) == 0 and (page.protect & _PAGE_EXECUTE_ANY) == 0:
+            continue
+        if scanned >= max_bytes:
+            break
+
+        size = min(page.region_size, max_bytes - scanned)
+        if size > 16 * 1024 * 1024:  # skip individual pages > 16 MiB to stay fast
+            size = 16 * 1024 * 1024
+        try:
+            data = client.read_memory(page.base_address, size)
+        except Exception:
+            continue
+        if not data:
+            continue
+        scanned += len(data)
+
+        is_exec = bool(page.protect & _PAGE_EXECUTE_ANY)
+        ref_type = "CODE_PTR" if is_exec else "DATA_PTR"
+
+        pos = 0
+        while pos <= len(data) - ptr_size:
+            i = data.find(target_bytes, pos)
+            if i == -1:
+                break
+            abs_addr = page.base_address + i
+            # Require pointer alignment to reduce false positives
+            if abs_addr % ptr_size == 0:
+                refs.append({
+                    "address": f"0x{abs_addr:X}",
+                    "type": ref_type,
+                    "section": page.info or "",
+                    "source": "addr_scan",
+                })
+                if len(refs) >= _ADDR_SCAN_MAX_RESULTS:
+                    break
+            pos = i + 1
+
+    return refs
 
 
 @tool
@@ -238,18 +322,36 @@ def get_xrefs(
         notes.append(
             "Native xref DB was empty; results are direct rel32 CALL/JMP callers "
             "found by scanning executable memory. The target module was scanned fully; "
-            "other loaded modules are subject to the scan ceiling. "
-            "Indirect references (register-indirect, vtable dispatch) are not included."
+            "other loaded modules are subject to the scan ceiling."
         )
+
+        # When direct scan finds nothing, scan all committed memory for the target
+        # address stored as a pointer (vtable entries, dispatch tables, etc.).
+        dispatch_refs: list[dict] = []
         if not refs:
+            try:
+                dispatch_refs = _scan_pointer_refs_to(client, addr, arch)
+            except Exception:
+                pass
+
+        if not refs and not dispatch_refs:
+            addr_bytes = addr.to_bytes(4 if arch != "x64" else 8, "little")
             notes.append(
-                f"No direct callers found for 0x{addr:X}. The function may be called "
-                "indirectly via a register (FF D0/FF D1) or through a vtable/dispatch table. "
-                "Try memory_search_pattern to search for the function's address as a "
-                f"4-byte immediate (e.g. pattern '{''.join(f'{b:02X} ' for b in addr.to_bytes(4, 'little')).strip()}') "
-                "in data sections to find potential dispatch sites."
+                f"No direct or dispatch callers found for 0x{addr:X}. "
+                "The function may be called via a computed register target (FF D0/FF D1) "
+                "with no static pointer in memory. Consider setting a hardware execute "
+                "breakpoint at the function and letting the debuggee run to catch callers "
+                "dynamically."
             )
-        return ok(
+        elif not refs and dispatch_refs:
+            notes.append(
+                f"No direct CALL/JMP callers found; {len(dispatch_refs)} potential dispatch "
+                "site(s) found where the function's address is stored as a pointer "
+                "(vtable entries, function pointer arrays, import stubs). "
+                "Inspect these sites to identify the actual call mechanism."
+            )
+
+        result = ok(
             sandbox_id=sandbox_id,
             address=f"0x{addr:X}",
             source="scan",
@@ -258,6 +360,10 @@ def get_xrefs(
             scan_truncated=truncated,
             notes=notes,
         )
+        if dispatch_refs:
+            result["dispatch_refs"] = dispatch_refs
+            result["dispatch_refs_total"] = len(dispatch_refs)
+        return result
 
     return ok(
         sandbox_id=sandbox_id,
@@ -312,6 +418,30 @@ def get_function_boundaries(*, sandbox_id: str | None = None, address: str) -> d
     )
     if bounds.note:
         result["note"] = bounds.note
+
+    # Nesting check: when the queried address is interior to the outer function
+    # AND looks like its own entry point, report it as an inner callable so the
+    # agent can target the right function boundary for decompilation/xrefs.
+    if addr != bounds.start and bounds.start < addr < bounds.end:
+        try:
+            if is_potential_entry(client, addr):
+                from x64dbg_automate.api_runtime.runtime_helpers import _find_end_from
+                inner_end = _find_end_from(client, addr)
+                result["inner_callable"] = {
+                    "start": f"0x{addr:X}",
+                    "end": f"0x{inner_end:X}",
+                    "size": max(0, inner_end - addr),
+                    "confidence": "low",
+                    "note": (
+                        "The queried address has a function prologue / post-padding "
+                        "signature and may be a distinct inner callable nested within "
+                        f"the outer function at 0x{bounds.start:X}. Use this start for "
+                        "xref lookups targeting this specific subroutine."
+                    ),
+                }
+        except Exception:
+            pass
+
     return result
 
 
@@ -458,6 +588,27 @@ def find_function_start(*, sandbox_id: str | None = None, address: str) -> dict:
     )
     if bounds.note:
         result["note"] = bounds.note
+
+    # Same nesting check as get_function_boundaries.
+    if addr != bounds.start and bounds.start < addr < bounds.end:
+        try:
+            if is_potential_entry(client, addr):
+                from x64dbg_automate.api_runtime.runtime_helpers import _find_end_from
+                inner_end = _find_end_from(client, addr)
+                result["inner_callable"] = {
+                    "start": f"0x{addr:X}",
+                    "end": f"0x{inner_end:X}",
+                    "size": max(0, inner_end - addr),
+                    "confidence": "low",
+                    "note": (
+                        "The queried address has a function prologue / post-padding "
+                        "signature and may be a distinct inner callable nested within "
+                        f"the outer function at 0x{bounds.start:X}."
+                    ),
+                }
+        except Exception:
+            pass
+
     return result
 
 
@@ -872,6 +1023,97 @@ def get_modules(sandbox_id: str | None = None) -> dict:
 
 
 @tool
+def refresh_modules(
+    sandbox_id: str | None = None,
+    wait_for: str = "",
+    timeout_sec: float = 5.0,
+) -> dict:
+    """Refresh the module list and optionally wait for a specific module to appear.
+
+    The live module list is always fetched fresh from x64dbg — no local cache
+    needs clearing. Pass ``wait_for`` to poll until a module whose name or path
+    contains that string (case-insensitive) is loaded.
+
+    Typical workflow for ASI / plugin modules::
+
+        sandbox_continue()                          # resume past system breakpoint
+        refresh_modules(wait_for="SilentPatch", timeout_sec=10)  # wait for the ASI
+
+    Args:
+        sandbox_id: Sandbox to refresh (omit for active session).
+        wait_for: Module name fragment to wait for (case-insensitive; omit to
+                  return immediately).
+        timeout_sec: Maximum seconds to poll when ``wait_for`` is set (default 5).
+    """
+    import time as _time
+
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    def _fetch():
+        try:
+            return client.get_modules()
+        except Exception as exc:
+            if is_bug(exc):
+                raise
+            return []
+
+    def _to_list(modules):
+        return [
+            {"base": f"0x{m.base:X}", "size": m.size, "entry": f"0x{m.entry:X}",
+             "name": m.name, "path": m.path, "section_count": m.section_count}
+            for m in modules
+        ]
+
+    if not wait_for.strip():
+        modules = _fetch()
+        return ok(sandbox_id=sandbox_id, modules=_to_list(modules), total=len(modules))
+
+    target = wait_for.strip().lower()
+    deadline = _time.monotonic() + max(0.1, timeout_sec)
+    found_mod = None
+    while _time.monotonic() < deadline:
+        modules = _fetch()
+        for m in modules:
+            if target in m.name.lower() or target in (m.path or "").lower():
+                found_mod = m
+                break
+        if found_mod is not None:
+            break
+        _time.sleep(0.25)
+
+    if found_mod is None:
+        modules = _fetch()
+        return ok(
+            sandbox_id=sandbox_id,
+            modules=_to_list(modules),
+            total=len(modules),
+            waited_for=wait_for,
+            found=False,
+            note=f"Module matching '{wait_for}' did not appear within {timeout_sec}s. "
+                 "Ensure the debuggee has been resumed past the point where the module loads.",
+        )
+
+    modules = _fetch()
+    return ok(
+        sandbox_id=sandbox_id,
+        modules=_to_list(modules),
+        total=len(modules),
+        waited_for=wait_for,
+        found=True,
+        found_module={
+            "base": f"0x{found_mod.base:X}",
+            "size": found_mod.size,
+            "name": found_mod.name,
+            "path": found_mod.path,
+        },
+    )
+
+
+@tool
 def get_seh_chain(sandbox_id: str | None = None) -> dict:
     """Get the Structured Exception Handling (SEH) chain for the current thread.
 
@@ -893,6 +1135,151 @@ def get_seh_chain(sandbox_id: str | None = None) -> dict:
         sandbox_id=sandbox_id,
         records=[{"address": f"0x{r.address:X}", "handler": f"0x{r.handler:X}"} for r in records],
         total=len(records),
+    )
+
+
+@tool
+def enumerate_exception_handlers(sandbox_id: str | None = None) -> dict:
+    """Enumerate active exception handlers in the debuggee process.
+
+    Returns two sections:
+
+    **SEH** (x86 only) — the Structured Exception Handling chain for the
+    current thread, walked from ``FS:[0]``. Each record contains the frame
+    address and handler function address (resolved to a symbol when available).
+
+    **VEH** — the Vectored Exception Handler list in ntdll, walked from
+    ``ntdll!LdrpVectorHandlerList``. This private symbol requires ntdll PDB
+    symbols to be loaded in x64dbg. If the symbol can't be resolved, a hint is
+    returned. On Windows Vista+, handler addresses are RtlEncodePointer-encoded
+    (XOR + rotate with a per-process cookie) and cannot be decoded without the
+    cookie from ntdll.
+
+    Args:
+        sandbox_id: Sandbox to inspect (omit for active session).
+    """
+    mgr = get_manager()
+    try:
+        client = mgr.get_client(sandbox_id)
+    except (KeyError, SandboxError) as exc:
+        return lookup_error(exc)
+
+    arch = "x64"
+    try:
+        sb = mgr.get_sandbox(sandbox_id)
+        arch = sb.debugger_arch or "x64"
+    except Exception:
+        pass
+
+    # ── SEH chain ─────────────────────────────────────────────────────────────
+    seh_records: list[dict] = []
+    seh_note: str | None = None
+
+    if arch == "x64":
+        seh_note = (
+            "SEH chain walk (FS:[0]) is x86-only. x64 uses table-based SEH "
+            "defined in the PE exception directory — no runtime linked list exists."
+        )
+    else:
+        try:
+            records = client.get_seh_chain()
+            for r in records:
+                sym = None
+                try:
+                    s = client.get_symbol_at(r.handler)
+                    if s:
+                        sym = s.undecoratedSymbol or s.decoratedSymbol
+                except Exception:
+                    pass
+                seh_records.append({
+                    "address": f"0x{r.address:X}",
+                    "handler": f"0x{r.handler:X}",
+                    "symbol": sym,
+                })
+        except Exception:
+            seh_note = "SEH chain could not be read."
+
+    # ── VEH list ──────────────────────────────────────────────────────────────
+    veh_handlers: list[dict] = []
+    veh_list_head: int = 0
+    veh_note: str | None = None
+
+    # LdrpVectorHandlerList is a non-exported internal ntdll variable.
+    # It only resolves if the ntdll PDB is loaded in x64dbg.
+    for sym_expr in ("ntdll:LdrpVectorHandlerList", "ntdll.LdrpVectorHandlerList"):
+        try:
+            val, success = client.eval_sync(sym_expr)
+            if success and val:
+                veh_list_head = val
+                break
+        except Exception:
+            pass
+
+    if veh_list_head:
+        # Node layout: [Flink:ptr][Blink:ptr][Refs:ULONG][pad?][Handler_encoded:ptr]
+        # x86: Flink(4)+Blink(4)+Refs(4) = 12 before Handler
+        # x64: Flink(8)+Blink(8)+Refs(4)+pad(4) = 24 before Handler
+        ptr_size = 4 if arch == "x32" else 8
+        handler_offset = 12 if arch == "x32" else 24
+        max_nodes = 64
+        seen: set[int] = {veh_list_head}
+        try:
+            raw = client.read_memory(veh_list_head, ptr_size)
+            flink = int.from_bytes(raw, "little") if raw else 0
+            while flink and flink not in seen and len(veh_handlers) < max_nodes:
+                seen.add(flink)
+                if flink == veh_list_head:
+                    break
+                handler_raw = client.read_memory(flink + handler_offset, ptr_size)
+                handler_enc = int.from_bytes(handler_raw, "little") if handler_raw else 0
+                sym_name = None
+                # Encoded pointer probably won't resolve, but try cheaply.
+                try:
+                    s = client.get_symbol_at(handler_enc)
+                    if s and (s.undecoratedSymbol or s.decoratedSymbol):
+                        sym_name = s.undecoratedSymbol or s.decoratedSymbol
+                except Exception:
+                    pass
+                veh_handlers.append({
+                    "node_address": f"0x{flink:X}",
+                    "handler_encoded": f"0x{handler_enc:X}",
+                    "symbol_guess": sym_name,
+                })
+                next_raw = client.read_memory(flink, ptr_size)
+                flink = int.from_bytes(next_raw, "little") if next_raw else 0
+        except Exception:
+            veh_note = "VEH list walk interrupted — partial results returned."
+
+        if not veh_note:
+            veh_note = (
+                "Handler pointers are RtlEncodePointer-encoded on Windows Vista+ "
+                "(XOR + _rotr3 with a per-process cookie stored in ntdll). "
+                "To decode: read the cookie from ntdll!RtlpProcessHeapKey and "
+                "apply: handler = _rotl(encoded_ptr ^ cookie, 3)."
+            )
+    else:
+        veh_note = (
+            "ntdll!LdrpVectorHandlerList could not be resolved — ntdll PDB symbols "
+            "are not loaded. In x64dbg: Options → Preferences → Symbols, enable "
+            "symbol server, then run 'sym ntdll' in the command bar. Alternatively, "
+            "use a hardware execute breakpoint at RtlAddVectoredExceptionHandler to "
+            "catch VEH registrations dynamically."
+        )
+
+    return ok(
+        sandbox_id=sandbox_id,
+        arch=arch,
+        seh={
+            "records": seh_records,
+            "count": len(seh_records),
+            "note": seh_note,
+        },
+        veh={
+            "list_head": f"0x{veh_list_head:X}" if veh_list_head else None,
+            "handlers": veh_handlers,
+            "count": len(veh_handlers),
+            "note": veh_note,
+        },
     )
 
 
@@ -1366,5 +1753,13 @@ def graph_call_graph(
         if is_bug(exc):
             raise
         return err(str(exc), classify_exception(exc), sandbox_id=sandbox_id)
+
+    if result["total_nodes"] == 1 and result["total_edges"] == 0:
+        result.setdefault("notes", []).append(
+            "Isolated call graph — no outgoing calls were resolved. "
+            "The function likely uses indirect dispatch (FF D0/FF D1 register calls, "
+            "vtable, or computed targets). Use get_xrefs to find callers TO this "
+            "function, or disassemble_function to inspect the call pattern manually."
+        )
 
     return ok(sandbox_id=sandbox_id, **result)

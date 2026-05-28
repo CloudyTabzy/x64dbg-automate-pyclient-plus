@@ -5031,3 +5031,418 @@ class TestDbgPathCache:
                 dp.resolve_x64dbg_path_with_env("")
         finally:
             dp._path_cache = orig
+
+
+# ---------------------------------------------------------------------------
+# verify_patch
+# ---------------------------------------------------------------------------
+
+class TestVerifyPatch:
+    def test_match(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import verify_patch
+        sb = _mock_sandbox(manager)
+        sb.client.read_memory.return_value = bytes([0xE9, 0x00, 0x00, 0x00, 0x00])
+        sb.client.eval_sync.return_value = (0x401000, True)
+        r = verify_patch(sandbox_id="aa11", address="0x401000", expected_bytes="E9 00 00 00 00")
+        assert r["success"]
+        assert r["match"] is True
+        assert "diffs" not in r
+
+    def test_mismatch_reports_diffs(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import verify_patch
+        sb = _mock_sandbox(manager)
+        # Expected NOPs, actual has a JMP
+        sb.client.read_memory.return_value = bytes([0xE9, 0x00, 0x00, 0x00, 0x00])
+        sb.client.eval_sync.return_value = (0x401000, True)
+        r = verify_patch(sandbox_id="aa11", address="0x401000", expected_bytes="90 90 90 90 90")
+        assert r["success"]
+        assert r["match"] is False
+        assert len(r["diffs"]) > 0
+
+    def test_invalid_hex_returns_error(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import verify_patch
+        _mock_sandbox(manager)
+        r = verify_patch(sandbox_id="aa11", address="0x401000", expected_bytes="GG HH")
+        assert not r["success"]
+        assert r["error_type"] == "BAD_ARGUMENT"
+
+    def test_empty_expected_bytes_error(self, manager):
+        from x64dbg_automate.api_runtime.api_patches import verify_patch
+        _mock_sandbox(manager)
+        r = verify_patch(sandbox_id="aa11", address="0x401000", expected_bytes="")
+        assert not r["success"]
+        assert r["error_type"] == "BAD_ARGUMENT"
+
+
+# ---------------------------------------------------------------------------
+# refresh_modules
+# ---------------------------------------------------------------------------
+
+class TestRefreshModules:
+    def _mod(self, name, base=0x400000):
+        m = MagicMock()
+        m.base = base
+        m.size = 0x10000
+        m.entry = base + 0x1000
+        m.name = name
+        m.path = f"C:\\{name}"
+        m.section_count = 3
+        return m
+
+    def test_basic_refresh(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import refresh_modules
+        sb = _mock_sandbox(manager)
+        sb.client.get_modules.return_value = [self._mod("bully.exe"), self._mod("ntdll.dll", 0x77000000)]
+        r = refresh_modules(sandbox_id="aa11")
+        assert r["success"]
+        assert r["total"] == 2
+        assert any(m["name"] == "bully.exe" for m in r["modules"])
+
+    def test_wait_for_found(self, manager, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import refresh_modules
+        sb = _mock_sandbox(manager)
+        call_count = {"n": 0}
+
+        def _get_modules_side_effect():
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                return [self._mod("bully.exe")]
+            return [self._mod("bully.exe"), self._mod("SilentPatchBully.asi", 0x10000000)]
+
+        sb.client.get_modules.side_effect = _get_modules_side_effect
+        monkeypatch.setattr("time.sleep", lambda _: None)
+        r = refresh_modules(sandbox_id="aa11", wait_for="SilentPatch", timeout_sec=2.0)
+        assert r["success"]
+        assert r["found"] is True
+        assert "SilentPatchBully.asi" in r["found_module"]["name"]
+
+    def test_wait_for_timeout(self, manager, monkeypatch):
+        from x64dbg_automate.api_runtime.api_analysis import refresh_modules
+        sb = _mock_sandbox(manager)
+        sb.client.get_modules.return_value = [self._mod("bully.exe")]
+        monkeypatch.setattr("time.sleep", lambda _: None)
+
+        import time as _t
+        _start = _t.monotonic()
+        r = refresh_modules(sandbox_id="aa11", wait_for="nonexistent.asi", timeout_sec=0.1)
+        assert r["success"]
+        assert r["found"] is False
+        assert "nonexistent.asi" in r["note"]
+
+
+# ---------------------------------------------------------------------------
+# graph_call_graph isolated-node warning
+# ---------------------------------------------------------------------------
+
+class TestCallGraphIsolatedNodeWarning:
+    def test_isolated_node_gets_note(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import graph_call_graph
+        sb = _mock_sandbox(manager)
+        # Minimal function with only a RET — no calls, no jumps
+        sb.client.read_memory.return_value = b"\xC3"  # ret
+        sb.client.eval_sync.return_value = (0x401000, True)
+        sb.client.get_function.return_value = None
+        sb.client.get_modules.return_value = []
+        sb.client.get_symbol_at.return_value = None
+        sb.client.get_process_info.return_value = MagicMock(image_base=0x400000, entry_point=0x1000)
+
+        r = graph_call_graph(sandbox_id="aa11", address="0x401000", max_depth=1)
+        assert r["success"]
+        assert r["total_nodes"] == 1
+        assert r["total_edges"] == 0
+        assert "notes" in r
+        assert any("indirect" in n.lower() for n in r["notes"])
+
+    def test_non_isolated_no_spurious_note(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import graph_call_graph
+        from x64dbg_automate.external.decompiler import disassemble_bytes
+        sb = _mock_sandbox(manager)
+        # call 0x401010 (E8 05 00 00 00) then ret (C3)
+        code = bytes.fromhex("E8050000000000000000000090C3")
+        sb.client.read_memory.return_value = code
+        sb.client.eval_sync.return_value = (0x401000, True)
+        sb.client.get_function.return_value = None
+        sb.client.get_modules.return_value = []
+        sb.client.get_symbol_at.return_value = None
+        sb.client.get_process_info.return_value = MagicMock(image_base=0x400000, entry_point=0x1000)
+
+        r = graph_call_graph(sandbox_id="aa11", address="0x401000", max_depth=1)
+        assert r["success"]
+        # If an edge was found, no isolated-node note should appear
+        if r["total_edges"] > 0:
+            notes = r.get("notes", [])
+            assert not any("isolated" in n.lower() for n in notes)
+
+
+# ---------------------------------------------------------------------------
+# is_potential_entry / inner_callable nesting
+# ---------------------------------------------------------------------------
+
+class TestFunctionNestingDetection:
+    def test_is_potential_entry_prologue(self):
+        from x64dbg_automate.api_runtime.runtime_helpers import is_potential_entry
+        client = MagicMock()
+        # push ebp; mov ebp, esp at addr
+        client.read_memory.return_value = bytes([0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10, 0x00, 0x00])
+        assert is_potential_entry(client, 0x401000) is True
+
+    def test_is_potential_entry_padding_preceded(self):
+        from x64dbg_automate.api_runtime.runtime_helpers import is_potential_entry
+        client = MagicMock()
+        def _read(addr, size):
+            # At addr: jnz (non-prologue); at addr-2: CC CC (padding)
+            if addr == 0x401002 and size == 8:
+                return bytes([0x75, 0x0A, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00])
+            if addr == 0x401000 and size == 2:
+                return bytes([0xCC, 0xCC])
+            return b""
+        client.read_memory.side_effect = _read
+        assert is_potential_entry(client, 0x401002) is True
+
+    def test_is_potential_entry_plain_interior(self):
+        from x64dbg_automate.api_runtime.runtime_helpers import is_potential_entry
+        client = MagicMock()
+        # mov eax, 1 — interior instruction, no prologue
+        def _read(addr, size):
+            if size == 8:
+                return bytes([0xB8, 0x01, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90])
+            if size == 2:
+                return bytes([0xB8, 0x01])  # not padding
+            return b""
+        client.read_memory.side_effect = _read
+        assert is_potential_entry(client, 0x401010) is False
+
+    def test_inner_callable_detected_in_get_function_boundaries(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import get_function_boundaries
+        sb = _mock_sandbox(manager)
+
+        outer_start = 0x885F47
+        addr = 0x887280
+        outer_end = 0x888000
+
+        # x64dbg returns outer function bounds
+        fb = MagicMock()
+        fb.start = outer_start
+        fb.end = outer_end
+        sb.client.get_function.return_value = fb
+
+        def _read(a, size):
+            # At addr: push ebp; mov ebp, esp (prologue)
+            if a == addr and size == 8:
+                return bytes([0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10, 0x00, 0x00])
+            # pre-padding check (addr-2)
+            if a == addr - 2 and size == 2:
+                return bytes([0xB8, 0x01])
+            # Forward scan for RET
+            if a >= addr and size == 1:
+                return b"\xC3" if a == addr + 0x20 else b"\x90"
+            return b""
+        sb.client.read_memory.side_effect = _read
+        sb.client.eval_sync.return_value = (addr, True)
+        sb.client.get_modules.return_value = []
+
+        r = get_function_boundaries(sandbox_id="aa11", address=f"0x{addr:X}")
+        assert r["success"]
+        assert r["start"] == f"0x{outer_start:X}"
+        assert "inner_callable" in r
+        assert r["inner_callable"]["start"] == f"0x{addr:X}"
+
+    def test_no_inner_callable_when_addr_is_function_start(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import get_function_boundaries
+        sb = _mock_sandbox(manager)
+        addr = 0x401000
+        fb = MagicMock()
+        fb.start = addr
+        fb.end = addr + 0x100
+        sb.client.get_function.return_value = fb
+        sb.client.read_memory.return_value = bytes([0x55, 0x8B, 0xEC, 0x00, 0x00, 0x00, 0x00, 0x00])
+        sb.client.eval_sync.return_value = (addr, True)
+        sb.client.get_modules.return_value = []
+
+        r = get_function_boundaries(sandbox_id="aa11", address=f"0x{addr:X}")
+        assert r["success"]
+        assert "inner_callable" not in r
+
+
+# ---------------------------------------------------------------------------
+# _scan_pointer_refs_to / dispatch_refs in get_xrefs
+# ---------------------------------------------------------------------------
+
+class TestXrefsPointerScan:
+    def _make_page(self, base, size, protect, state=0x1000, info=""):
+        p = MagicMock()
+        p.base_address = base
+        p.region_size = size
+        p.protect = protect
+        p.state = state
+        p.type = 0x20000
+        p.info = info
+        return p
+
+    def test_dispatch_refs_found_when_direct_scan_empty(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import get_xrefs
+        sb = _mock_sandbox(manager, arch="x32")
+
+        target = 0x401000
+        target_bytes = target.to_bytes(4, "little")
+
+        # A data page containing the target address as a DWORD
+        data_page = self._make_page(0x600000, 0x1000, 0x04)  # readwrite
+        # A code page with no E8/E9 to target
+        code_page = self._make_page(0x401000, 0x1000, 0x20)  # execute_read
+
+        def _memmap():
+            return [code_page, data_page]
+
+        def _read(addr, size):
+            if addr == 0x600000:
+                # Put the target address at offset 0, aligned
+                return target_bytes + b"\x00" * (size - 4)
+            if addr == 0x401000:
+                return b"\x90" * size  # NOPs, no CALL to target
+            return b"\x00" * size
+
+        def _disasm(addr):
+            ins = MagicMock()
+            ins.instruction = "nop"
+            ins.instr_size = 1
+            return ins
+
+        sb.client.memmap.return_value = [code_page, data_page]
+        sb.client.read_memory.side_effect = _read
+        sb.client.disassemble_at.side_effect = _disasm
+        sb.client.eval_sync.return_value = (target, True)
+        sb.client.get_xrefs.return_value = None
+        sb.client.cmd_sync.return_value = True
+        sb.client.get_modules.return_value = []
+
+        r = get_xrefs(sandbox_id="aa11", address=f"0x{target:X}", analyze=False, scan_fallback=True)
+        assert r["success"]
+        assert r["total"] == 0  # no direct callers
+        assert "dispatch_refs" in r
+        assert r["dispatch_refs_total"] >= 1
+        assert r["dispatch_refs"][0]["type"] == "DATA_PTR"
+
+    def test_no_dispatch_refs_when_direct_callers_found(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import get_xrefs
+        sb = _mock_sandbox(manager, arch="x32")
+
+        target = 0x401000
+        target_bytes = target.to_bytes(4, "little")
+
+        # Build CALL rel32 opcode: E8 + rel32
+        site = 0x500000
+        rel = (target - (site + 5)) & 0xFFFFFFFF
+        call_bytes = bytes([0xE8]) + rel.to_bytes(4, "little") + b"\x90" * (0x1000 - 5)
+
+        code_page = self._make_page(site, 0x1000, 0x20)
+
+        def _read(addr, size):
+            if addr == site:
+                return call_bytes[:size]
+            return b"\x00" * size
+
+        def _disasm(addr):
+            ins = MagicMock()
+            ins.instruction = "call 0x401000"
+            ins.instr_size = 5
+            return ins
+
+        sb.client.memmap.return_value = [code_page]
+        sb.client.read_memory.side_effect = _read
+        sb.client.disassemble_at.side_effect = _disasm
+        sb.client.eval_sync.return_value = (target, True)
+        sb.client.get_xrefs.return_value = None
+        sb.client.cmd_sync.return_value = True
+        sb.client.get_modules.return_value = []
+
+        r = get_xrefs(sandbox_id="aa11", address=f"0x{target:X}", analyze=False, scan_fallback=True)
+        assert r["success"]
+        # Direct callers found — no dispatch_refs should be added
+        assert "dispatch_refs" not in r
+
+
+# ---------------------------------------------------------------------------
+# enumerate_exception_handlers
+# ---------------------------------------------------------------------------
+
+class TestEnumerateExceptionHandlers:
+    def test_seh_x86_returns_records(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import enumerate_exception_handlers
+        sb = _mock_sandbox(manager, arch="x32")
+
+        seh_rec = MagicMock()
+        seh_rec.address = 0x18FF00
+        seh_rec.handler = 0x77001234
+        sb.client.get_seh_chain.return_value = [seh_rec]
+        sb.client.get_symbol_at.return_value = None
+        sb.client.eval_sync.return_value = (0, False)  # VEH symbol not resolved
+
+        r = enumerate_exception_handlers(sandbox_id="aa11")
+        assert r["success"]
+        assert r["arch"] == "x32"
+        assert r["seh"]["count"] == 1
+        assert r["seh"]["records"][0]["handler"] == "0x77001234"
+
+    def test_seh_x64_note_only(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import enumerate_exception_handlers
+        sb = _mock_sandbox(manager, arch="x64")
+        sb.client.get_seh_chain.return_value = []
+        sb.client.eval_sync.return_value = (0, False)
+
+        r = enumerate_exception_handlers(sandbox_id="aa11")
+        assert r["success"]
+        assert "x86-only" in r["seh"]["note"]
+        assert r["seh"]["count"] == 0
+
+    def test_veh_list_head_not_resolved(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import enumerate_exception_handlers
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.get_seh_chain.return_value = []
+        sb.client.get_symbol_at.return_value = None
+        # Both eval_sync calls return failure
+        sb.client.eval_sync.return_value = (0, False)
+
+        r = enumerate_exception_handlers(sandbox_id="aa11")
+        assert r["success"]
+        assert r["veh"]["list_head"] is None
+        assert r["veh"]["count"] == 0
+        assert "LdrpVectorHandlerList" in r["veh"]["note"]
+
+    def test_veh_list_walked_when_head_resolved(self, manager):
+        from x64dbg_automate.api_runtime.api_analysis import enumerate_exception_handlers
+        sb = _mock_sandbox(manager, arch="x32")
+        sb.client.get_seh_chain.return_value = []
+        sb.client.get_symbol_at.return_value = None
+
+        list_head = 0x77AA0000
+        node1 = 0x77BB0000
+        handler_enc = 0xDEADBEEF
+
+        call_count = {"n": 0}
+        def _eval(expr):
+            if "LdrpVectorHandlerList" in expr:
+                return (list_head, True)
+            return (0, False)
+
+        def _read(addr, size):
+            # list_head Flink → node1
+            if addr == list_head and size == 4:
+                return node1.to_bytes(4, "little")
+            # node1 Flink → list_head (sentinel: list is done)
+            if addr == node1 and size == 4:
+                return list_head.to_bytes(4, "little")
+            # node1 Handler at offset 12
+            if addr == node1 + 12 and size == 4:
+                return handler_enc.to_bytes(4, "little")
+            return b"\x00" * size
+
+        sb.client.eval_sync.side_effect = _eval
+        sb.client.read_memory.side_effect = _read
+
+        r = enumerate_exception_handlers(sandbox_id="aa11")
+        assert r["success"]
+        assert r["veh"]["list_head"] == f"0x{list_head:X}"
+        assert r["veh"]["count"] == 1
+        assert r["veh"]["handlers"][0]["handler_encoded"] == f"0x{handler_enc:X}"
+        assert "RtlEncodePointer" in r["veh"]["note"]

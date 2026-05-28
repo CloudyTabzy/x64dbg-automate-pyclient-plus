@@ -107,6 +107,51 @@ class FunctionBounds:
         return max(0, self.end - self.start)
 
 
+def is_potential_entry(client: Any, addr: int) -> bool:
+    """Return True if ``addr`` looks like an independent function entry point.
+
+    Checks both prologue byte patterns (push-ebp, sub-rsp, etc.) and the
+    inter-function padding heuristic (2+ consecutive CC/90 bytes immediately
+    before ``addr``). Used by nesting disambiguation to decide whether the
+    queried address is itself a callable rather than an interior address of
+    the outer function found by ``detect_function_bounds``.
+    """
+    try:
+        data = client.read_memory(addr, 8)
+    except Exception:
+        return False
+    if not data:
+        return False
+    if any(data.startswith(p) for p in _PROLOGUE_PATTERNS):
+        return True
+    if addr >= 2:
+        try:
+            pre = client.read_memory(addr - 2, 2)
+            if (len(pre) >= 2
+                    and pre[0] in _PADDING_BYTE_VALUES
+                    and pre[0] == pre[1]):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _find_end_from(client: Any, addr: int, max_forward: int = 0x8000) -> int:
+    """Scan forward from ``addr`` for the nearest RET, returning address just past it.
+
+    Falls back to ``addr + 0x1000`` when no RET is found in the scan window.
+    Never raises.
+    """
+    for off in range(addr, addr + max_forward):
+        try:
+            b = client.read_memory(off, 1)
+        except Exception:
+            break
+        if b in _RET_BYTES:
+            return off + 1
+    return addr + 0x1000
+
+
 def detect_function_bounds(
     client: Any,
     addr: int,
